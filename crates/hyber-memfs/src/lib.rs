@@ -87,19 +87,27 @@ impl Provider for MemFSProvider {
             return Err("MemFS only supports File and Directory creation".to_string());
         }
 
-        // 1. Create Hyber object
+        if ns_mgr.lookup(parent_id, name).is_some() {
+            return Err(format!("Node '{name}' already exists"));
+        }
+
+        // 1. Create the object only after validation; undo it if linking fails.
         let obj_id = obj_mgr.create_object(obj_type);
 
-        // 2. Register in namespace
-        ns_mgr
-            .create_node(obj_mgr, parent_id, name, obj_id)
-            .map_err(|e| format!("Namespace error: {}", e))?;
+        if let Err(error) = ns_mgr.create_node(obj_mgr, parent_id, name, obj_id) {
+            obj_mgr.release(obj_id);
+            obj_mgr.destroy(obj_id);
+            return Err(format!("Namespace error: {error}"));
+        }
 
         // 3. Initialize directory contents in namespace manager if needed
         if obj_type == ObjectType::Directory {
-            ns_mgr
-                .initialize_directory(obj_id)
-                .map_err(|e| format!("MemFS init dir error: {}", e))?;
+            if let Err(error) = ns_mgr.initialize_directory(obj_id) {
+                let _ = ns_mgr.remove_node(parent_id, name);
+                obj_mgr.release(obj_id);
+                obj_mgr.destroy(obj_id);
+                return Err(format!("MemFS init dir error: {error}"));
+            }
             self.entries.insert(obj_id, MemEntry::new_directory());
         } else {
             self.entries.insert(obj_id, MemEntry::new_file());

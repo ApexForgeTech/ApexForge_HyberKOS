@@ -28,7 +28,7 @@ struct HyberShell {
     vfs: VFS,
     current_dir: Path,
     process_id: ProcessId,
-    proc_mgr: Rc<RefCell<ProcessManager>>,
+    proc_mgr: Arc<Mutex<ProcessManager>>,
     dev_mgr: Arc<Mutex<DeviceManager>>,
     svc_mgr: Arc<Mutex<ServiceManager>>,
     running: bool,
@@ -59,10 +59,13 @@ impl HyberShell {
         // ── Process Manager (Phase 10) ────────────────────────────────────────────
         let mut proc_mgr = ProcessManager::new();
         let root_security = SecurityContext::root();
-        let shell_pid =
-            proc_mgr.create_process(&mut obj_mgr, None, root_security, Some(std::process::id()));
-        proc_mgr.start_process(shell_pid).unwrap();
-        let proc_mgr_rc = Rc::new(RefCell::new(proc_mgr));
+        let shell_pid = proc_mgr
+            .create_process(&mut obj_mgr, None, root_security, Some(std::process::id()))
+            .map_err(|e| format!("Failed to create shell process: {e}"))?;
+        proc_mgr
+            .start_process(shell_pid)
+            .map_err(|e| format!("Failed to start shell process: {e}"))?;
+        let proc_mgr_arc = Arc::new(Mutex::new(proc_mgr));
 
         // ── Device Manager (Phase 11) — pre-register standard virtual devices ─────
         let mut dev_mgr_inner = DeviceManager::new();
@@ -141,8 +144,9 @@ impl HyberShell {
             .create_node(&obj_mgr, ns_mgr.root(), "processes", proc_dir_id)
             .unwrap();
         ns_mgr.initialize_directory(proc_dir_id).ok(); // idempotent
-        let shell_process_object = proc_mgr_rc
-            .borrow()
+        let shell_process_object = proc_mgr_arc
+            .lock()
+            .unwrap()
             .get_process(shell_pid)
             .ok_or("Shell process was not registered")?
             .object_id;
@@ -154,7 +158,7 @@ impl HyberShell {
         )?;
         vfs.register_provider(
             "procfs".to_string(),
-            Box::new(ProcessProvider::new(proc_mgr_rc.clone())),
+            Box::new(ProcessProvider::new(proc_mgr_arc.clone())),
         );
         vfs.mount(Path::parse("/processes"), "procfs".to_string());
 
@@ -233,7 +237,7 @@ impl HyberShell {
             vfs,
             current_dir,
             process_id: shell_pid,
-            proc_mgr: proc_mgr_rc,
+            proc_mgr: proc_mgr_arc,
             dev_mgr,
             svc_mgr,
             running: true,
@@ -522,7 +526,8 @@ impl HyberShell {
                 }
                 let sec_ctx = self
                     .proc_mgr
-                    .borrow()
+                    .lock()
+                    .unwrap()
                     .get_process(self.process_id)
                     .unwrap()
                     .security_context
@@ -546,7 +551,8 @@ impl HyberShell {
 
             let sec_ctx = self
                 .proc_mgr
-                .borrow()
+                .lock()
+                .unwrap()
                 .get_process(self.process_id)
                 .unwrap()
                 .security_context
@@ -594,7 +600,8 @@ impl HyberShell {
 
         let sec_ctx = self
             .proc_mgr
-            .borrow()
+            .lock()
+            .unwrap()
             .get_process(self.process_id)
             .unwrap()
             .security_context
@@ -629,7 +636,8 @@ impl HyberShell {
 
         let sec_ctx = self
             .proc_mgr
-            .borrow()
+            .lock()
+            .unwrap()
             .get_process(self.process_id)
             .ok_or("Shell process not found")?
             .security_context
@@ -704,7 +712,8 @@ impl HyberShell {
 
         let sec_ctx = self
             .proc_mgr
-            .borrow()
+            .lock()
+            .unwrap()
             .get_process(self.process_id)
             .ok_or("Shell process not found")?
             .security_context
@@ -732,7 +741,8 @@ impl HyberShell {
         // Open source for reading
         let sec_ctx = self
             .proc_mgr
-            .borrow()
+            .lock()
+            .unwrap()
             .get_process(self.process_id)
             .unwrap()
             .security_context
@@ -782,7 +792,8 @@ impl HyberShell {
         };
         let sec_ctx = self
             .proc_mgr
-            .borrow()
+            .lock()
+            .unwrap()
             .get_process(self.process_id)
             .unwrap()
             .security_context
@@ -833,7 +844,8 @@ impl HyberShell {
 
         let sec_ctx = self
             .proc_mgr
-            .borrow()
+            .lock()
+            .unwrap()
             .get_process(self.process_id)
             .unwrap()
             .security_context
@@ -968,7 +980,8 @@ impl HyberShell {
 
         let sec_ctx = self
             .proc_mgr
-            .borrow()
+            .lock()
+            .unwrap()
             .get_process(self.process_id)
             .unwrap()
             .security_context
@@ -1053,7 +1066,8 @@ impl HyberShell {
 
         let context = self
             .proc_mgr
-            .borrow()
+            .lock()
+            .unwrap()
             .get_process(self.process_id)
             .ok_or("Shell process not found")?
             .security_context
@@ -1191,7 +1205,7 @@ impl HyberShell {
             uid // Default gid to uid
         };
 
-        if let Some(proc) = self.proc_mgr.borrow_mut().get_process_mut(self.process_id) {
+        if let Some(proc) = self.proc_mgr.lock().unwrap().get_process_mut(self.process_id) {
             proc.security_context.user_id = UserId(uid);
             proc.security_context.group_id = GroupId(gid);
             // If changing to non-root, clear capabilities
@@ -1204,7 +1218,7 @@ impl HyberShell {
     }
 
     fn cmd_ps(&self, _args: &[&str]) -> Result<(), String> {
-        let proc_mgr = self.proc_mgr.borrow();
+        let proc_mgr = self.proc_mgr.lock().unwrap();
         let processes = proc_mgr.list_processes();
         println!(
             "{:<5} | {:<5} | {:<10} | {:<5} | GID",

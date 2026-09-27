@@ -37,7 +37,7 @@ impl NamespaceManager {
         name: &str,
         object_id: ObjectId,
     ) -> Result<Node, String> {
-        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
             return Err(format!("Invalid namespace node name '{name}'"));
         }
 
@@ -147,6 +147,21 @@ impl NamespaceManager {
         new_parent_id: ObjectId,
         new_name: &str,
     ) -> Result<(), String> {
+        if new_name.is_empty()
+            || new_name == "."
+            || new_name == ".."
+            || new_name.contains(['/', '\0'])
+        {
+            return Err(format!("Invalid namespace node name '{new_name}'"));
+        }
+
+        if !self.directory_contents.contains_key(&new_parent_id) {
+            return Err(format!(
+                "New parent directory {:?} is not initialized",
+                new_parent_id
+            ));
+        }
+
         // 1. Get the object ID
         let obj_id = self
             .lookup(old_parent_id, old_name)

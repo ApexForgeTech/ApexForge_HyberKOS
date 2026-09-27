@@ -3,15 +3,14 @@ use hyber_core::{ObjectId, ObjectType};
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
 use hyber_vfs::Provider;
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 pub struct ProcessProvider {
-    pub proc_mgr: Rc<RefCell<ProcessManager>>,
+    pub proc_mgr: Arc<Mutex<ProcessManager>>,
 }
 
 impl ProcessProvider {
-    pub fn new(proc_mgr: Rc<RefCell<ProcessManager>>) -> Self {
+    pub fn new(proc_mgr: Arc<Mutex<ProcessManager>>) -> Self {
         Self { proc_mgr }
     }
 }
@@ -51,7 +50,7 @@ impl Provider for ProcessProvider {
     }
 
     fn read(&self, object_id: ObjectId, offset: u64, buffer: &mut [u8]) -> Result<usize, String> {
-        let proc_mgr = self.proc_mgr.borrow();
+        let proc_mgr = self.proc_mgr.lock().map_err(|_| "PoisonError")?;
 
         // Find the process by object_id
         let mut target_process = None;
@@ -93,7 +92,7 @@ impl Provider for ProcessProvider {
     }
 
     fn enumerate(&self, _dir_id: ObjectId) -> Result<Vec<(String, ObjectId)>, String> {
-        let proc_mgr = self.proc_mgr.borrow();
+        let proc_mgr = self.proc_mgr.lock().map_err(|_| "PoisonError")?;
         let mut entries = Vec::new();
         for proc in proc_mgr.list_processes() {
             entries.push((proc.id.0.to_string(), proc.object_id));

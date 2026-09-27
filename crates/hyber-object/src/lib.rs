@@ -151,6 +151,7 @@ impl ObjectManager {
         key: &str,
         value: MetadataValue,
     ) -> Result<(), String> {
+        Self::validate_metadata_key(key)?;
         let obj = self.objects.get_mut(&id).ok_or("Object not found")?;
         obj.extended_metadata.insert(key.to_string(), value);
         // Update modified_at timestamp when metadata changes
@@ -163,6 +164,7 @@ impl ObjectManager {
 
     /// Remove a specific extended metadata value
     pub fn remove_metadata(&mut self, id: ObjectId, key: &str) -> Result<bool, String> {
+        Self::validate_metadata_key(key)?;
         let obj = self.objects.get_mut(&id).ok_or("Object not found")?;
         let removed = obj.extended_metadata.remove(key).is_some();
         if removed {
@@ -182,6 +184,22 @@ impl ObjectManager {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         })
+    }
+
+    fn validate_metadata_key(key: &str) -> Result<(), String> {
+        let (namespace, name) = key
+            .split_once('.')
+            .ok_or("Metadata keys must use the 'namespace.name' form")?;
+        if namespace.is_empty()
+            || name.is_empty()
+            || key.len() > 255
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err("Invalid metadata key".to_string());
+        }
+        Ok(())
     }
 }
 impl Default for ObjectManager {

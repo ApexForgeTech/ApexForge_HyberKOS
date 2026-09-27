@@ -98,16 +98,11 @@ impl Provider for HostFSProvider {
         name: &str,
         obj_type: ObjectType,
     ) -> Result<ObjectId, String> {
-        // 1. Create Hyber Object and Node
-        let obj_id = obj_mgr.create_object(obj_type);
-        ns_mgr
-            .create_node(obj_mgr, parent_id, name, obj_id)
-            .map_err(|e| format!("Namespace error: {}", e))?;
-
-        if obj_type == ObjectType::Directory {
-            ns_mgr
-                .initialize_directory(obj_id)
-                .map_err(|e| format!("Init dir error: {}", e))?;
+        if ns_mgr.lookup(parent_id, name).is_some() {
+            return Err(format!("Node '{name}' already exists"));
+        }
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+            return Err(format!("Invalid namespace node name '{name}'"));
         }
 
         // 2. 7.3 Example Mapping: Build the relative Linux path
@@ -122,12 +117,13 @@ impl Provider for HostFSProvider {
             parent_path.join(name)
         };
 
-        // 3. Create REAL Linux file/directory
+        // 3. Create the host object before committing Hyber state. This avoids
+        // dangling namespace entries when the OS operation fails.
         let linux_path = self.root_path.join(&new_relative_path);
 
         match obj_type {
             ObjectType::Directory => {
-                fs::create_dir_all(&linux_path)
+                fs::create_dir(&linux_path)
                     .map_err(|e| format!("Failed to create Linux dir: {}", e))?;
             }
             ObjectType::File => {
@@ -136,13 +132,38 @@ impl Provider for HostFSProvider {
                     fs::create_dir_all(parent)
                         .map_err(|e| format!("Failed to create parent dir: {}", e))?;
                 }
-                File::create(&linux_path)
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&linux_path)
                     .map_err(|e| format!("Failed to create Linux file: {}", e))?;
             }
             _ => return Err("HostFS only supports File and Directory creation".to_string()),
         }
 
-        // 4. 7.5 Inode Isolation: Map ObjectId to relative path, NOT Linux inode
+        // 4. Commit object and namespace. If that fails, undo the host create.
+        let obj_id = obj_mgr.create_object(obj_type);
+        if let Err(error) = ns_mgr.create_node(obj_mgr, parent_id, name, obj_id) {
+            let _ = if obj_type == ObjectType::Directory {
+                fs::remove_dir(&linux_path)
+            } else {
+                fs::remove_file(&linux_path)
+            };
+            obj_mgr.release(obj_id);
+            obj_mgr.destroy(obj_id);
+            return Err(format!("Namespace error: {error}"));
+        }
+        if obj_type == ObjectType::Directory {
+            if let Err(error) = ns_mgr.initialize_directory(obj_id) {
+                let _ = ns_mgr.remove_node(parent_id, name);
+                let _ = fs::remove_dir(&linux_path);
+                obj_mgr.release(obj_id);
+                obj_mgr.destroy(obj_id);
+                return Err(format!("Directory initialization error: {error}"));
+            }
+        }
+
+        // 5. 7.5 Inode Isolation: Map ObjectId to relative path, NOT Linux inode
         self.object_paths.insert(obj_id, new_relative_path);
 
         Ok(obj_id)

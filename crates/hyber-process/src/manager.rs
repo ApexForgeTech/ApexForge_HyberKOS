@@ -62,7 +62,16 @@ impl ProcessManager {
         parent_id: Option<ProcessId>,
         security_context: SecurityContext,
         linux_pid: Option<u32>,
-    ) -> ProcessId {
+    ) -> Result<ProcessId, String> {
+        if let Some(parent) = parent_id {
+            let parent_process = self.processes.get(&parent).ok_or("Parent process not found")?;
+            if parent_process.state == ProcessState::Zombie {
+                return Err("Cannot create a child of a terminated process".to_string());
+            }
+        }
+        if self.next_pid == u64::MAX || self.next_tid == u64::MAX {
+            return Err("Process or thread identifier space exhausted".to_string());
+        }
         let id = ProcessId(self.next_pid);
         self.next_pid += 1;
 
@@ -87,7 +96,10 @@ impl ProcessManager {
         };
 
         self.processes.insert(id, process);
-        id
+        // Every process has a primary thread. A process with no thread cannot
+        // satisfy the Phase 10 execution model.
+        self.create_thread(obj_mgr, id)?;
+        Ok(id)
     }
 
     /// 11.2 — Thread creation
@@ -136,6 +148,9 @@ impl ProcessManager {
     /// 11.5 — Process Operations: start
     pub fn start_process(&mut self, id: ProcessId) -> Result<(), String> {
         if let Some(p) = self.processes.get_mut(&id) {
+            if p.state != ProcessState::Created {
+                return Err(format!("Process {:?} cannot start from {:?}", id, p.state));
+            }
             p.state = ProcessState::Running;
             // Also start all ready threads
             for tid in &p.threads {
@@ -154,6 +169,9 @@ impl ProcessManager {
     /// 11.5 — Process Operations: stop (terminate)
     pub fn stop_process(&mut self, id: ProcessId, exit_code: i32) -> Result<(), String> {
         if let Some(p) = self.processes.get_mut(&id) {
+            if p.state == ProcessState::Zombie {
+                return Err("Process is already terminated".to_string());
+            }
             p.state = ProcessState::Zombie;
             p.exit_code = Some(exit_code);
             // Terminate threads
@@ -183,7 +201,7 @@ impl ProcessManager {
     pub fn signal_process(&mut self, id: ProcessId, _signal: u32) -> Result<(), String> {
         // Conceptually sends a signal to the process.
         let p = self.processes.get_mut(&id).ok_or("Process not found")?;
-        if p.state == ProcessState::Zombie {
+        if p.state != ProcessState::Running {
             return Err("Cannot signal a zombie process".to_string());
         }
         Ok(())
