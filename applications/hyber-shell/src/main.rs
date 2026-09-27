@@ -4,7 +4,7 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use hyber_core::{HandleId, ObjectType, Path, ProcessId, Rights};
+use hyber_core::{HandleId, ObjectType, Path, ProcessId, Rights, MetadataValue};
 use hyber_handle::HandleManager;
 use hyber_hostfs::HostFSProvider;
 use hyber_namespace::NamespaceManager;
@@ -116,6 +116,7 @@ impl HyberShell {
             "handles" => self.cmd_handles(args),
             "mnts" => self.cmd_mnts(args),
             "rights" => self.cmd_rights(args),
+            "meta" => self.cmd_meta(args),
             "exit" => self.cmd_exit(args),
             "help" => self.cmd_help(args),
 
@@ -415,7 +416,7 @@ impl HyberShell {
             Rights::read_write(),
         )?;
 
-        self.vfs.write(&mut self.handle_mgr, self.process_id, dest_handle, &data)?;
+        self.vfs.write(&mut self.handle_mgr, &mut self.obj_mgr, self.process_id, dest_handle, &data)?;
         self.vfs.close(&mut self.handle_mgr, &mut self.obj_mgr, self.process_id, dest_handle)?;
 
         Ok(())
@@ -470,8 +471,8 @@ impl HyberShell {
             let obj = self.obj_mgr.lookup(node.object_id);
             let obj_type = obj.map(|o| o.object_type.to_string()).unwrap_or("?".to_string());
             let refs = obj.map(|o| o.references).unwrap_or(0);
-            // Size is not tracked yet in Object, show "-"
-            println!("{:<20} | {:<12} | {:<10} | {:<5} | {}", node.name, node.object_id, obj_type, refs, "-");
+            let size = obj.map(|o| o.size).unwrap_or(0);
+            println!("{:<20} | {:<12} | {:<10} | {:<5} | {}", node.name, node.object_id, obj_type, refs, size);
         }
         Ok(())
     }
@@ -491,10 +492,20 @@ impl HyberShell {
         println!("Type:        {}", obj.object_type);
         println!("State:       {}", obj.state);
         println!("References:  {}", obj.references);
+        println!("Owner:       {}", obj.owner);
+        println!("Group:       {}", obj.group);
+        println!("Permissions: {:o}", obj.permissions);
+        println!("Size:        {}", obj.size);
         println!("Created:     {}", obj.created_at);
         println!("Modified:    {}", obj.modified_at);
         println!("Flags:       {}", obj.flags);
         println!("Provider:    HostFSProvider");
+        if !obj.extended_metadata.is_empty() {
+            println!("Extended Metadata:");
+            for (k, v) in &obj.extended_metadata {
+                println!("  {} = {}", k, v);
+            }
+        }
         Ok(())
     }
 
@@ -576,14 +587,92 @@ impl HyberShell {
         let obj = self.obj_mgr.lookup(obj_id)
             .ok_or("Object not found")?;
 
-        // For now, show basic rights based on object type
-        let can_read = obj.object_type == ObjectType::File || obj.object_type == ObjectType::Directory;
-        let can_write = obj.object_type == ObjectType::File;
-        let can_execute = false; // No execution model yet
+        // Extract basic rights from the new permissions field (assuming UNIX-like octal permissions)
+        let can_read = (obj.permissions & 0o400) != 0;
+        let can_write = (obj.permissions & 0o200) != 0;
+        let can_execute = (obj.permissions & 0o100) != 0;
 
         println!("READ:    {}", if can_read { "Yes" } else { "No" });
         println!("WRITE:   {}", if can_write { "Yes" } else { "No" });
         println!("EXECUTE: {}", if can_execute { "Yes" } else { "No" });
+        Ok(())
+    }
+
+    fn cmd_meta(&mut self, args: &[&str]) -> Result<(), String> {
+        let (_flags, positional) = Self::parse_flags(args);
+        if positional.is_empty() {
+            return Err("Usage: meta <ls|get|set|rm> <path> [key] [type] [value]".to_string());
+        }
+        
+        let action = positional[0];
+        if positional.len() < 2 {
+            return Err("Missing path argument".to_string());
+        }
+        
+        let path = self.resolve_path(positional[1]);
+        let obj_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
+        
+        match action {
+            "ls" => {
+                if let Some(meta_list) = self.obj_mgr.list_metadata(obj_id) {
+                    if meta_list.is_empty() {
+                        println!("No extended metadata.");
+                    } else {
+                        for (k, v) in meta_list {
+                            println!("{} = {}", k, v);
+                        }
+                    }
+                }
+            }
+            "get" => {
+                if positional.len() < 3 {
+                    return Err("Missing key argument".to_string());
+                }
+                let key = positional[2];
+                if let Some(val) = self.obj_mgr.get_metadata(obj_id, key) {
+                    println!("{}", val);
+                } else {
+                    println!("Key not found.");
+                }
+            }
+            "rm" => {
+                if positional.len() < 3 {
+                    return Err("Missing key argument".to_string());
+                }
+                let key = positional[2];
+                if self.obj_mgr.remove_metadata(obj_id, key)? {
+                    println!("Metadata removed.");
+                } else {
+                    println!("Key not found.");
+                }
+            }
+            "set" => {
+                if positional.len() < 5 {
+                    return Err("Usage: meta set <path> <key> <type> <value>\nTypes: string, int, bool".to_string());
+                }
+                let key = positional[2];
+                let val_type = positional[3];
+                // The value might have spaces, so join the remaining positional args
+                let val_str = positional[4..].join(" ");
+                
+                let meta_val = match val_type {
+                    "string" => MetadataValue::String(val_str),
+                    "int" => {
+                        let i = val_str.parse::<i64>().map_err(|_| "Invalid integer")?;
+                        MetadataValue::Integer(i)
+                    }
+                    "bool" => {
+                        let b = val_str.parse::<bool>().map_err(|_| "Invalid boolean (true/false)")?;
+                        MetadataValue::Boolean(b)
+                    }
+                    _ => return Err("Unsupported type. Use: string, int, bool".to_string()),
+                };
+                
+                self.obj_mgr.set_metadata(obj_id, key, meta_val)?;
+                println!("Metadata set.");
+            }
+            _ => return Err("Unknown meta action. Use: ls, get, set, rm".to_string()),
+        }
         Ok(())
     }
 
@@ -613,6 +702,7 @@ impl HyberShell {
         println!("  handles                 Show Handle Table");
         println!("  mnts                    Show mount points");
         println!("  rights <path>           Show access rights");
+        println!("  meta <ls|get|set|rm>    Manage extended metadata");
         println!("  exit                    Exit shell");
         println!("  help                    Show this help");
         Ok(())

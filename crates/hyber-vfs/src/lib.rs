@@ -151,6 +151,7 @@ impl<P: Provider> VFS<P> {
     pub fn write(
         &mut self,
         handle_mgr: &mut HandleManager,
+        obj_mgr: &mut ObjectManager, // Added to update metadata
         process_id: ProcessId,
         handle_id: HandleId,
         buffer: &[u8],
@@ -165,6 +166,19 @@ impl<P: Provider> VFS<P> {
         let offset = handle.offset;
         let bytes_written = self.provider.write(object_id, offset, buffer)?;
         handle_mgr.update_offset(process_id, handle_id, bytes_written as u64)?;
+        
+        // Update Core Metadata (Phase 8 completeness)
+        if let Some(obj) = obj_mgr.lookup_mut(object_id) {
+            let new_size = offset + (bytes_written as u64);
+            if new_size > obj.size {
+                obj.size = new_size;
+            }
+            obj.modified_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+        }
+
         Ok(bytes_written)
     }
 

@@ -4,10 +4,12 @@ use std::collections::HashMap;
 use hyber_core::{
     ObjectType,
     ObjectId,
-    ObjectState
+    ObjectState,
+    MetadataValue,
+    UserId,
+    GroupId,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
-
 
 //3.8 Object Traits
 pub trait Readable {}
@@ -26,10 +28,17 @@ pub struct Object {
     pub state: ObjectState,
     pub references: u64,
 
-    //3.7 Object Metadata
+    // Core Metadata (Phase 8 & 9)
+    pub owner: UserId,
+    pub group: GroupId,
+    pub permissions: u32,
+    pub size: u64,
     pub created_at: u64,
     pub modified_at: u64,
-    pub flags: u32, // Special flags for object behavior(For Example:2= Read-Only, 1=Hidden, System Object, etc.)
+    pub flags: u32,
+
+    // Extended Metadata (Phase 8)
+    pub extended_metadata: HashMap<String, MetadataValue>,
 }
 
 impl Object {
@@ -40,14 +49,23 @@ impl Object {
             .expect("Time went backwards")
             .as_secs();
 
+        // Default permissions based on ObjectType could be set here.
+        // For now, we use a default mock value (e.g., 0o644 for files, 0o755 for dirs)
+        let permissions = if object_type == ObjectType::Directory { 0o755 } else { 0o644 };
+
         Self {
             id,
             object_type,
             state: ObjectState::Live,
             references: 1, // Initial reference count is 1
+            owner: UserId(0),      // Default owner (root)
+            group: GroupId(0),      // Default group (root)
+            permissions,
+            size: 0,       // Default size
             created_at: now,
             modified_at: now,
             flags: 0, // Default flags
+            extended_metadata: HashMap::new(),
         }
     }
 }
@@ -123,8 +141,47 @@ impl ObjectManager {
         false
     }
 
+    // 9.3 Metadata API
 
-    
+    /// Get a specific extended metadata value
+    pub fn get_metadata(&self, id: ObjectId, key: &str) -> Option<&MetadataValue> {
+        self.objects.get(&id)?.extended_metadata.get(key)
+    }
+
+    /// Set a specific extended metadata value
+    pub fn set_metadata(&mut self, id: ObjectId, key: &str, value: MetadataValue) -> Result<(), String> {
+        let obj = self.objects.get_mut(&id).ok_or("Object not found")?;
+        obj.extended_metadata.insert(key.to_string(), value);
+        // Update modified_at timestamp when metadata changes
+        obj.modified_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Ok(())
+    }
+
+    /// Remove a specific extended metadata value
+    pub fn remove_metadata(&mut self, id: ObjectId, key: &str) -> Result<bool, String> {
+        let obj = self.objects.get_mut(&id).ok_or("Object not found")?;
+        let removed = obj.extended_metadata.remove(key).is_some();
+        if removed {
+            obj.modified_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+        }
+        Ok(removed)
+    }
+
+    /// List all extended metadata keys and values
+    pub fn list_metadata(&self, id: ObjectId) -> Option<Vec<(String, MetadataValue)>> {
+        self.objects.get(&id).map(|obj| {
+            obj.extended_metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+    }
 }
 impl Default for ObjectManager {
         fn default() -> Self {

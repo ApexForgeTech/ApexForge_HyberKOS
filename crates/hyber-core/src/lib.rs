@@ -78,6 +78,35 @@ impl fmt::Display for HandleId {
         write!(f, "HandleId({})", self.0)
     }
 }
+
+// 2.4.1 User, Group, and Thread IDs (Phase 9 & 10)
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct UserId(pub u32);
+
+impl fmt::Display for UserId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "UID({})", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GroupId(pub u32);
+
+impl fmt::Display for GroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GID({})", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ThreadId(pub u64);
+
+impl fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ThreadId({})", self.0)
+    }
+}
 // 2.5 Node
 
 /// A Node maps a name to an ObjectId inside a Directory.
@@ -253,6 +282,119 @@ impl fmt::Display for ObjectState {
             ObjectState::Live => write!(f, "LIVE"),
             ObjectState::Destroyed => write!(f, "DESTROYED"),
             ObjectState::Closing => write!(f, "CLOSING"),
+        }
+    }
+}
+
+// 2.9 Metadata Types
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataValue {
+    String(String),
+    Integer(i64),
+    Boolean(bool),
+    Bytes(Vec<u8>),
+    Timestamp(u64),
+    List(Vec<MetadataValue>),
+}
+
+impl fmt::Display for MetadataValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MetadataValue::String(s) => write!(f, "\"{}\"", s),
+            MetadataValue::Integer(i) => write!(f, "{}", i),
+            MetadataValue::Boolean(b) => write!(f, "{}", b),
+            MetadataValue::Bytes(b) => write!(f, "<bytes: {} len>", b.len()),
+            MetadataValue::Timestamp(t) => write!(f, "<timestamp: {}>", t),
+            MetadataValue::List(l) => {
+                write!(f, "[")?;
+                for (i, v) in l.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", v)?;
+                }
+                write!(f, "]")
+            }
+        }
+    }
+}
+
+// 2.10 Security Foundation (Phase 9)
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capability {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityContext {
+    pub user_id: UserId,
+    pub group_id: GroupId,
+    pub capabilities: Vec<Capability>,
+}
+
+impl SecurityContext {
+    pub fn root() -> Self {
+        Self {
+            user_id: UserId(0),
+            group_id: GroupId(0),
+            capabilities: vec![Capability { name: "CAP_SYS_ADMIN".to_string() }],
+        }
+    }
+}
+
+pub struct SecurityManager;
+
+impl SecurityManager {
+    pub fn check_access(
+        context: &SecurityContext,
+        owner: UserId,
+        group: GroupId,
+        permissions: u32,
+        requested_rights: Rights,
+    ) -> Result<(), String> {
+        // Root always has access
+        if context.user_id.0 == 0 {
+            return Ok(());
+        }
+
+        let mut allowed_read = false;
+        let mut allowed_write = false;
+        let mut allowed_execute = false;
+
+        if context.user_id == owner {
+            allowed_read = (permissions & 0o400) != 0;
+            allowed_write = (permissions & 0o200) != 0;
+            allowed_execute = (permissions & 0o100) != 0;
+        } else if context.group_id == group {
+            allowed_read = (permissions & 0o040) != 0;
+            allowed_write = (permissions & 0o020) != 0;
+            allowed_execute = (permissions & 0o010) != 0;
+        } else {
+            allowed_read = (permissions & 0o004) != 0;
+            allowed_write = (permissions & 0o002) != 0;
+            allowed_execute = (permissions & 0o001) != 0;
+        }
+
+        if requested_rights.read && !allowed_read {
+            return Err("Access denied: READ permission missing".to_string());
+        }
+        if requested_rights.write && !allowed_write {
+            return Err("Access denied: WRITE permission missing".to_string());
+        }
+        if requested_rights.execute && !allowed_execute {
+            return Err("Access denied: EXECUTE permission missing".to_string());
+        }
+
+        Ok(())
+    }
+
+    pub fn check_capability(context: &SecurityContext, required: &str) -> Result<(), String> {
+        if context.user_id.0 == 0 {
+            return Ok(());
+        }
+        if context.capabilities.iter().any(|c| c.name == required) {
+            Ok(())
+        } else {
+            Err(format!("Access denied: Missing capability '{}'", required))
         }
     }
 }
