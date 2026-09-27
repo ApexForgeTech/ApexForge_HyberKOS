@@ -1,22 +1,24 @@
 //! HyberKOS Shell — First User-Space Environment
 //! Phase 7–11 — REPL with Standard, Native & Virtual Namespace Commands
 
-use std::rc::Rc;
 use std::cell::RefCell;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use hyber_core::{HandleId, ObjectType, Path, ProcessId, Rights, MetadataValue, SecurityContext, UserId, GroupId};
+use hyber_core::{
+    GroupId, HandleId, MetadataValue, ObjectType, Path, ProcessId, Rights, SecurityContext, UserId,
+};
+use hyber_device::{DeviceClass, DeviceManager, DeviceProvider};
 use hyber_handle::HandleManager;
 use hyber_hostfs::HostFSProvider;
+use hyber_memfs::MemFSProvider;
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
-use hyber_vfs::{VFS, Provider};
 use hyber_process::{ProcessManager, ProcessProvider};
-use hyber_device::{DeviceClass, DeviceManager, DeviceProvider};
 use hyber_service::{ServiceManager, ServiceProvider};
-use hyber_memfs::MemFSProvider;
+use hyber_vfs::{Provider, VFS};
 
 /// HyberKOS Shell state
 struct HyberShell {
@@ -57,23 +59,64 @@ impl HyberShell {
         // ── Process Manager (Phase 10) ────────────────────────────────────────────
         let mut proc_mgr = ProcessManager::new();
         let root_security = SecurityContext::root();
-        let shell_pid = proc_mgr.create_process(&mut obj_mgr, None, root_security, Some(std::process::id()));
+        let shell_pid =
+            proc_mgr.create_process(&mut obj_mgr, None, root_security, Some(std::process::id()));
         proc_mgr.start_process(shell_pid).unwrap();
         let proc_mgr_rc = Rc::new(RefCell::new(proc_mgr));
 
         // ── Device Manager (Phase 11) — pre-register standard virtual devices ─────
         let mut dev_mgr_inner = DeviceManager::new();
-        dev_mgr_inner.register_device(&mut obj_mgr, "null",   DeviceClass::Virtual, "Discard all writes, return zeros on read");
-        dev_mgr_inner.register_device(&mut obj_mgr, "zero",   DeviceClass::Virtual, "Always returns zero bytes");
-        dev_mgr_inner.register_device(&mut obj_mgr, "random", DeviceClass::Virtual, "Pseudo-random byte generator");
+        dev_mgr_inner.register_device(
+            &mut obj_mgr,
+            "null",
+            DeviceClass::Virtual,
+            "Discard all writes, return zeros on read",
+        );
+        dev_mgr_inner.register_device(
+            &mut obj_mgr,
+            "zero",
+            DeviceClass::Virtual,
+            "Always returns zero bytes",
+        );
+        dev_mgr_inner.register_device(
+            &mut obj_mgr,
+            "random",
+            DeviceClass::Virtual,
+            "Pseudo-random byte generator",
+        );
         let dev_mgr = Arc::new(Mutex::new(dev_mgr_inner));
 
         // ── Service Manager (Phase 11) — pre-register placeholder services ────────
         let mut svc_mgr_inner = ServiceManager::new();
-        svc_mgr_inner.register_service(&mut obj_mgr, "logger",    "HyberKOS system event logger");
-        svc_mgr_inner.register_service(&mut obj_mgr, "scheduler", "HyberKOS cooperative task scheduler");
-        svc_mgr_inner.register_service(&mut obj_mgr, "netstack",  "HyberKOS network stack (not yet active)");
+        svc_mgr_inner.register_service(&mut obj_mgr, "logger", "HyberKOS system event logger");
+        svc_mgr_inner.register_service(
+            &mut obj_mgr,
+            "scheduler",
+            "HyberKOS cooperative task scheduler",
+        );
+        svc_mgr_inner.register_service(
+            &mut obj_mgr,
+            "netstack",
+            "HyberKOS network stack (not yet active)",
+        );
         let svc_mgr = Arc::new(Mutex::new(svc_mgr_inner));
+
+        // Create the persistent namespace roots before importing the host tree.
+        // Importing them is essential: it establishes HostFS's private
+        // ObjectId -> relative-path mapping for every parent directory.
+        for name in [
+            "system",
+            "users",
+            "apps",
+            "data",
+            "config",
+            "packages",
+            "volumes",
+            "developer",
+        ] {
+            std::fs::create_dir_all(host_root.join(name))
+                .map_err(|e| format!("Failed to create host subdir '{name}': {e}"))?;
+        }
 
         // ── HostFS — sync existing files from the host root ───────────────────────
         let mut hostfs = HostFSProvider::new(&host_root)
@@ -87,69 +130,101 @@ impl HyberShell {
 
         // Mount HostFS at namespace root (covers all non-virtual paths)
         vfs.register_provider("hostfs".to_string(), Box::new(hostfs));
-        vfs.mount(Path::from_str("/"), "hostfs".to_string());
+        vfs.mount(Path::parse("/"), "hostfs".to_string());
 
         // Helper: create a namespace directory node and mount a provider at it
         // We define a closure-like pattern inline for each virtual mount point.
 
         // ── /processes  (ProcessProvider) ────────────────────────────────────────
         let proc_dir_id = obj_mgr.create_object(ObjectType::Directory);
-        ns_mgr.create_node(&mut obj_mgr, ns_mgr.root(), "processes", proc_dir_id).unwrap();
+        ns_mgr
+            .create_node(&obj_mgr, ns_mgr.root(), "processes", proc_dir_id)
+            .unwrap();
         ns_mgr.initialize_directory(proc_dir_id).ok(); // idempotent
-        vfs.register_provider("procfs".to_string(), Box::new(ProcessProvider::new(proc_mgr_rc.clone())));
-        vfs.mount(Path::from_str("/processes"), "procfs".to_string());
+        let shell_process_object = proc_mgr_rc
+            .borrow()
+            .get_process(shell_pid)
+            .ok_or("Shell process was not registered")?
+            .object_id;
+        ns_mgr.create_node(
+            &obj_mgr,
+            proc_dir_id,
+            &shell_pid.0.to_string(),
+            shell_process_object,
+        )?;
+        vfs.register_provider(
+            "procfs".to_string(),
+            Box::new(ProcessProvider::new(proc_mgr_rc.clone())),
+        );
+        vfs.mount(Path::parse("/processes"), "procfs".to_string());
 
         // ── /devices  (DeviceProvider) ────────────────────────────────────────────
         let dev_dir_id = obj_mgr.create_object(ObjectType::Directory);
-        ns_mgr.create_node(&mut obj_mgr, ns_mgr.root(), "devices", dev_dir_id).unwrap();
+        ns_mgr
+            .create_node(&obj_mgr, ns_mgr.root(), "devices", dev_dir_id)
+            .unwrap();
         ns_mgr.initialize_directory(dev_dir_id).ok();
-        vfs.register_provider("devfs".to_string(), Box::new(DeviceProvider::new(dev_mgr.clone())));
-        vfs.mount(Path::from_str("/devices"), "devfs".to_string());
+        for device in dev_mgr
+            .lock()
+            .map_err(|_| "DeviceManager lock poisoned")?
+            .list_devices()
+        {
+            ns_mgr.create_node(&obj_mgr, dev_dir_id, &device.name, device.object_id)?;
+        }
+        vfs.register_provider(
+            "devfs".to_string(),
+            Box::new(DeviceProvider::new(dev_mgr.clone())),
+        );
+        vfs.mount(Path::parse("/devices"), "devfs".to_string());
 
         // ── /services  (ServiceProvider) ─────────────────────────────────────────
         let svc_dir_id = obj_mgr.create_object(ObjectType::Directory);
-        ns_mgr.create_node(&mut obj_mgr, ns_mgr.root(), "services", svc_dir_id).unwrap();
+        ns_mgr
+            .create_node(&obj_mgr, ns_mgr.root(), "services", svc_dir_id)
+            .unwrap();
         ns_mgr.initialize_directory(svc_dir_id).ok();
-        vfs.register_provider("svcfs".to_string(), Box::new(ServiceProvider::new(svc_mgr.clone())));
-        vfs.mount(Path::from_str("/services"), "svcfs".to_string());
+        for service in svc_mgr
+            .lock()
+            .map_err(|_| "ServiceManager lock poisoned")?
+            .list_services()
+        {
+            ns_mgr.create_node(&obj_mgr, svc_dir_id, &service.name, service.object_id)?;
+        }
+        vfs.register_provider(
+            "svcfs".to_string(),
+            Box::new(ServiceProvider::new(svc_mgr.clone())),
+        );
+        vfs.mount(Path::parse("/services"), "svcfs".to_string());
 
         // ── /runtime  (MemFS — volatile runtime data) ─────────────────────────────
         let runtime_dir_id = obj_mgr.create_object(ObjectType::Directory);
-        ns_mgr.create_node(&mut obj_mgr, ns_mgr.root(), "runtime", runtime_dir_id).unwrap();
+        ns_mgr
+            .create_node(&obj_mgr, ns_mgr.root(), "runtime", runtime_dir_id)
+            .unwrap();
         ns_mgr.initialize_directory(runtime_dir_id).ok();
         let mut runtime_memfs = MemFSProvider::new();
-        runtime_memfs.create(&mut obj_mgr, &mut ns_mgr, runtime_dir_id, ".keep", ObjectType::File).ok();
+        runtime_memfs
+            .create(
+                &mut obj_mgr,
+                &mut ns_mgr,
+                runtime_dir_id,
+                ".keep",
+                ObjectType::File,
+            )
+            .ok();
         vfs.register_provider("runtime-memfs".to_string(), Box::new(runtime_memfs));
-        vfs.mount(Path::from_str("/runtime"), "runtime-memfs".to_string());
+        vfs.mount(Path::parse("/runtime"), "runtime-memfs".to_string());
 
         // ── /temporary  (MemFS — ephemeral scratch space) ─────────────────────────
         let tmp_dir_id = obj_mgr.create_object(ObjectType::Directory);
-        ns_mgr.create_node(&mut obj_mgr, ns_mgr.root(), "temporary", tmp_dir_id).unwrap();
+        ns_mgr
+            .create_node(&obj_mgr, ns_mgr.root(), "temporary", tmp_dir_id)
+            .unwrap();
         ns_mgr.initialize_directory(tmp_dir_id).ok();
         vfs.register_provider("tmp-memfs".to_string(), Box::new(MemFSProvider::new()));
-        vfs.mount(Path::from_str("/temporary"), "tmp-memfs".to_string());
+        vfs.mount(Path::parse("/temporary"), "tmp-memfs".to_string());
 
-        // ── HostFS-backed logical directories (mkdir in host root as needed) ──────
-        // These are subdirectories of the HostFS root — they persist across reboots.
-        let hostfs_subdirs = [
-            "system", "users", "apps", "data", "config",
-            "packages", "volumes", "developer",
-        ];
-        for subdir in &hostfs_subdirs {
-            let host_subdir = host_root.join(subdir);
-            if !host_subdir.exists() {
-                std::fs::create_dir_all(&host_subdir)
-                    .map_err(|e| format!("Failed to create host subdir '{}': {}", subdir, e))?;
-            }
-            // Register in namespace if not already synced
-            if ns_mgr.lookup(ns_mgr.root(), subdir).is_none() {
-                let dir_id = obj_mgr.create_object(ObjectType::Directory);
-                ns_mgr.create_node(&mut obj_mgr, ns_mgr.root(), subdir, dir_id).unwrap();
-                ns_mgr.initialize_directory(dir_id).ok();
-            }
-        }
-
-        let current_dir = Path::from_str("/");
+        let current_dir = Path::parse("/");
 
         Ok(Self {
             obj_mgr,
@@ -165,8 +240,6 @@ impl HyberShell {
         })
     }
 
-
-
     fn sync_host_directory(
         host_path: &std::path::Path,
         obj_mgr: &mut ObjectManager,
@@ -174,8 +247,8 @@ impl HyberShell {
         hostfs: &mut HostFSProvider,
         parent_id: hyber_core::ObjectId,
     ) -> Result<(), String> {
-        let entries = std::fs::read_dir(host_path)
-            .map_err(|e| format!("Failed to read dir: {}", e))?;
+        let entries =
+            std::fs::read_dir(host_path).map_err(|e| format!("Failed to read dir: {}", e))?;
 
         for entry in entries {
             let entry = entry.map_err(|e| format!("IO Error: {}", e))?;
@@ -183,10 +256,22 @@ impl HyberShell {
             let name = entry.file_name().into_string().unwrap_or_default();
 
             if path.is_dir() {
-                let obj_id = hostfs.register_existing(obj_mgr, ns_mgr, parent_id, &name, ObjectType::Directory)?;
+                let obj_id = hostfs.register_existing(
+                    obj_mgr,
+                    ns_mgr,
+                    parent_id,
+                    &name,
+                    ObjectType::Directory,
+                )?;
                 Self::sync_host_directory(&path, obj_mgr, ns_mgr, hostfs, obj_id)?;
             } else {
-                let obj_id = hostfs.register_existing(obj_mgr, ns_mgr, parent_id, &name, ObjectType::File)?;
+                let obj_id = hostfs.register_existing(
+                    obj_mgr,
+                    ns_mgr,
+                    parent_id,
+                    &name,
+                    ObjectType::File,
+                )?;
                 // Update size metadata for existing files
                 if let Ok(metadata) = std::fs::metadata(&path) {
                     if let Some(obj) = obj_mgr.lookup_mut(obj_id) {
@@ -274,7 +359,10 @@ impl HyberShell {
             "help" => self.cmd_help(args),
 
             _ => {
-                eprintln!("Unknown command: '{}'. Type 'help' for available commands.", command);
+                eprintln!(
+                    "Unknown command: '{}'. Type 'help' for available commands.",
+                    command
+                );
                 Ok(())
             }
         };
@@ -289,8 +377,8 @@ impl HyberShell {
         let mut flags = Vec::new();
         let mut positional = Vec::new();
         for arg in args {
-            if arg.starts_with('-') {
-                flags.push(arg[1..].to_string()); // Remove leading '-'
+            if let Some(flag) = arg.strip_prefix('-') {
+                flags.push(flag.to_string());
             } else {
                 positional.push(*arg);
             }
@@ -301,7 +389,7 @@ impl HyberShell {
     /// Helper: Resolve a path relative to current_dir
     fn resolve_path(&self, path_str: &str) -> Path {
         if path_str.starts_with('/') {
-            Path::from_str(path_str)
+            Path::parse(path_str)
         } else if path_str == "." {
             self.current_dir.clone()
         } else {
@@ -311,7 +399,7 @@ impl HyberShell {
                 combined.push('/');
             }
             combined.push_str(path_str);
-            Path::from_str(&combined).normalize()
+            Path::parse(&combined).normalize()
         }
     }
 
@@ -326,7 +414,7 @@ impl HyberShell {
 
     fn cmd_cd(&mut self, args: &[&str]) -> Result<(), String> {
         if args.is_empty() {
-            self.current_dir = Path::from_str("/");
+            self.current_dir = Path::parse("/");
             return Ok(());
         }
 
@@ -349,8 +437,7 @@ impl HyberShell {
 
         // Verify it's a directory
         let obj_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
-        let obj = self.obj_mgr.lookup(obj_id)
-            .ok_or("Object not found")?;
+        let obj = self.obj_mgr.lookup(obj_id).ok_or("Object not found")?;
         if obj.object_type != ObjectType::Directory {
             return Err(format!("{:?} is not a directory", obj_id));
         }
@@ -363,13 +450,14 @@ impl HyberShell {
         let (flags, positional) = Self::parse_flags(args);
         let path_str = positional.first().copied().unwrap_or(".");
         let path = self.resolve_path(path_str);
-        
+
         let nodes = match self.vfs.enumerate(&self.ns_mgr, &path) {
             Ok(nodes) => nodes,
             Err(_) => {
                 // Fallback to NamespaceManager listing if no provider is mounted here
                 let dir_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
-                self.ns_mgr.list_directory(dir_id)
+                self.ns_mgr
+                    .list_directory(dir_id)
                     .ok_or("Failed to list directory")?
                     .into_iter()
                     .map(|n| (n.name, n.object_id))
@@ -386,7 +474,9 @@ impl HyberShell {
             }
             if long_format {
                 let obj = self.obj_mgr.lookup(object_id);
-                let obj_type = obj.map(|o| o.object_type.to_string()).unwrap_or("?".to_string());
+                let obj_type = obj
+                    .map(|o| o.object_type.to_string())
+                    .unwrap_or("?".to_string());
                 println!("{} [{}]", name, obj_type);
             } else {
                 println!("{}", name);
@@ -417,17 +507,34 @@ impl HyberShell {
                     is_absolute: path.is_absolute,
                 };
                 // Check if it already exists
-                if self.ns_mgr.resolve(
-                    &Path {
-                        components: components[..=i].to_vec(),
-                        is_absolute: path.is_absolute,
-                    },
-                    self.ns_mgr.root(),
-                ).is_ok() {
+                if self
+                    .ns_mgr
+                    .resolve(
+                        &Path {
+                            components: components[..=i].to_vec(),
+                            is_absolute: path.is_absolute,
+                        },
+                        self.ns_mgr.root(),
+                    )
+                    .is_ok()
+                {
                     continue; // Already exists
                 }
-                let sec_ctx = self.proc_mgr.borrow().get_process(self.process_id).unwrap().security_context.clone();
-                self.vfs.create(&mut self.ns_mgr, &mut self.obj_mgr, &sec_ctx, &partial_parent, &partial_name, ObjectType::Directory)?;
+                let sec_ctx = self
+                    .proc_mgr
+                    .borrow()
+                    .get_process(self.process_id)
+                    .unwrap()
+                    .security_context
+                    .clone();
+                self.vfs.create(
+                    &mut self.ns_mgr,
+                    &mut self.obj_mgr,
+                    &sec_ctx,
+                    &partial_parent,
+                    &partial_name,
+                    ObjectType::Directory,
+                )?;
             }
             Ok(())
         } else {
@@ -437,8 +544,21 @@ impl HyberShell {
                 is_absolute: path.is_absolute,
             };
 
-            let sec_ctx = self.proc_mgr.borrow().get_process(self.process_id).unwrap().security_context.clone();
-            self.vfs.create(&mut self.ns_mgr, &mut self.obj_mgr, &sec_ctx, &parent_path, &name, ObjectType::Directory)?;
+            let sec_ctx = self
+                .proc_mgr
+                .borrow()
+                .get_process(self.process_id)
+                .unwrap()
+                .security_context
+                .clone();
+            self.vfs.create(
+                &mut self.ns_mgr,
+                &mut self.obj_mgr,
+                &sec_ctx,
+                &parent_path,
+                &name,
+                ObjectType::Directory,
+            )?;
             Ok(())
         }
     }
@@ -472,13 +592,26 @@ impl HyberShell {
             is_absolute: path.is_absolute,
         };
 
-        let sec_ctx = self.proc_mgr.borrow().get_process(self.process_id).unwrap().security_context.clone();
-        self.vfs.create(&mut self.ns_mgr, &mut self.obj_mgr, &sec_ctx, &parent_path, &name, ObjectType::File)?;
+        let sec_ctx = self
+            .proc_mgr
+            .borrow()
+            .get_process(self.process_id)
+            .unwrap()
+            .security_context
+            .clone();
+        self.vfs.create(
+            &mut self.ns_mgr,
+            &mut self.obj_mgr,
+            &sec_ctx,
+            &parent_path,
+            &name,
+            ObjectType::File,
+        )?;
         Ok(())
     }
 
     fn cmd_rm(&mut self, args: &[&str]) -> Result<(), String> {
-        let (_flags, positional) = Self::parse_flags(args);
+        let (flags, positional) = Self::parse_flags(args);
         if positional.is_empty() {
             return Err("Usage: rm [-r] <path>".to_string());
         }
@@ -494,8 +627,52 @@ impl HyberShell {
             is_absolute: path.is_absolute,
         };
 
-        self.vfs.remove(&mut self.ns_mgr, &mut self.obj_mgr, &parent_path, &name)?;
+        let sec_ctx = self
+            .proc_mgr
+            .borrow()
+            .get_process(self.process_id)
+            .ok_or("Shell process not found")?
+            .security_context
+            .clone();
+        let recursive = flags.iter().any(|flag| flag.contains('r'));
+        if recursive {
+            self.remove_tree(&path, &sec_ctx)?;
+        } else {
+            self.vfs.remove(
+                &mut self.ns_mgr,
+                &mut self.obj_mgr,
+                &sec_ctx,
+                &parent_path,
+                &name,
+            )?;
+        }
         Ok(())
+    }
+
+    /// Post-order recursive removal for providers whose normal remove operation
+    /// intentionally refuses non-empty directories.
+    fn remove_tree(&mut self, path: &Path, context: &SecurityContext) -> Result<(), String> {
+        let object_id = self.ns_mgr.resolve(path, self.ns_mgr.root())?;
+        if self
+            .obj_mgr
+            .lookup(object_id)
+            .map(|o| o.object_type == ObjectType::Directory)
+            .unwrap_or(false)
+        {
+            let entries = self.vfs.enumerate(&self.ns_mgr, path)?;
+            for (name, _) in entries {
+                let child = Path::parse(&format!("{}/{}", path, name)).normalize();
+                self.remove_tree(&child, context)?;
+            }
+        }
+        let components = &path.components;
+        let name = components.last().ok_or("Cannot remove root")?.0.clone();
+        let parent = Path {
+            components: components[..components.len() - 1].to_vec(),
+            is_absolute: true,
+        };
+        self.vfs
+            .remove(&mut self.ns_mgr, &mut self.obj_mgr, context, &parent, &name)
     }
 
     fn cmd_mv(&mut self, args: &[&str]) -> Result<(), String> {
@@ -525,7 +702,22 @@ impl HyberShell {
             is_absolute: dest_path.is_absolute,
         };
 
-        self.vfs.rename(&mut self.ns_mgr, &mut self.obj_mgr, &src_parent, &src_name, &dest_parent, &dest_name)?;
+        let sec_ctx = self
+            .proc_mgr
+            .borrow()
+            .get_process(self.process_id)
+            .ok_or("Shell process not found")?
+            .security_context
+            .clone();
+        self.vfs.rename(
+            &mut self.ns_mgr,
+            &mut self.obj_mgr,
+            &sec_ctx,
+            &src_parent,
+            &src_name,
+            &dest_parent,
+            &dest_name,
+        )?;
         Ok(())
     }
 
@@ -538,7 +730,13 @@ impl HyberShell {
         let dest_path = self.resolve_path(positional[1]);
 
         // Open source for reading
-        let sec_ctx = self.proc_mgr.borrow().get_process(self.process_id).unwrap().security_context.clone();
+        let sec_ctx = self
+            .proc_mgr
+            .borrow()
+            .get_process(self.process_id)
+            .unwrap()
+            .security_context
+            .clone();
 
         let src_handle = self.vfs.open(
             &self.ns_mgr,
@@ -554,13 +752,23 @@ impl HyberShell {
         let mut data = Vec::new();
         let mut buffer = [0u8; 4096];
         loop {
-            let bytes = self.vfs.read(&mut self.handle_mgr, self.process_id, src_handle, &mut buffer)?;
+            let bytes = self.vfs.read(
+                &mut self.handle_mgr,
+                self.process_id,
+                src_handle,
+                &mut buffer,
+            )?;
             if bytes == 0 {
                 break;
             }
             data.extend_from_slice(&buffer[..bytes]);
         }
-        self.vfs.close(&mut self.handle_mgr, &mut self.obj_mgr, self.process_id, src_handle)?;
+        self.vfs.close(
+            &mut self.handle_mgr,
+            &mut self.obj_mgr,
+            self.process_id,
+            src_handle,
+        )?;
 
         // Create dest file
         let dest_components = dest_path.components.clone();
@@ -572,8 +780,21 @@ impl HyberShell {
             components: dest_components[..dest_components.len() - 1].to_vec(),
             is_absolute: dest_path.is_absolute,
         };
-        let sec_ctx = self.proc_mgr.borrow().get_process(self.process_id).unwrap().security_context.clone();
-        self.vfs.create(&mut self.ns_mgr, &mut self.obj_mgr, &sec_ctx, &dest_parent, &dest_name, ObjectType::File)?;
+        let sec_ctx = self
+            .proc_mgr
+            .borrow()
+            .get_process(self.process_id)
+            .unwrap()
+            .security_context
+            .clone();
+        self.vfs.create(
+            &mut self.ns_mgr,
+            &mut self.obj_mgr,
+            &sec_ctx,
+            &dest_parent,
+            &dest_name,
+            ObjectType::File,
+        )?;
 
         // Open dest for writing
         let dest_handle = self.vfs.open(
@@ -586,8 +807,19 @@ impl HyberShell {
             Rights::read_write(),
         )?;
 
-        self.vfs.write(&mut self.handle_mgr, &mut self.obj_mgr, self.process_id, dest_handle, &data)?;
-        self.vfs.close(&mut self.handle_mgr, &mut self.obj_mgr, self.process_id, dest_handle)?;
+        self.vfs.write(
+            &mut self.handle_mgr,
+            &mut self.obj_mgr,
+            self.process_id,
+            dest_handle,
+            &data,
+        )?;
+        self.vfs.close(
+            &mut self.handle_mgr,
+            &mut self.obj_mgr,
+            self.process_id,
+            dest_handle,
+        )?;
 
         Ok(())
     }
@@ -599,7 +831,13 @@ impl HyberShell {
         }
         let path = self.resolve_path(positional[0]);
 
-        let sec_ctx = self.proc_mgr.borrow().get_process(self.process_id).unwrap().security_context.clone();
+        let sec_ctx = self
+            .proc_mgr
+            .borrow()
+            .get_process(self.process_id)
+            .unwrap()
+            .security_context
+            .clone();
         let handle = self.vfs.open(
             &self.ns_mgr,
             &mut self.handle_mgr,
@@ -612,7 +850,9 @@ impl HyberShell {
 
         let mut buffer = [0u8; 4096];
         loop {
-            let bytes = self.vfs.read(&mut self.handle_mgr, self.process_id, handle, &mut buffer)?;
+            let bytes =
+                self.vfs
+                    .read(&mut self.handle_mgr, self.process_id, handle, &mut buffer)?;
             if bytes == 0 {
                 break;
             }
@@ -620,7 +860,12 @@ impl HyberShell {
         }
         println!();
 
-        self.vfs.close(&mut self.handle_mgr, &mut self.obj_mgr, self.process_id, handle)?;
+        self.vfs.close(
+            &mut self.handle_mgr,
+            &mut self.obj_mgr,
+            self.process_id,
+            handle,
+        )?;
         Ok(())
     }
 
@@ -634,17 +879,27 @@ impl HyberShell {
         let path = self.resolve_path(path_str);
         let dir_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
 
-        let nodes = self.ns_mgr.list_directory(dir_id)
+        let nodes = self
+            .ns_mgr
+            .list_directory(dir_id)
             .ok_or("Failed to list directory")?;
 
-        println!("{:<20} | {:<12} | {:<10} | {:<5} | {}", "Name", "ObjectId", "Type", "Refs", "Size");
+        println!(
+            "{:<20} | {:<12} | {:<10} | {:<5} | Size",
+            "Name", "ObjectId", "Type", "Refs"
+        );
         println!("{}", "-".repeat(65));
         for node in nodes {
             let obj = self.obj_mgr.lookup(node.object_id);
-            let obj_type = obj.map(|o| o.object_type.to_string()).unwrap_or("?".to_string());
+            let obj_type = obj
+                .map(|o| o.object_type.to_string())
+                .unwrap_or("?".to_string());
             let refs = obj.map(|o| o.references).unwrap_or(0);
             let size = obj.map(|o| o.size).unwrap_or(0);
-            println!("{:<20} | {:<12} | {:<10} | {:<5} | {}", node.name, node.object_id, obj_type, refs, size);
+            println!(
+                "{:<20} | {:<12} | {:<10} | {:<5} | {}",
+                node.name, node.object_id, obj_type, refs, size
+            );
         }
         Ok(())
     }
@@ -657,8 +912,7 @@ impl HyberShell {
         let path = self.resolve_path(positional[0]);
         let obj_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
 
-        let obj = self.obj_mgr.lookup(obj_id)
-            .ok_or("Object not found")?;
+        let obj = self.obj_mgr.lookup(obj_id).ok_or("Object not found")?;
 
         println!("Object ID:   {}", obj.id);
         println!("Type:        {}", obj.object_type);
@@ -671,7 +925,20 @@ impl HyberShell {
         println!("Created:     {}", obj.created_at);
         println!("Modified:    {}", obj.modified_at);
         println!("Flags:       {}", obj.flags);
-        println!("Provider:    HostFSProvider");
+        let provider = self
+            .vfs
+            .list_mounts()
+            .iter()
+            .filter(|mount| {
+                path.to_string() == mount.path.to_string()
+                    || path
+                        .to_string()
+                        .starts_with(&(mount.path.to_string() + "/"))
+            })
+            .max_by_key(|mount| mount.path.to_string().len())
+            .map(|mount| mount.provider_name.as_str())
+            .unwrap_or("unknown");
+        println!("Provider:    {}", provider);
         if !obj.extended_metadata.is_empty() {
             println!("Extended Metadata:");
             for (k, v) in &obj.extended_metadata {
@@ -691,12 +958,21 @@ impl HyberShell {
 
         let rights = match mode {
             "r" => Rights::read_only(),
-            "w" => Rights { write: true, ..Rights::empty() },
+            "w" => Rights {
+                write: true,
+                ..Rights::empty()
+            },
             "rw" => Rights::read_write(),
             _ => return Err("Invalid mode. Use: r, w, or rw".to_string()),
         };
 
-        let sec_ctx = self.proc_mgr.borrow().get_process(self.process_id).unwrap().security_context.clone();
+        let sec_ctx = self
+            .proc_mgr
+            .borrow()
+            .get_process(self.process_id)
+            .unwrap()
+            .security_context
+            .clone();
         let handle_id = self.vfs.open(
             &self.ns_mgr,
             &mut self.handle_mgr,
@@ -717,17 +993,26 @@ impl HyberShell {
         if positional.is_empty() {
             return Err("Usage: release <handle_id>".to_string());
         }
-        let handle_id_num: u64 = positional[0].parse()
+        let handle_id_num: u64 = positional[0]
+            .parse()
             .map_err(|_| "Invalid handle ID".to_string())?;
         let handle_id = HandleId(handle_id_num);
 
-        self.vfs.close(&mut self.handle_mgr, &mut self.obj_mgr, self.process_id, handle_id)?;
+        self.vfs.close(
+            &mut self.handle_mgr,
+            &mut self.obj_mgr,
+            self.process_id,
+            handle_id,
+        )?;
         println!("Released Handle #{}", handle_id.0);
         Ok(())
     }
 
     fn cmd_handles(&self, _args: &[&str]) -> Result<(), String> {
-        println!("{:<10} | {:<12} | {:<10} | {}", "HandleId", "ObjectId", "Rights", "Offset");
+        println!(
+            "{:<10} | {:<12} | {:<10} | Offset",
+            "HandleId", "ObjectId", "Rights"
+        );
         println!("{}", "-".repeat(50));
         let handles = self.handle_mgr.list_handles(self.process_id);
         for handle in handles {
@@ -737,13 +1022,19 @@ impl HyberShell {
                 if handle.rights.write { "W" } else { "-" },
                 if handle.rights.execute { "X" } else { "-" }
             );
-            println!("{:<10} | {:<12} | {:<10} | {}", handle.handle_id, handle.object_id, rights_str, handle.offset);
+            println!(
+                "{:<10} | {:<12} | {:<10} | {}",
+                handle.handle_id, handle.object_id, rights_str, handle.offset
+            );
         }
         Ok(())
     }
 
     fn cmd_mnts(&self, _args: &[&str]) -> Result<(), String> {
-        println!("{:<20} | {:<20} | {}", "Namespace Path", "Provider Name", "Status");
+        println!(
+            "{:<20} | {:<20} | Status",
+            "Namespace Path", "Provider Name"
+        );
         println!("{}", "-".repeat(55));
         for mount in self.vfs.list_mounts() {
             println!("{:<20} | {:<20} | Active", mount.path, mount.provider_name);
@@ -758,13 +1049,45 @@ impl HyberShell {
         }
         let path = self.resolve_path(positional[0]);
         let obj_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
-        let obj = self.obj_mgr.lookup(obj_id)
-            .ok_or("Object not found")?;
+        let obj = self.obj_mgr.lookup(obj_id).ok_or("Object not found")?;
 
-        // Extract basic rights from the new permissions field (assuming UNIX-like octal permissions)
-        let can_read = (obj.permissions & 0o400) != 0;
-        let can_write = (obj.permissions & 0o200) != 0;
-        let can_execute = (obj.permissions & 0o100) != 0;
+        let context = self
+            .proc_mgr
+            .borrow()
+            .get_process(self.process_id)
+            .ok_or("Shell process not found")?
+            .security_context
+            .clone();
+        let can_read = hyber_core::SecurityManager::check_access(
+            &context,
+            obj.owner,
+            obj.group,
+            obj.permissions,
+            Rights::read_only(),
+        )
+        .is_ok();
+        let can_write = hyber_core::SecurityManager::check_access(
+            &context,
+            obj.owner,
+            obj.group,
+            obj.permissions,
+            Rights {
+                write: true,
+                ..Rights::empty()
+            },
+        )
+        .is_ok();
+        let can_execute = hyber_core::SecurityManager::check_access(
+            &context,
+            obj.owner,
+            obj.group,
+            obj.permissions,
+            Rights {
+                execute: true,
+                ..Rights::empty()
+            },
+        )
+        .is_ok();
 
         println!("READ:    {}", if can_read { "Yes" } else { "No" });
         println!("WRITE:   {}", if can_write { "Yes" } else { "No" });
@@ -777,15 +1100,15 @@ impl HyberShell {
         if positional.is_empty() {
             return Err("Usage: meta <ls|get|set|rm> <path> [key] [type] [value]".to_string());
         }
-        
+
         let action = positional[0];
         if positional.len() < 2 {
             return Err("Missing path argument".to_string());
         }
-        
+
         let path = self.resolve_path(positional[1]);
         let obj_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
-        
+
         match action {
             "ls" => {
                 if let Some(meta_list) = self.obj_mgr.list_metadata(obj_id) {
@@ -822,13 +1145,16 @@ impl HyberShell {
             }
             "set" => {
                 if positional.len() < 5 {
-                    return Err("Usage: meta set <path> <key> <type> <value>\nTypes: string, int, bool".to_string());
+                    return Err(
+                        "Usage: meta set <path> <key> <type> <value>\nTypes: string, int, bool"
+                            .to_string(),
+                    );
                 }
                 let key = positional[2];
                 let val_type = positional[3];
                 // The value might have spaces, so join the remaining positional args
                 let val_str = positional[4..].join(" ");
-                
+
                 let meta_val = match val_type {
                     "string" => MetadataValue::String(val_str),
                     "int" => {
@@ -836,12 +1162,14 @@ impl HyberShell {
                         MetadataValue::Integer(i)
                     }
                     "bool" => {
-                        let b = val_str.parse::<bool>().map_err(|_| "Invalid boolean (true/false)")?;
+                        let b = val_str
+                            .parse::<bool>()
+                            .map_err(|_| "Invalid boolean (true/false)")?;
                         MetadataValue::Boolean(b)
                     }
                     _ => return Err("Unsupported type. Use: string, int, bool".to_string()),
                 };
-                
+
                 self.obj_mgr.set_metadata(obj_id, key, meta_val)?;
                 println!("Metadata set.");
             }
@@ -855,14 +1183,14 @@ impl HyberShell {
         if positional.is_empty() {
             return Err("Usage: su <uid> [gid]".to_string());
         }
-        
+
         let uid: u32 = positional[0].parse().map_err(|_| "Invalid UID")?;
         let gid: u32 = if positional.len() > 1 {
             positional[1].parse().map_err(|_| "Invalid GID")?
         } else {
             uid // Default gid to uid
         };
-        
+
         if let Some(proc) = self.proc_mgr.borrow_mut().get_process_mut(self.process_id) {
             proc.security_context.user_id = UserId(uid);
             proc.security_context.group_id = GroupId(gid);
@@ -878,44 +1206,76 @@ impl HyberShell {
     fn cmd_ps(&self, _args: &[&str]) -> Result<(), String> {
         let proc_mgr = self.proc_mgr.borrow();
         let processes = proc_mgr.list_processes();
-        println!("{:<5} | {:<5} | {:<10} | {:<5} | {:<5} | {}", "PID", "PPID", "State", "UID", "GID", "Host PID");
+        println!(
+            "{:<5} | {:<5} | {:<10} | {:<5} | GID",
+            "PID", "PPID", "State", "UID"
+        );
         println!("{}", "-".repeat(55));
         for p in processes {
-            let ppid_str = p.parent_id.map(|id| id.0.to_string()).unwrap_or("-".to_string());
-            let host_pid_str = p.linux_pid.map(|id| id.to_string()).unwrap_or("-".to_string());
-            println!("{:<5} | {:<5} | {:<10?} | {:<5} | {:<5} | {}", 
-                p.id.0, ppid_str, p.state, p.security_context.user_id.0, p.security_context.group_id.0, host_pid_str);
+            let ppid_str = p
+                .parent_id
+                .map(|id| id.0.to_string())
+                .unwrap_or("-".to_string());
+            println!(
+                "{:<5} | {:<5} | {:<10?} | {:<5} | {:<5}",
+                p.id.0,
+                ppid_str,
+                p.state,
+                p.security_context.user_id.0,
+                p.security_context.group_id.0
+            );
         }
         Ok(())
     }
 
     fn cmd_lsdev(&self, _args: &[&str]) -> Result<(), String> {
-        let mgr = self.dev_mgr.lock().map_err(|_| "DeviceManager lock poisoned")?;
+        let mgr = self
+            .dev_mgr
+            .lock()
+            .map_err(|_| "DeviceManager lock poisoned")?;
         let devices = mgr.list_devices();
         if devices.is_empty() {
             println!("No devices registered.");
             return Ok(());
         }
-        println!("{:<12} | {:<10} | {:<8} | {}", "Name", "Class", "Online", "Description");
+        println!(
+            "{:<12} | {:<10} | {:<8} | Description",
+            "Name", "Class", "Online"
+        );
         println!("{}", "-".repeat(60));
         for d in devices {
-            println!("{:<12} | {:<10?} | {:<8} | {}", d.name, d.class, d.online, d.description);
+            println!(
+                "{:<12} | {:<10?} | {:<8} | {}",
+                d.name, d.class, d.online, d.description
+            );
         }
         Ok(())
     }
 
     fn cmd_lssvc(&self, _args: &[&str]) -> Result<(), String> {
-        let mgr = self.svc_mgr.lock().map_err(|_| "ServiceManager lock poisoned")?;
+        let mgr = self
+            .svc_mgr
+            .lock()
+            .map_err(|_| "ServiceManager lock poisoned")?;
         let services = mgr.list_services();
         if services.is_empty() {
             println!("No services registered.");
             return Ok(());
         }
-        println!("{:<14} | {:<10} | {:<6} | {}", "Name", "State", "PID", "Description");
+        println!(
+            "{:<14} | {:<10} | {:<6} | Description",
+            "Name", "State", "PID"
+        );
         println!("{}", "-".repeat(62));
         for s in services {
-            let pid_str = s.process_id.map(|p| p.0.to_string()).unwrap_or_else(|| "-".to_string());
-            println!("{:<14} | {:<10} | {:<6} | {}", s.name, s.state, pid_str, s.description);
+            let pid_str = s
+                .process_id
+                .map(|p| p.0.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "{:<14} | {:<10} | {:<6} | {}",
+                s.name, s.state, pid_str, s.description
+            );
         }
         Ok(())
     }
@@ -929,7 +1289,13 @@ impl HyberShell {
         Ok(())
     }
 
-    fn tree_recursive(&self, path: &Path, prefix: &str, depth: usize, max_depth: usize) -> Result<(), String> {
+    fn tree_recursive(
+        &self,
+        path: &Path,
+        prefix: &str,
+        depth: usize,
+        max_depth: usize,
+    ) -> Result<(), String> {
         if depth >= max_depth {
             return Ok(());
         }
@@ -938,7 +1304,8 @@ impl HyberShell {
             Ok(e) => e,
             Err(_) => {
                 let dir_id = self.ns_mgr.resolve(path, self.ns_mgr.root())?;
-                self.ns_mgr.list_directory(dir_id)
+                self.ns_mgr
+                    .list_directory(dir_id)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|n| (n.name, n.object_id))
@@ -951,15 +1318,22 @@ impl HyberShell {
         for (i, (name, obj_id)) in sorted.into_iter().enumerate() {
             let is_last = i == count - 1;
             let connector = if is_last { "└── " } else { "├── " };
-            let obj_type = self.obj_mgr.lookup(obj_id)
+            let obj_type = self
+                .obj_mgr
+                .lookup(obj_id)
                 .map(|o| format!(" [{}]", o.object_type))
                 .unwrap_or_default();
             println!("{}{}{}{}", prefix, connector, name, obj_type);
             // Recurse into directories
-            if self.obj_mgr.lookup(obj_id).map(|o| o.object_type == ObjectType::Directory).unwrap_or(false) {
+            if self
+                .obj_mgr
+                .lookup(obj_id)
+                .map(|o| o.object_type == ObjectType::Directory)
+                .unwrap_or(false)
+            {
                 let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
                 let child_path_str = format!("{}/{}", path, name);
-                let child_path = Path::from_str(&child_path_str).normalize();
+                let child_path = Path::parse(&child_path_str).normalize();
                 let _ = self.tree_recursive(&child_path, &child_prefix, depth + 1, max_depth);
             }
         }
@@ -1019,7 +1393,12 @@ impl HyberShell {
     fn cleanup(&mut self) {
         let handle_ids = self.handle_mgr.list_handle_ids(self.process_id);
         for hid in handle_ids {
-            let _ = self.vfs.close(&mut self.handle_mgr, &mut self.obj_mgr, self.process_id, hid);
+            let _ = self.vfs.close(
+                &mut self.handle_mgr,
+                &mut self.obj_mgr,
+                self.process_id,
+                hid,
+            );
         }
     }
 }

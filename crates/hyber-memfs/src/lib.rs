@@ -11,11 +11,11 @@
 //! - Supports files and directories.
 //! - Consistent with the Provider interface.
 
-use std::collections::HashMap;
 use hyber_core::{ObjectId, ObjectType};
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
 use hyber_vfs::Provider;
+use std::collections::HashMap;
 
 /// In-memory file storage entry
 #[derive(Debug, Clone)]
@@ -28,10 +28,16 @@ struct MemEntry {
 
 impl MemEntry {
     fn new_file() -> Self {
-        Self { data: Vec::new(), is_directory: false }
+        Self {
+            data: Vec::new(),
+            is_directory: false,
+        }
     }
     fn new_directory() -> Self {
-        Self { data: Vec::new(), is_directory: true }
+        Self {
+            data: Vec::new(),
+            is_directory: true,
+        }
     }
 }
 
@@ -85,12 +91,14 @@ impl Provider for MemFSProvider {
         let obj_id = obj_mgr.create_object(obj_type);
 
         // 2. Register in namespace
-        ns_mgr.create_node(obj_mgr, parent_id, name, obj_id)
+        ns_mgr
+            .create_node(obj_mgr, parent_id, name, obj_id)
             .map_err(|e| format!("Namespace error: {}", e))?;
 
         // 3. Initialize directory contents in namespace manager if needed
         if obj_type == ObjectType::Directory {
-            ns_mgr.initialize_directory(obj_id)
+            ns_mgr
+                .initialize_directory(obj_id)
                 .map_err(|e| format!("MemFS init dir error: {}", e))?;
             self.entries.insert(obj_id, MemEntry::new_directory());
         } else {
@@ -108,8 +116,20 @@ impl Provider for MemFSProvider {
         name: &str,
     ) -> Result<(), String> {
         // 1. Find the object in the namespace
-        let obj_id = ns_mgr.lookup(parent_id, name)
+        let obj_id = ns_mgr
+            .lookup(parent_id, name)
             .ok_or_else(|| format!("'{}' not found in MemFS", name))?;
+
+        if obj_mgr
+            .lookup(obj_id)
+            .map(|o| o.object_type == ObjectType::Directory)
+            .unwrap_or(false)
+            && ns_mgr
+                .list_directory(obj_id)
+                .is_some_and(|entries| !entries.is_empty())
+        {
+            return Err("Cannot remove a non-empty directory".to_string());
+        }
 
         // 2. Remove from namespace
         ns_mgr.remove_node(parent_id, name);
@@ -134,12 +154,15 @@ impl Provider for MemFSProvider {
         new_name: &str,
     ) -> Result<(), String> {
         // The data stays in entries under the same ObjectId — only the namespace entry changes
-        ns_mgr.rename_node(old_parent_id, old_name, new_parent_id, new_name)
+        ns_mgr
+            .rename_node(old_parent_id, old_name, new_parent_id, new_name)
             .map_err(|e| format!("MemFS rename error: {}", e))
     }
 
     fn read(&self, object_id: ObjectId, offset: u64, buffer: &mut [u8]) -> Result<usize, String> {
-        let entry = self.entries.get(&object_id)
+        let entry = self
+            .entries
+            .get(&object_id)
             .ok_or_else(|| format!("MemFS: ObjectId {:?} not found", object_id))?;
 
         if entry.is_directory {
@@ -158,7 +181,9 @@ impl Provider for MemFSProvider {
     }
 
     fn write(&mut self, object_id: ObjectId, offset: u64, buffer: &[u8]) -> Result<usize, String> {
-        let entry = self.entries.get_mut(&object_id)
+        let entry = self
+            .entries
+            .get_mut(&object_id)
             .ok_or_else(|| format!("MemFS: ObjectId {:?} not found", object_id))?;
 
         if entry.is_directory {
@@ -180,7 +205,9 @@ impl Provider for MemFSProvider {
         // MemFS directory listing comes from NamespaceManager, not our entries map.
         // We signal this by returning an error — VFS will fall back to NamespaceManager.
         // The entry existing in our map confirms the dir exists in MemFS.
-        let _ = self.entries.get(&dir_id)
+        let _ = self
+            .entries
+            .get(&dir_id)
             .ok_or_else(|| format!("MemFS dir {:?} not registered", dir_id))?;
         Err("MemFS defers directory listing to NamespaceManager".to_string())
     }

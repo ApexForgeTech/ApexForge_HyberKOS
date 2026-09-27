@@ -2,16 +2,16 @@
 //! Phase 11 — Virtual /services Namespace
 //!
 //! ServiceProvider backs the /services virtual directory.
-//! Each registered service (background task / daemon-like entity) 
+//! Each registered service (background task / daemon-like entity)
 //! appears as a virtual object under /services/<name>.
 //! Services are HyberKOS-native; no Linux systemd/init is exposed.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use hyber_core::{ObjectId, ObjectType, ProcessId};
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
 use hyber_vfs::Provider;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// The lifecycle state of a service
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,9 +29,9 @@ pub enum ServiceState {
 impl std::fmt::Display for ServiceState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ServiceState::Stopped  => write!(f, "stopped"),
-            ServiceState::Running  => write!(f, "running"),
-            ServiceState::Failed   => write!(f, "failed"),
+            ServiceState::Stopped => write!(f, "stopped"),
+            ServiceState::Running => write!(f, "running"),
+            ServiceState::Failed => write!(f, "failed"),
             ServiceState::Disabled => write!(f, "disabled"),
         }
     }
@@ -90,7 +90,9 @@ impl ServiceManager {
     }
 
     pub fn start_service(&mut self, id: u64, process_id: Option<ProcessId>) -> Result<(), String> {
-        let svc = self.services.get_mut(&id)
+        let svc = self
+            .services
+            .get_mut(&id)
             .ok_or_else(|| format!("Service {} not found", id))?;
         if svc.state == ServiceState::Disabled {
             return Err(format!("Service '{}' is disabled", svc.name));
@@ -101,7 +103,9 @@ impl ServiceManager {
     }
 
     pub fn stop_service(&mut self, id: u64) -> Result<(), String> {
-        let svc = self.services.get_mut(&id)
+        let svc = self
+            .services
+            .get_mut(&id)
             .ok_or_else(|| format!("Service {} not found", id))?;
         svc.state = ServiceState::Stopped;
         svc.process_id = None;
@@ -109,14 +113,18 @@ impl ServiceManager {
     }
 
     pub fn mark_failed(&mut self, id: u64) -> Result<(), String> {
-        let svc = self.services.get_mut(&id)
+        let svc = self
+            .services
+            .get_mut(&id)
             .ok_or_else(|| format!("Service {} not found", id))?;
         svc.state = ServiceState::Failed;
         Ok(())
     }
 
     pub fn disable_service(&mut self, id: u64) -> Result<(), String> {
-        let svc = self.services.get_mut(&id)
+        let svc = self
+            .services
+            .get_mut(&id)
             .ok_or_else(|| format!("Service {} not found", id))?;
         svc.state = ServiceState::Disabled;
         svc.process_id = None;
@@ -189,8 +197,11 @@ impl Provider for ServiceProvider {
         Err("/services entries cannot be renamed.".to_string())
     }
 
-    fn read(&self, object_id: ObjectId, _offset: u64, buffer: &mut [u8]) -> Result<usize, String> {
-        let mgr = self.service_mgr.lock().map_err(|_| "ServiceManager lock poisoned")?;
+    fn read(&self, object_id: ObjectId, offset: u64, buffer: &mut [u8]) -> Result<usize, String> {
+        let mgr = self
+            .service_mgr
+            .lock()
+            .map_err(|_| "ServiceManager lock poisoned")?;
         let svc = mgr
             .get_service_by_object(object_id)
             .ok_or("Service not found for this ObjectId")?;
@@ -199,21 +210,35 @@ impl Provider for ServiceProvider {
             "Service: {}\nState: {}\nPID: {}\nDescription: {}\n",
             svc.name,
             svc.state,
-            svc.process_id.map(|p| p.0.to_string()).unwrap_or_else(|| "-".to_string()),
+            svc.process_id
+                .map(|p| p.0.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             svc.description,
         );
         let bytes = info.as_bytes();
-        let len = buffer.len().min(bytes.len());
-        buffer[..len].copy_from_slice(&bytes[..len]);
+        let offset = usize::try_from(offset).map_err(|_| "Offset is too large")?;
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let len = buffer.len().min(bytes.len() - offset);
+        buffer[..len].copy_from_slice(&bytes[offset..offset + len]);
         Ok(len)
     }
 
-    fn write(&mut self, _object_id: ObjectId, _offset: u64, _buffer: &[u8]) -> Result<usize, String> {
+    fn write(
+        &mut self,
+        _object_id: ObjectId,
+        _offset: u64,
+        _buffer: &[u8],
+    ) -> Result<usize, String> {
         Err("/services objects are read-only through VFS.".to_string())
     }
 
     fn enumerate(&self, _dir_id: ObjectId) -> Result<Vec<(String, ObjectId)>, String> {
-        let mgr = self.service_mgr.lock().map_err(|_| "ServiceManager lock poisoned")?;
+        let mgr = self
+            .service_mgr
+            .lock()
+            .map_err(|_| "ServiceManager lock poisoned")?;
         let entries = mgr
             .list_services()
             .into_iter()

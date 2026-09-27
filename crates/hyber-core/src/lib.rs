@@ -25,7 +25,7 @@ pub enum ObjectType {
     Service,
     SharedMemory,
     Package,
-    Channel
+    Channel,
 }
 
 impl fmt::Display for ObjectType {
@@ -152,12 +152,12 @@ pub struct Path {
 
 impl Path {
     /// Create a path from a string like "/users/neo/test.txt"
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         let is_absolute = s.starts_with('/');
         let components = s
             .split('/')
             .filter(|c| !c.is_empty())
-            .map(|c| PathComponent::new(c))
+            .map(PathComponent::new)
             .collect();
 
         Self {
@@ -177,6 +177,11 @@ impl Path {
                 ".." => {
                     if !normalized_components.is_empty() {
                         normalized_components.pop(); // Go up one directory
+                    } else if !is_absolute {
+                        // A relative path must retain leading parents.  Dropping
+                        // them changes the meaning when it is resolved from a
+                        // non-root working directory.
+                        normalized_components.push(component.clone());
                     }
                 }
                 _ => normalized_components.push(component.clone()),
@@ -216,7 +221,7 @@ pub struct Rights {
     pub signal: bool,
 }
 
-impl Rights{
+impl Rights {
     pub fn empty() -> Self {
         Self {
             read: false,
@@ -259,11 +264,9 @@ impl Rights{
             signal: true,
         }
     }
-
 }
 
 // 2.8 Object State
-
 
 //Lifecycle state of an object
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -308,7 +311,9 @@ impl fmt::Display for MetadataValue {
             MetadataValue::List(l) => {
                 write!(f, "[")?;
                 for (i, v) in l.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", v)?;
                 }
                 write!(f, "]")
@@ -336,7 +341,9 @@ impl SecurityContext {
         Self {
             user_id: UserId(0),
             group_id: GroupId(0),
-            capabilities: vec![Capability { name: "CAP_SYS_ADMIN".to_string() }],
+            capabilities: vec![Capability {
+                name: "CAP_SYS_ADMIN".to_string(),
+            }],
         }
     }
 }
@@ -383,6 +390,16 @@ impl SecurityManager {
         if requested_rights.execute && !allowed_execute {
             return Err("Access denied: EXECUTE permission missing".to_string());
         }
+        // POSIX-style metadata has no separate delete/rename bits: those
+        // operations are governed by write permission on the parent directory.
+        if (requested_rights.write || requested_rights.delete || requested_rights.rename)
+            && !allowed_write
+        {
+            return Err("Access denied: WRITE permission missing".to_string());
+        }
+        if requested_rights.enumerate && !allowed_read {
+            return Err("Access denied: READ permission missing".to_string());
+        }
 
         Ok(())
     }
@@ -396,5 +413,22 @@ impl SecurityManager {
         } else {
             Err(format!("Access denied: Missing capability '{}'", required))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Path;
+
+    #[test]
+    fn relative_normalization_preserves_leading_parent() {
+        let path = Path::parse("../users/./neo").normalize();
+        assert_eq!(path.to_string(), "../users/neo");
+    }
+
+    #[test]
+    fn absolute_normalization_cannot_escape_root() {
+        let path = Path::parse("/users/../../temporary").normalize();
+        assert_eq!(path.to_string(), "/temporary");
     }
 }

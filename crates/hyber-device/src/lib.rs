@@ -1,17 +1,17 @@
 //! HyberKOS Device Provider
 //! Phase 11 — Virtual /devices Namespace
-//! 
+//!
 //! DeviceProvider backs the /devices virtual directory.
 //! Each registered device appears as a virtual object.
-//! No Linux device files are exposed directly — 
+//! No Linux device files are exposed directly —
 //! all device access is mediated through the Hyber object model.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use hyber_core::{ObjectId, ObjectType};
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
 use hyber_vfs::Provider;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// The category of a device
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,21 +151,28 @@ impl Provider for DeviceProvider {
         Err("/devices entries cannot be renamed.".to_string())
     }
 
-    fn read(&self, object_id: ObjectId, _offset: u64, buffer: &mut [u8]) -> Result<usize, String> {
-        let mgr = self.device_mgr.lock().map_err(|_| "DeviceManager lock poisoned")?;
+    fn read(&self, object_id: ObjectId, offset: u64, buffer: &mut [u8]) -> Result<usize, String> {
+        let mgr = self
+            .device_mgr
+            .lock()
+            .map_err(|_| "DeviceManager lock poisoned")?;
         let dev = mgr
             .get_device_by_object(object_id)
             .ok_or("Device not found for this ObjectId")?;
 
         // Virtual "null" device: always returns zeros
         if dev.name == "null" {
-            for b in buffer.iter_mut() { *b = 0; }
+            for b in buffer.iter_mut() {
+                *b = 0;
+            }
             return Ok(buffer.len());
         }
 
         // Virtual "zero" device: returns zeros
         if dev.name == "zero" {
-            for b in buffer.iter_mut() { *b = 0; }
+            for b in buffer.iter_mut() {
+                *b = 0;
+            }
             return Ok(buffer.len());
         }
 
@@ -177,7 +184,9 @@ impl Provider for DeviceProvider {
                 .unwrap_or_default()
                 .subsec_nanos() as u64;
             for b in buffer.iter_mut() {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 *b = ((seed >> 33) & 0xFF) as u8;
             }
             return Ok(buffer.len());
@@ -189,13 +198,20 @@ impl Provider for DeviceProvider {
             dev.name, dev.class, dev.online, dev.description
         );
         let bytes = info.as_bytes();
-        let len = buffer.len().min(bytes.len());
-        buffer[..len].copy_from_slice(&bytes[..len]);
+        let offset = usize::try_from(offset).map_err(|_| "Offset is too large")?;
+        if offset >= bytes.len() {
+            return Ok(0);
+        }
+        let len = buffer.len().min(bytes.len() - offset);
+        buffer[..len].copy_from_slice(&bytes[offset..offset + len]);
         Ok(len)
     }
 
     fn write(&mut self, object_id: ObjectId, _offset: u64, buffer: &[u8]) -> Result<usize, String> {
-        let mgr = self.device_mgr.lock().map_err(|_| "DeviceManager lock poisoned")?;
+        let mgr = self
+            .device_mgr
+            .lock()
+            .map_err(|_| "DeviceManager lock poisoned")?;
         let dev = mgr
             .get_device_by_object(object_id)
             .ok_or("Device not found for this ObjectId")?;
@@ -205,11 +221,17 @@ impl Provider for DeviceProvider {
             return Ok(buffer.len());
         }
 
-        Err(format!("Device '{}' does not support writes through VFS", dev.name))
+        Err(format!(
+            "Device '{}' does not support writes through VFS",
+            dev.name
+        ))
     }
 
     fn enumerate(&self, _dir_id: ObjectId) -> Result<Vec<(String, ObjectId)>, String> {
-        let mgr = self.device_mgr.lock().map_err(|_| "DeviceManager lock poisoned")?;
+        let mgr = self
+            .device_mgr
+            .lock()
+            .map_err(|_| "DeviceManager lock poisoned")?;
         let entries = mgr
             .list_devices()
             .into_iter()

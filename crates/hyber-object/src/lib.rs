@@ -1,14 +1,7 @@
 //! HyberKOS Object Manager
 //! Phase 2 — Object Registry & Lifecycle
+use hyber_core::{GroupId, MetadataValue, ObjectId, ObjectState, ObjectType, UserId};
 use std::collections::HashMap;
-use hyber_core::{
-    ObjectType,
-    ObjectId,
-    ObjectState,
-    MetadataValue,
-    UserId,
-    GroupId,
-};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 //3.8 Object Traits
@@ -43,7 +36,6 @@ pub struct Object {
 
 impl Object {
     pub fn new(id: ObjectId, object_type: ObjectType) -> Self {
-        
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
@@ -51,17 +43,21 @@ impl Object {
 
         // Default permissions based on ObjectType could be set here.
         // For now, we use a default mock value (e.g., 0o644 for files, 0o755 for dirs)
-        let permissions = if object_type == ObjectType::Directory { 0o755 } else { 0o644 };
+        let permissions = if object_type == ObjectType::Directory {
+            0o755
+        } else {
+            0o644
+        };
 
         Self {
             id,
             object_type,
             state: ObjectState::Live,
-            references: 1, // Initial reference count is 1
-            owner: UserId(0),      // Default owner (root)
-            group: GroupId(0),      // Default group (root)
+            references: 1,     // Initial reference count is 1
+            owner: UserId(0),  // Default owner (root)
+            group: GroupId(0), // Default group (root)
             permissions,
-            size: 0,       // Default size
+            size: 0, // Default size
             created_at: now,
             modified_at: now,
             flags: 0, // Default flags
@@ -80,11 +76,11 @@ impl ObjectManager {
     pub fn new() -> Self {
         Self {
             objects: HashMap::new(),
-            next_id: 1, 
+            next_id: 1,
         }
     }
 
-// Create a new object and return its ID
+    // Create a new object and return its ID
     pub fn create_object(&mut self, object_type: ObjectType) -> ObjectId {
         let id = ObjectId(self.next_id);
         self.next_id += 1;
@@ -96,11 +92,11 @@ impl ObjectManager {
     }
 
     //Look up an object by its ID
-   pub fn lookup(&self, id: ObjectId) -> Option<&Object> {
+    pub fn lookup(&self, id: ObjectId) -> Option<&Object> {
         self.objects.get(&id)
     }
 
-   // Look up a mutable reference to an object by its ID
+    // Look up a mutable reference to an object by its ID
     pub fn lookup_mut(&mut self, id: ObjectId) -> Option<&mut Object> {
         self.objects.get_mut(&id)
     }
@@ -121,7 +117,7 @@ impl ObjectManager {
             if obj.references > 0 {
                 obj.references -= 1;
             }
-            
+
             if obj.references == 0 {
                 obj.state = ObjectState::Destroyed;
                 return true; // Object is now destroyed
@@ -149,7 +145,12 @@ impl ObjectManager {
     }
 
     /// Set a specific extended metadata value
-    pub fn set_metadata(&mut self, id: ObjectId, key: &str, value: MetadataValue) -> Result<(), String> {
+    pub fn set_metadata(
+        &mut self,
+        id: ObjectId,
+        key: &str,
+        value: MetadataValue,
+    ) -> Result<(), String> {
         let obj = self.objects.get_mut(&id).ok_or("Object not found")?;
         obj.extended_metadata.insert(key.to_string(), value);
         // Update modified_at timestamp when metadata changes
@@ -184,7 +185,7 @@ impl ObjectManager {
     }
 }
 impl Default for ObjectManager {
-        fn default() -> Self {
-            Self::new()
-        }
+    fn default() -> Self {
+        Self::new()
+    }
 }

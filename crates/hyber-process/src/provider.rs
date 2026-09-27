@@ -1,10 +1,10 @@
-use std::rc::Rc;
-use std::cell::RefCell;
-use hyber_vfs::Provider;
+use crate::manager::ProcessManager;
 use hyber_core::{ObjectId, ObjectType};
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
-use crate::manager::ProcessManager;
+use hyber_vfs::Provider;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 pub struct ProcessProvider {
     pub proc_mgr: Rc<RefCell<ProcessManager>>,
@@ -50,9 +50,9 @@ impl Provider for ProcessProvider {
         Err("Cannot rename in /processes".to_string())
     }
 
-    fn read(&self, object_id: ObjectId, _offset: u64, buffer: &mut [u8]) -> Result<usize, String> {
+    fn read(&self, object_id: ObjectId, offset: u64, buffer: &mut [u8]) -> Result<usize, String> {
         let proc_mgr = self.proc_mgr.borrow();
-        
+
         // Find the process by object_id
         let mut target_process = None;
         for proc in proc_mgr.list_processes() {
@@ -61,27 +61,34 @@ impl Provider for ProcessProvider {
                 break;
             }
         }
-        
+
         let proc = target_process.ok_or("Process not found")?;
-        
+
         // Create a simple string representation
         let info = format!(
-            "Process ID: {}\nParent ID: {:?}\nState: {:?}\nUser ID: {}\nGroup ID: {}\nLinux PID: {:?}\n",
-            proc.id.0, proc.parent_id, proc.state, proc.security_context.user_id.0, proc.security_context.group_id.0, proc.linux_pid
+            "Process ID: {}\nParent ID: {:?}\nState: {:?}\nUser ID: {}\nGroup ID: {}\n",
+            proc.id.0,
+            proc.parent_id,
+            proc.state,
+            proc.security_context.user_id.0,
+            proc.security_context.group_id.0
         );
-        
         let bytes = info.as_bytes();
-        let mut written = 0;
-        for (i, &b) in bytes.iter().enumerate() {
-            if i >= buffer.len() { break; }
-            buffer[i] = b;
-            written += 1;
+        let offset = usize::try_from(offset).map_err(|_| "Offset is too large")?;
+        if offset >= bytes.len() {
+            return Ok(0);
         }
-        
-        Ok(written)
+        let len = buffer.len().min(bytes.len() - offset);
+        buffer[..len].copy_from_slice(&bytes[offset..offset + len]);
+        Ok(len)
     }
 
-    fn write(&mut self, _object_id: ObjectId, _offset: u64, _buffer: &[u8]) -> Result<usize, String> {
+    fn write(
+        &mut self,
+        _object_id: ObjectId,
+        _offset: u64,
+        _buffer: &[u8],
+    ) -> Result<usize, String> {
         Err("Cannot write to process objects".to_string())
     }
 

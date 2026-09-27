@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use hyber_core::{ProcessId, ThreadId, SecurityContext, ObjectType};
+use hyber_core::{ObjectType, ProcessId, SecurityContext, ThreadId};
 use hyber_object::ObjectManager;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessState {
@@ -67,7 +67,7 @@ impl ProcessManager {
         self.next_pid += 1;
 
         let obj_id = obj_mgr.create_object(ObjectType::Process);
-        
+
         // Setup ownership for the process object
         if let Some(obj) = obj_mgr.lookup_mut(obj_id) {
             obj.owner = security_context.user_id;
@@ -91,7 +91,11 @@ impl ProcessManager {
     }
 
     /// 11.2 — Thread creation
-    pub fn create_thread(&mut self, obj_mgr: &mut ObjectManager, process_id: ProcessId) -> Result<ThreadId, String> {
+    pub fn create_thread(
+        &mut self,
+        obj_mgr: &mut ObjectManager,
+        process_id: ProcessId,
+    ) -> Result<ThreadId, String> {
         if !self.processes.contains_key(&process_id) {
             return Err("Process not found".to_string());
         }
@@ -108,8 +112,12 @@ impl ProcessManager {
         };
 
         self.threads.insert(tid, thread);
-        self.processes.get_mut(&process_id).unwrap().threads.push(tid);
-        
+        self.processes
+            .get_mut(&process_id)
+            .unwrap()
+            .threads
+            .push(tid);
+
         Ok(tid)
     }
 
@@ -131,10 +139,10 @@ impl ProcessManager {
             p.state = ProcessState::Running;
             // Also start all ready threads
             for tid in &p.threads {
-                if let Some(t) = self.threads.get_mut(tid) {
-                    if t.state == ThreadState::Ready {
-                        t.state = ThreadState::Running;
-                    }
+                if let Some(t) = self.threads.get_mut(tid)
+                    && t.state == ThreadState::Ready
+                {
+                    t.state = ThreadState::Running;
                 }
             }
             Ok(())
@@ -159,7 +167,7 @@ impl ProcessManager {
             Err("Process not found".to_string())
         }
     }
-    
+
     /// 11.5 — Process Operations: wait
     /// In a real system this would block. Here it returns the exit code if Zombie.
     pub fn wait_process(&self, id: ProcessId) -> Result<Option<i32>, String> {
@@ -186,5 +194,11 @@ impl ProcessManager {
         let mut v: Vec<&Process> = self.processes.values().collect();
         v.sort_by_key(|p| p.id);
         v
+    }
+}
+
+impl Default for ProcessManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
