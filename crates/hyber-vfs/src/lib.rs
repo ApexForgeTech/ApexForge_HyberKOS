@@ -276,17 +276,39 @@ impl VFS {
         provider.rename(obj_mgr, ns_mgr, old_parent_id, old_name, new_parent_id, new_name)
     }
 
-    pub fn enumerate(&self, ns_mgr: &NamespaceManager, path: &Path) -> Result<Vec<(String, ObjectId)>, String> {
+    /// Enumerate a directory.
+    ///
+    /// Strategy (two-tier):
+    /// 1. Ask the responsible provider first (by mount table lookup).
+    ///    If it returns Ok(entries) — use them. This is the path for fully virtual
+    ///    providers like ProcessProvider, DeviceProvider, ServiceProvider that own
+    ///    their own data and have no NamespaceManager backing.
+    /// 2. If the provider returns Err — fall back to NamespaceManager.
+    ///    This is the path for HostFS and MemFS, where the namespace IS the source
+    ///    of truth and the provider has nothing extra to add.
+    pub fn enumerate(
+        &self,
+        ns_mgr: &NamespaceManager,
+        path: &Path,
+    ) -> Result<Vec<(String, ObjectId)>, String> {
         let provider_name = self.mount_table.find_provider(path)
             .ok_or_else(|| format!("No provider mounted for path: {}", path))?;
-        let dir_id = ns_mgr.resolve(path, ns_mgr.root())?;
-        
-        let provider = self.providers.get(&provider_name)
-            .ok_or_else(|| format!("Provider {} not found", provider_name))?;
-            
-        provider.enumerate(dir_id)
-    }
 
+        let dir_id = ns_mgr.resolve(path, ns_mgr.root())?;
+
+        let provider = self.providers.get(&provider_name)
+            .ok_or_else(|| format!("Provider '{}' not found", provider_name))?;
+
+        match provider.enumerate(dir_id) {
+            Ok(entries) => Ok(entries),
+            Err(_) => {
+                // Provider defers directory listing to NamespaceManager.
+                let nodes = ns_mgr.list_directory(dir_id)
+                    .ok_or_else(|| format!("Directory not found in namespace: {:?}", dir_id))?;
+                Ok(nodes.into_iter().map(|n| (n.name, n.object_id)).collect())
+            }
+        }
+    }
 
     /// Get all active mount points for introspection
     pub fn list_mounts(&self) -> &[Mount] {

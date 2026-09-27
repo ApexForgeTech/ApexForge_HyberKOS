@@ -1,18 +1,22 @@
 //! HyberKOS Shell — First User-Space Environment
-//! Phase 7 — REPL with Standard & Native Commands
+//! Phase 7–11 — REPL with Standard, Native & Virtual Namespace Commands
 
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use hyber_core::{HandleId, ObjectType, Path, ProcessId, Rights, MetadataValue, SecurityContext, UserId, GroupId};
 use hyber_handle::HandleManager;
 use hyber_hostfs::HostFSProvider;
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
-use hyber_vfs::VFS;
+use hyber_vfs::{VFS, Provider};
 use hyber_process::{ProcessManager, ProcessProvider};
+use hyber_device::{DeviceClass, DeviceManager, DeviceProvider};
+use hyber_service::{ServiceManager, ServiceProvider};
+use hyber_memfs::MemFSProvider;
 
 /// HyberKOS Shell state
 struct HyberShell {
@@ -23,41 +27,127 @@ struct HyberShell {
     current_dir: Path,
     process_id: ProcessId,
     proc_mgr: Rc<RefCell<ProcessManager>>,
+    dev_mgr: Arc<Mutex<DeviceManager>>,
+    svc_mgr: Arc<Mutex<ServiceManager>>,
     running: bool,
 }
 
 impl HyberShell {
-    /// Initialize the shell with all managers and mount HostFS at /
+    /// Initialize the shell with all managers and mount the full virtual namespace tree.
+    /// Phase 11 Exit Criteria namespace:
+    ///   /
+    ///   ├── system/       (HostFS — OS internals)
+    ///   ├── users/        (HostFS — user data)
+    ///   ├── apps/         (HostFS — installed applications)
+    ///   ├── data/         (HostFS — persistent data)
+    ///   ├── config/       (HostFS — configuration files)
+    ///   ├── packages/     (HostFS — package artifacts)
+    ///   ├── services/     (ServiceProvider — virtual service registry)
+    ///   ├── devices/      (DeviceProvider — virtual device registry)
+    ///   ├── processes/    (ProcessProvider — live process tree)
+    ///   ├── runtime/      (MemFS — volatile runtime data)
+    ///   ├── temporary/    (MemFS — ephemeral scratch space)
+    ///   ├── volumes/      (HostFS — mountable storage volumes)
+    ///   └── developer/    (HostFS — developer tooling & debug data)
     fn new(host_root: PathBuf) -> Result<Self, String> {
         let mut obj_mgr = ObjectManager::new();
         let mut ns_mgr = NamespaceManager::new(&mut obj_mgr);
         let handle_mgr = HandleManager::new();
-        
+
+        // ── Process Manager (Phase 10) ────────────────────────────────────────────
         let mut proc_mgr = ProcessManager::new();
         let root_security = SecurityContext::root();
         let shell_pid = proc_mgr.create_process(&mut obj_mgr, None, root_security, Some(std::process::id()));
         proc_mgr.start_process(shell_pid).unwrap();
         let proc_mgr_rc = Rc::new(RefCell::new(proc_mgr));
 
+        // ── Device Manager (Phase 11) — pre-register standard virtual devices ─────
+        let mut dev_mgr_inner = DeviceManager::new();
+        dev_mgr_inner.register_device(&mut obj_mgr, "null",   DeviceClass::Virtual, "Discard all writes, return zeros on read");
+        dev_mgr_inner.register_device(&mut obj_mgr, "zero",   DeviceClass::Virtual, "Always returns zero bytes");
+        dev_mgr_inner.register_device(&mut obj_mgr, "random", DeviceClass::Virtual, "Pseudo-random byte generator");
+        let dev_mgr = Arc::new(Mutex::new(dev_mgr_inner));
+
+        // ── Service Manager (Phase 11) — pre-register placeholder services ────────
+        let mut svc_mgr_inner = ServiceManager::new();
+        svc_mgr_inner.register_service(&mut obj_mgr, "logger",    "HyberKOS system event logger");
+        svc_mgr_inner.register_service(&mut obj_mgr, "scheduler", "HyberKOS cooperative task scheduler");
+        svc_mgr_inner.register_service(&mut obj_mgr, "netstack",  "HyberKOS network stack (not yet active)");
+        let svc_mgr = Arc::new(Mutex::new(svc_mgr_inner));
+
+        // ── HostFS — sync existing files from the host root ───────────────────────
         let mut hostfs = HostFSProvider::new(&host_root)
             .map_err(|e| format!("Failed to initialize HostFS at {:?}: {}", host_root, e))?;
-            
         let root_id = ns_mgr.root();
         Self::sync_host_directory(&host_root, &mut obj_mgr, &mut ns_mgr, &mut hostfs, root_id)
             .map_err(|e| format!("Failed to sync host directory: {}", e))?;
 
+        // ── VFS setup ─────────────────────────────────────────────────────────────
         let mut vfs = VFS::new();
 
-        // Mount HostFS at root
+        // Mount HostFS at namespace root (covers all non-virtual paths)
         vfs.register_provider("hostfs".to_string(), Box::new(hostfs));
         vfs.mount(Path::from_str("/"), "hostfs".to_string());
-        
-        // Mount ProcessProvider at /processes
-        let proc_provider = Box::new(ProcessProvider::new(proc_mgr_rc.clone()));
-        vfs.register_provider("procfs".to_string(), proc_provider);
+
+        // Helper: create a namespace directory node and mount a provider at it
+        // We define a closure-like pattern inline for each virtual mount point.
+
+        // ── /processes  (ProcessProvider) ────────────────────────────────────────
         let proc_dir_id = obj_mgr.create_object(ObjectType::Directory);
         ns_mgr.create_node(&mut obj_mgr, ns_mgr.root(), "processes", proc_dir_id).unwrap();
+        ns_mgr.initialize_directory(proc_dir_id).ok(); // idempotent
+        vfs.register_provider("procfs".to_string(), Box::new(ProcessProvider::new(proc_mgr_rc.clone())));
         vfs.mount(Path::from_str("/processes"), "procfs".to_string());
+
+        // ── /devices  (DeviceProvider) ────────────────────────────────────────────
+        let dev_dir_id = obj_mgr.create_object(ObjectType::Directory);
+        ns_mgr.create_node(&mut obj_mgr, ns_mgr.root(), "devices", dev_dir_id).unwrap();
+        ns_mgr.initialize_directory(dev_dir_id).ok();
+        vfs.register_provider("devfs".to_string(), Box::new(DeviceProvider::new(dev_mgr.clone())));
+        vfs.mount(Path::from_str("/devices"), "devfs".to_string());
+
+        // ── /services  (ServiceProvider) ─────────────────────────────────────────
+        let svc_dir_id = obj_mgr.create_object(ObjectType::Directory);
+        ns_mgr.create_node(&mut obj_mgr, ns_mgr.root(), "services", svc_dir_id).unwrap();
+        ns_mgr.initialize_directory(svc_dir_id).ok();
+        vfs.register_provider("svcfs".to_string(), Box::new(ServiceProvider::new(svc_mgr.clone())));
+        vfs.mount(Path::from_str("/services"), "svcfs".to_string());
+
+        // ── /runtime  (MemFS — volatile runtime data) ─────────────────────────────
+        let runtime_dir_id = obj_mgr.create_object(ObjectType::Directory);
+        ns_mgr.create_node(&mut obj_mgr, ns_mgr.root(), "runtime", runtime_dir_id).unwrap();
+        ns_mgr.initialize_directory(runtime_dir_id).ok();
+        let mut runtime_memfs = MemFSProvider::new();
+        runtime_memfs.create(&mut obj_mgr, &mut ns_mgr, runtime_dir_id, ".keep", ObjectType::File).ok();
+        vfs.register_provider("runtime-memfs".to_string(), Box::new(runtime_memfs));
+        vfs.mount(Path::from_str("/runtime"), "runtime-memfs".to_string());
+
+        // ── /temporary  (MemFS — ephemeral scratch space) ─────────────────────────
+        let tmp_dir_id = obj_mgr.create_object(ObjectType::Directory);
+        ns_mgr.create_node(&mut obj_mgr, ns_mgr.root(), "temporary", tmp_dir_id).unwrap();
+        ns_mgr.initialize_directory(tmp_dir_id).ok();
+        vfs.register_provider("tmp-memfs".to_string(), Box::new(MemFSProvider::new()));
+        vfs.mount(Path::from_str("/temporary"), "tmp-memfs".to_string());
+
+        // ── HostFS-backed logical directories (mkdir in host root as needed) ──────
+        // These are subdirectories of the HostFS root — they persist across reboots.
+        let hostfs_subdirs = [
+            "system", "users", "apps", "data", "config",
+            "packages", "volumes", "developer",
+        ];
+        for subdir in &hostfs_subdirs {
+            let host_subdir = host_root.join(subdir);
+            if !host_subdir.exists() {
+                std::fs::create_dir_all(&host_subdir)
+                    .map_err(|e| format!("Failed to create host subdir '{}': {}", subdir, e))?;
+            }
+            // Register in namespace if not already synced
+            if ns_mgr.lookup(ns_mgr.root(), subdir).is_none() {
+                let dir_id = obj_mgr.create_object(ObjectType::Directory);
+                ns_mgr.create_node(&mut obj_mgr, ns_mgr.root(), subdir, dir_id).unwrap();
+                ns_mgr.initialize_directory(dir_id).ok();
+            }
+        }
 
         let current_dir = Path::from_str("/");
 
@@ -69,9 +159,13 @@ impl HyberShell {
             current_dir,
             process_id: shell_pid,
             proc_mgr: proc_mgr_rc,
+            dev_mgr,
+            svc_mgr,
             running: true,
         })
     }
+
+
 
     fn sync_host_directory(
         host_path: &std::path::Path,
@@ -173,6 +267,9 @@ impl HyberShell {
             "meta" => self.cmd_meta(args),
             "su" => self.cmd_su(args),
             "ps" => self.cmd_ps(args),
+            "lsdev" => self.cmd_lsdev(args),
+            "lssvc" => self.cmd_lssvc(args),
+            "tree" => self.cmd_tree(args),
             "exit" => self.cmd_exit(args),
             "help" => self.cmd_help(args),
 
@@ -792,13 +889,90 @@ impl HyberShell {
         Ok(())
     }
 
+    fn cmd_lsdev(&self, _args: &[&str]) -> Result<(), String> {
+        let mgr = self.dev_mgr.lock().map_err(|_| "DeviceManager lock poisoned")?;
+        let devices = mgr.list_devices();
+        if devices.is_empty() {
+            println!("No devices registered.");
+            return Ok(());
+        }
+        println!("{:<12} | {:<10} | {:<8} | {}", "Name", "Class", "Online", "Description");
+        println!("{}", "-".repeat(60));
+        for d in devices {
+            println!("{:<12} | {:<10?} | {:<8} | {}", d.name, d.class, d.online, d.description);
+        }
+        Ok(())
+    }
+
+    fn cmd_lssvc(&self, _args: &[&str]) -> Result<(), String> {
+        let mgr = self.svc_mgr.lock().map_err(|_| "ServiceManager lock poisoned")?;
+        let services = mgr.list_services();
+        if services.is_empty() {
+            println!("No services registered.");
+            return Ok(());
+        }
+        println!("{:<14} | {:<10} | {:<6} | {}", "Name", "State", "PID", "Description");
+        println!("{}", "-".repeat(62));
+        for s in services {
+            let pid_str = s.process_id.map(|p| p.0.to_string()).unwrap_or_else(|| "-".to_string());
+            println!("{:<14} | {:<10} | {:<6} | {}", s.name, s.state, pid_str, s.description);
+        }
+        Ok(())
+    }
+
+    fn cmd_tree(&self, args: &[&str]) -> Result<(), String> {
+        let (_flags, positional) = Self::parse_flags(args);
+        let path_str = positional.first().copied().unwrap_or("/");
+        let path = self.resolve_path(path_str);
+        println!("{}", path);
+        self.tree_recursive(&path, "", 0, 4)?;
+        Ok(())
+    }
+
+    fn tree_recursive(&self, path: &Path, prefix: &str, depth: usize, max_depth: usize) -> Result<(), String> {
+        if depth >= max_depth {
+            return Ok(());
+        }
+        // Try virtual provider enumerate first, then namespace fallback
+        let entries = match self.vfs.enumerate(&self.ns_mgr, path) {
+            Ok(e) => e,
+            Err(_) => {
+                let dir_id = self.ns_mgr.resolve(path, self.ns_mgr.root())?;
+                self.ns_mgr.list_directory(dir_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|n| (n.name, n.object_id))
+                    .collect()
+            }
+        };
+        let mut sorted = entries;
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let count = sorted.len();
+        for (i, (name, obj_id)) in sorted.into_iter().enumerate() {
+            let is_last = i == count - 1;
+            let connector = if is_last { "└── " } else { "├── " };
+            let obj_type = self.obj_mgr.lookup(obj_id)
+                .map(|o| format!(" [{}]", o.object_type))
+                .unwrap_or_default();
+            println!("{}{}{}{}", prefix, connector, name, obj_type);
+            // Recurse into directories
+            if self.obj_mgr.lookup(obj_id).map(|o| o.object_type == ObjectType::Directory).unwrap_or(false) {
+                let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
+                let child_path_str = format!("{}/{}", path, name);
+                let child_path = Path::from_str(&child_path_str).normalize();
+                let _ = self.tree_recursive(&child_path, &child_prefix, depth + 1, max_depth);
+            }
+        }
+        Ok(())
+    }
+
     fn cmd_exit(&mut self, _args: &[&str]) -> Result<(), String> {
         self.running = false;
         Ok(())
     }
 
     fn cmd_help(&self, _args: &[&str]) -> Result<(), String> {
-        println!("=== HyberKOS Shell Commands ===\n");
+        println!("=== HyberKOS Shell Commands (Phase 11) ===\n");
         println!("Standard Commands:");
         println!("  pwd                     Print working directory");
         println!("  cd <path>               Change directory");
@@ -813,14 +987,29 @@ impl HyberShell {
         println!("HyberKOS Native Commands:");
         println!("  list [path]             List with Object details");
         println!("  look <path>             Deep Object inspection");
+        println!("  tree [path]             Recursive namespace tree (max 4 levels)");
         println!("  acquire <path> [mode]   Get Handle (r/w/rw)");
         println!("  release <handle_id>     Release Handle");
         println!("  handles                 Show Handle Table");
         println!("  mnts                    Show mount points");
         println!("  rights <path>           Show access rights");
         println!("  meta <ls|get|set|rm>    Manage extended metadata");
+        println!();
+        println!("Phase 10/11 Commands:");
         println!("  su <uid> [gid]          Switch effective user ID");
         println!("  ps                      List processes");
+        println!("  lsdev                   List registered devices (/devices)");
+        println!("  lssvc                   List registered services (/services)");
+        println!();
+        println!("Virtual Namespace (Phase 11):");
+        println!("  /processes    -- live processes   (ProcessProvider)");
+        println!("  /devices      -- virtual devices  (DeviceProvider)");
+        println!("  /services     -- system services  (ServiceProvider)");
+        println!("  /runtime      -- volatile data    (MemFS)");
+        println!("  /temporary    -- scratch space    (MemFS)");
+        println!("  /system, /users, /apps, /data, /config,");
+        println!("  /packages, /volumes, /developer   (HostFS)");
+        println!();
         println!("  exit                    Exit shell");
         println!("  help                    Show this help");
         Ok(())

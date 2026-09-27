@@ -14,6 +14,16 @@ name = "hyber-core"
 version = "0.1.0"
 
 [[package]]
+name = "hyber-device"
+version = "0.1.0"
+dependencies = [
+ "hyber-core",
+ "hyber-namespace",
+ "hyber-object",
+ "hyber-vfs",
+]
+
+[[package]]
 name = "hyber-handle"
 version = "0.1.0"
 dependencies = [
@@ -24,6 +34,16 @@ dependencies = [
 
 [[package]]
 name = "hyber-hostfs"
+version = "0.1.0"
+dependencies = [
+ "hyber-core",
+ "hyber-namespace",
+ "hyber-object",
+ "hyber-vfs",
+]
+
+[[package]]
+name = "hyber-memfs"
 version = "0.1.0"
 dependencies = [
  "hyber-core",
@@ -59,15 +79,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyber-service"
+version = "0.1.0"
+dependencies = [
+ "hyber-core",
+ "hyber-namespace",
+ "hyber-object",
+ "hyber-vfs",
+]
+
+[[package]]
 name = "hyber-shell"
 version = "0.1.0"
 dependencies = [
  "hyber-core",
+ "hyber-device",
  "hyber-handle",
  "hyber-hostfs",
+ "hyber-memfs",
  "hyber-namespace",
  "hyber-object",
  "hyber-process",
+ "hyber-service",
  "hyber-vfs",
 ]
 

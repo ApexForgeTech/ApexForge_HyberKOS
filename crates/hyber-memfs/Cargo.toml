@@ -1,0 +1,10 @@
+[package]
+name = "hyber-memfs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyber-core = { path = "../../crates/hyber-core" }
+hyber-object = { path = "../../crates/hyber-object" }
+hyber-namespace = { path = "../../crates/hyber-namespace" }
+hyber-vfs = { path = "../../crates/hyber-vfs" }
