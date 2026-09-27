@@ -39,12 +39,17 @@ impl HyberShell {
         proc_mgr.start_process(shell_pid).unwrap();
         let proc_mgr_rc = Rc::new(RefCell::new(proc_mgr));
 
-        let hostfs = Box::new(HostFSProvider::new(&host_root)
-            .map_err(|e| format!("Failed to initialize HostFS at {:?}: {}", host_root, e))?);
+        let mut hostfs = HostFSProvider::new(&host_root)
+            .map_err(|e| format!("Failed to initialize HostFS at {:?}: {}", host_root, e))?;
+            
+        let root_id = ns_mgr.root();
+        Self::sync_host_directory(&host_root, &mut obj_mgr, &mut ns_mgr, &mut hostfs, root_id)
+            .map_err(|e| format!("Failed to sync host directory: {}", e))?;
+
         let mut vfs = VFS::new();
 
         // Mount HostFS at root
-        vfs.register_provider("hostfs".to_string(), hostfs);
+        vfs.register_provider("hostfs".to_string(), Box::new(hostfs));
         vfs.mount(Path::from_str("/"), "hostfs".to_string());
         
         // Mount ProcessProvider at /processes
@@ -66,6 +71,37 @@ impl HyberShell {
             proc_mgr: proc_mgr_rc,
             running: true,
         })
+    }
+
+    fn sync_host_directory(
+        host_path: &std::path::Path,
+        obj_mgr: &mut ObjectManager,
+        ns_mgr: &mut NamespaceManager,
+        hostfs: &mut HostFSProvider,
+        parent_id: hyber_core::ObjectId,
+    ) -> Result<(), String> {
+        let entries = std::fs::read_dir(host_path)
+            .map_err(|e| format!("Failed to read dir: {}", e))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("IO Error: {}", e))?;
+            let path = entry.path();
+            let name = entry.file_name().into_string().unwrap_or_default();
+
+            if path.is_dir() {
+                let obj_id = hostfs.register_existing(obj_mgr, ns_mgr, parent_id, &name, ObjectType::Directory)?;
+                Self::sync_host_directory(&path, obj_mgr, ns_mgr, hostfs, obj_id)?;
+            } else {
+                let obj_id = hostfs.register_existing(obj_mgr, ns_mgr, parent_id, &name, ObjectType::File)?;
+                // Update size metadata for existing files
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    if let Some(obj) = obj_mgr.lookup_mut(obj_id) {
+                        obj.size = metadata.len();
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Main REPL loop

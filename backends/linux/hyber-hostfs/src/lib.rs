@@ -50,6 +50,35 @@ impl HostFSProvider {
             self.object_paths.get(&obj_id).unwrap_or(&PathBuf::from(obj_id.0.to_string()))
         )
     }
+
+    /// Register an existing Linux file/directory into HyberKOS without truncating it.
+    pub fn register_existing(
+        &mut self,
+        obj_mgr: &mut ObjectManager,
+        ns_mgr: &mut NamespaceManager,
+        parent_id: ObjectId,
+        name: &str,
+        obj_type: ObjectType,
+    ) -> Result<ObjectId, String> {
+        let obj_id = obj_mgr.create_object(obj_type);
+        ns_mgr.create_node(obj_mgr, parent_id, name, obj_id)
+            .map_err(|e| format!("Namespace error: {}", e))?;
+        
+        if obj_type == ObjectType::Directory {
+            ns_mgr.initialize_directory(obj_id)
+                .map_err(|e| format!("Init dir error: {}", e))?;
+        }
+
+        let parent_path = self.object_paths.get(&parent_id).cloned().unwrap_or_default();
+        let new_relative_path = if parent_path.as_os_str().is_empty() {
+            PathBuf::from(name)
+        } else {
+            parent_path.join(name)
+        };
+
+        self.object_paths.insert(obj_id, new_relative_path);
+        Ok(obj_id)
+    }
 }
 
 impl Provider for HostFSProvider {
@@ -103,6 +132,7 @@ impl Provider for HostFSProvider {
 
         Ok(obj_id)
     }
+
 
     fn remove(
         &mut self,
