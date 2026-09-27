@@ -23,6 +23,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyber-hostfs"
+version = "0.1.0"
+dependencies = [
+ "hyber-core",
+ "hyber-namespace",
+ "hyber-object",
+ "hyber-vfs",
+]
+
+[[package]]
 name = "hyber-namespace"
 version = "0.1.0"
 dependencies = [

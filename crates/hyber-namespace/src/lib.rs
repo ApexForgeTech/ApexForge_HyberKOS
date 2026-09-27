@@ -117,6 +117,41 @@ impl NamespaceManager {
         Ok(current_dir)
     }
 
+    pub fn remove_node(&mut self, parent_id: ObjectId, name: &str) -> Option<ObjectId> {
+        let contents = self.directory_contents.get_mut(&parent_id)?;
+        contents.remove(name)
+    }
+
+        /// Renames a node from old parent/name to new parent/name cleanly
+    pub fn rename_node(
+        &mut self,
+        old_parent_id: ObjectId,
+        old_name: &str,
+        new_parent_id: ObjectId,
+        new_name: &str,
+    ) -> Result<(), String> {
+        // 1. Get the object ID
+        let obj_id = self.lookup(old_parent_id, old_name)
+            .ok_or_else(|| format!("Node '{}' not found in old parent", old_name))?;
+
+        // 2. Remove from old parent
+        self.remove_node(old_parent_id, old_name);
+
+        // 3. Add to new parent
+        let new_parent_contents = self.directory_contents.get_mut(&new_parent_id)
+            .ok_or_else(|| format!("New parent directory {:?} is not initialized", new_parent_id))?;
+
+        if new_parent_contents.contains_key(new_name) {
+            // Rollback: put it back in the old parent if the new name already exists
+            if let Some(old_contents) = self.directory_contents.get_mut(&old_parent_id) {
+                old_contents.insert(old_name.to_string(), obj_id);
+            }
+            return Err(format!("Node '{}' already exists in new parent", new_name));
+        }
+
+        new_parent_contents.insert(new_name.to_string(), obj_id);
+        Ok(())
+    }
     pub fn initialize_directory(&mut self, dir_id: ObjectId) -> Result<(), String> {
         if self.directory_contents.contains_key(&dir_id) {
             return Err(format!("Directory {:?} is already initialized", dir_id));
@@ -126,6 +161,7 @@ impl NamespaceManager {
         Ok(())
     }
 
+    
      pub fn list_directory(&self, dir_id: ObjectId) -> Option<Vec<Node>> {
         self.directory_contents.get(&dir_id).map(|contents| {
             contents
