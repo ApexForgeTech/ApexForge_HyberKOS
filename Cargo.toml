@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/hyber-core",
+    "crates/hyber-object",
+    "crates/hyber-namespace",
+    "crates/hyber-handle",
+    "crates/hyber-vfs",
+    "crates/hyber-api",
+]
+resolver = "2"

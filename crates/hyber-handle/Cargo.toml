@@ -1,0 +1,8 @@
+[package]
+name = "hyber-handle"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyber-core = { path = "../hyber-core" }
+hyber-object = { path = "../hyber-object" }

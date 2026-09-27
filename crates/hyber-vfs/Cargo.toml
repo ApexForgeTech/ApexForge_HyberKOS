@@ -1,0 +1,9 @@
+[package]
+name = "hyber-vfs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyber-core = { path = "../hyber-core" }
+hyber-object = { path = "../hyber-object" }
+hyber-namespace = { path = "../hyber-namespace" }
