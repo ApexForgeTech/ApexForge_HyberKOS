@@ -6,6 +6,7 @@ members = [
     "crates/hyber-handle",
     "crates/hyber-vfs",
     "crates/hyber-api",
-    "backends/linux/hyber-hostfs", # ← YENİ ƏLAVƏ
+    "backends/linux/hyber-hostfs",
+    "applications/hyber-shell",
 ]
 resolver = "2"

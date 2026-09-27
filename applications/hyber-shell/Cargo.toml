@@ -1,0 +1,12 @@
+[package]
+name = "hyber-shell"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyber-core = { path = "../../crates/hyber-core" }
+hyber-object = { path = "../../crates/hyber-object" }
+hyber-namespace = { path = "../../crates/hyber-namespace" }
+hyber-handle = { path = "../../crates/hyber-handle" }
+hyber-vfs = { path = "../../crates/hyber-vfs" }
+hyber-hostfs = { path = "../../backends/linux/hyber-hostfs" }

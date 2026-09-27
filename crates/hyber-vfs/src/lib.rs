@@ -213,4 +213,9 @@ impl<P: Provider> VFS<P> {
 
     pub fn provider(&self) -> &P { &self.provider }
     pub fn provider_mut(&mut self) -> &mut P { &mut self.provider }
+
+    /// Get all active mount points for introspection
+    pub fn list_mounts(&self) -> &[Mount] {
+        &self.mount_table.mounts
+    }
 }

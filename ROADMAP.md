@@ -1293,9 +1293,16 @@ through Hyber VFS.
 
 # 8. Phase 7 — First Hyber Shell
 
+
 ## Objective
 
 Create the first visible HyberKOS environment.
+
+The shell provides two layers of commands:
+1. **Standard Base Commands** — familiar POSIX-like commands for daily tasks.
+2. **HyberKOS Native Commands** — unique commands that expose the Object Model, Handle Manager, and VFS Providers.
+
+Under the hood, **no command uses Linux syscalls directly**. All commands operate through the HyberKOS VFS, Namespace, Handle, and Provider abstractions.
 
 ---
 
@@ -1307,40 +1314,179 @@ Create:
 hyber-shell
 ```
 
----
 
-# 8.2 — Initial Commands
-
-Implement:
+Location:
 
 ```text
-pwd
-ls
-cd
-cat
-touch
-mkdir
-rm
-mv
-cp
-stat
-open
-close
+applications/hyber-shell/
+```
+
+The shell is a REPL (Read-Eval-Print Loop) that:
+* Reads user input from `stdin`
+* Parses commands and arguments
+* Executes through HyberKOS abstractions
+* Prints results to `stdout`
+* Displays the prompt:
+
+```text
+hyber>
 ```
 
 ---
 
-# 8.3 — Process-Independent Shell
+# 8.2 — Standard Base Commands (Familiarity Layer)
 
-Initially the shell can be a Linux process.
+These commands behave like their Linux/Unix counterparts for user familiarity, but operate entirely through HyberKOS abstractions.
 
-Later it becomes a native Hyber process.
+## Navigation & Context
+
+```text
+pwd
+cd <path>
+```
+
+* `pwd` — Print current Hyber namespace path.
+* `cd` — Change working directory. Supports `.`, `..`, absolute and relative paths.
+
+## File & Directory Management
+
+```text
+ls [path]
+mkdir <path>
+touch <path>
+rm <path>
+mv <source> <dest>
+cp <source> <dest>
+```
+
+* `ls` — List directory contents (names only). Flags: `-l`, `-a`.
+* `mkdir` — Create a Directory Object and link it to the namespace. Flags: `-p`.
+* `touch` — Create an empty File Object or update `modified_at` timestamp.
+* `rm` — Remove a Node and destroy the Object if reference count reaches 0. Flags: `-r`.
+* `mv` — Relocate a Node (rename or move to a different parent).
+* `cp` — Copy file data through Handle-based read/write.
+
+## Content Viewing
+
+```text
+cat <path>
+```
+
+* `cat` — Read a File Object through a Handle and print its contents.
 
 ---
 
-# 8.4 — Shell Path Handling
+# 8.3 — HyberKOS Native Commands (Introspection Layer)
 
-Commands should operate on:
+These commands are unique to HyberKOS. They expose the Object Model, Handle Manager, and VFS Providers.
+
+## Namespace & Object Introspection
+
+```text
+list [path]
+look <path>
+```
+
+* `list` — The Hyber-aware `ls`. Shows:
+
+```text
+Name | ObjectId | Type | Refs | Size
+```
+
+Example:
+
+```text
+test.txt | Obj(104) | FILE | 1 | 4096
+```
+
+* `look` — Replaces `stat`/`inspect`. Dumps deep Object metadata:
+  * Object ID, Type, State (Live/Closing/Destroyed)
+  * Reference count
+  * Created/Modified timestamps
+  * Flags
+  * Provider handling the Object
+  * Flags: `-v` (verbose, includes extended metadata).
+
+## Handle Management (Capability System)
+
+```text
+acquire <path> [mode]
+release <handle_id>
+handles
+```
+
+* `acquire` — Replaces `open`. Manually requests a Handle to an Object.
+  * Modes: `r` (Read), `w` (Write), `rw` (Read/Write). Default: `r`.
+  * Output:
+
+```text
+Acquired Handle #7 for Object #104
+```
+
+* `release` — Replaces `close`. Drops a Handle, decrementing the Object's reference count.
+* `handles` — Displays the shell process's current Handle Table:
+
+```text
+HandleId | ObjectId | Rights | Offset
+```
+
+## VFS & Security Introspection
+
+```text
+mnts
+rights <path>
+```
+
+* `mnts` — Replaces `mounts`/`providers`. Lists active VFS mount points:
+
+```text
+Namespace Path | Provider Name | Status
+```
+
+Example:
+
+```text
+/ | HostFSProvider | Active
+```
+
+* `rights` — Evaluates effective access rights for a path:
+
+```text
+READ: Yes | WRITE: No | EXECUTE: No
+```
+
+## System Control
+
+```text
+exit
+```
+
+* `exit` — Gracefully shuts down the shell.
+* **Crucial Action:** Automatically iterates through the Handle Table and calls `release` on all open handles before terminating, preventing resource leaks.
+
+---
+
+# 8.4 — Process-Independent Shell
+
+Initially the shell runs as a Linux process.
+
+Later it becomes a native Hyber process.
+
+The shell must not depend on Linux-specific APIs. It should only use:
+
+```text
+Hyber VFS
+Hyber Namespace
+Hyber Handle Manager
+Hyber Object Manager
+Hyber Providers
+```
+
+---
+
+# 8.5 — Shell Path Handling
+
+Commands operate on:
 
 ```text
 Hyber paths
@@ -1354,9 +1500,58 @@ Example:
 ls /users/neo
 ```
 
+NOT:
+
+```text
+ls /home/neo/hyber-host/users/neo
+```
+
+## Path Handling Rules
+
+1. **Hyber Paths Only:** All commands accept Hyber namespace paths. They must never accept or expose Linux host paths.
+2. **Relative Resolution:** If a path does not start with `/`, it is resolved relative to the shell's current `pwd` context.
+3. **Normalization:** Paths like `/users/../users/./neo` are automatically normalized by the `NamespaceManager` before execution.
+
 ---
 
-# 8.5 — Phase 7 Exit Criteria
+# 8.6 — Implementation Strategy
+
+## REPL Loop
+
+The shell runs a continuous:
+
+```text
+Read → Eval → Print → Loop
+```
+
+## Parser
+
+A simple string tokenizer splits user input into:
+
+```text
+command
+arguments
+flags
+```
+
+## Execution
+
+* Standard commands map to `VFS` and `NamespaceManager` helpers.
+* Native commands map directly to `ObjectManager`, `HandleManager`, and `MountTable` queries.
+
+## Backend Initialization
+
+At startup, the shell:
+1. Creates an `ObjectManager`.
+2. Creates a `NamespaceManager` with root `/`.
+3. Creates a `HandleManager`.
+4. Initializes `HostFSProvider` at a safe, isolated directory (e.g., `~/hyber-host`).
+5. Mounts the provider at `/`.
+6. Enters the REPL loop.
+
+---
+
+# 8.7 — Phase 7 Exit Criteria
 
 You should be able to start:
 
@@ -1364,11 +1559,45 @@ You should be able to start:
 hyber-shell
 ```
 
-and interact with the Hyber namespace.
+and interact with the Hyber namespace using both standard and native commands.
+
+Example session:
+
+```text
+hyber> pwd
+/
+hyber> mkdir /users
+hyber> mkdir /users/neo
+hyber> touch /users/neo/test.txt
+hyber> acquire /users/neo/test.txt rw
+Acquired Handle #1 for Object #5
+hyber> handles
+HandleId | ObjectId | Rights | Offset
+1        | Obj(5)   | RW     | 0
+hyber> list /users/neo
+Name       | ObjectId | Type | Refs | Size
+test.txt   | Obj(5)   | FILE | 1    | 0
+hyber> look /users/neo/test.txt
+Object ID:   5
+Type:        FILE
+State:       LIVE
+References:  1
+Created:     2026-09-27 16:30:00
+Modified:    2026-09-27 16:30:00
+Provider:    HostFSProvider
+hyber> mnts
+Namespace Path | Provider Name    | Status
+/              | HostFSProvider   | Active
+hyber> release 1
+Released Handle #1
+hyber> exit
+```
 
 At this point the project becomes demonstrable.
 
+
 ---
+
 
 # 9. Phase 8 — Metadata System
 

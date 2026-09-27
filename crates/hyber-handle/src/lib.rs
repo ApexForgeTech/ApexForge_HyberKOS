@@ -147,5 +147,21 @@ impl HandleManager {
         handle.offset += bytes_read;
         Ok(())
     }
+
+    /// List all handles for a given process (for shell introspection)
+    pub fn list_handles(&self, process_id: ProcessId) -> Vec<&Handle> {
+        match self.process_tables.get(&process_id) {
+            Some(table) => table.handles.values().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Get all handle IDs for a given process (for cleanup)
+    pub fn list_handle_ids(&self, process_id: ProcessId) -> Vec<HandleId> {
+        match self.process_tables.get(&process_id) {
+            Some(table) => table.handles.keys().cloned().collect(),
+            None => Vec::new(),
+        }
+    }
 }
 

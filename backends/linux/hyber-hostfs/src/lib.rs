@@ -136,7 +136,7 @@ impl Provider for HostFSProvider {
 
     fn rename(
         &mut self,
-        obj_mgr: &mut ObjectManager, // Added to match the updated Provider trait
+        _obj_mgr: &mut ObjectManager, // Required by Provider trait but not used in HostFS rename
         ns_mgr: &mut NamespaceManager,
         old_parent_id: ObjectId,
         old_name: &str,
