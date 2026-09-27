@@ -7,3 +7,4 @@ edition = "2021"
 hyber-core = { path = "../hyber-core" }
 hyber-object = { path = "../hyber-object" }
 hyber-namespace = { path = "../hyber-namespace" }
+hyber-handle = { path = "../hyber-handle" }

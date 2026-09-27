@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 hyber-core = { path = "../hyber-core" }
 hyber-object = { path = "../hyber-object" }
+
+[dev-dependencies]
+hyber-namespace = { path = "../hyber-namespace" }
