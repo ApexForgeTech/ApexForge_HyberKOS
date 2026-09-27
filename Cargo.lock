@@ -48,6 +48,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyber-process"
+version = "0.1.0"
+dependencies = [
+ "hyber-core",
+ "hyber-handle",
+ "hyber-namespace",
+ "hyber-object",
+ "hyber-vfs",
+]
+
+[[package]]
 name = "hyber-shell"
 version = "0.1.0"
 dependencies = [
@@ -56,6 +67,7 @@ dependencies = [
  "hyber-hostfs",
  "hyber-namespace",
  "hyber-object",
+ "hyber-process",
  "hyber-vfs",
 ]
 

@@ -356,9 +356,9 @@ impl SecurityManager {
             return Ok(());
         }
 
-        let mut allowed_read = false;
-        let mut allowed_write = false;
-        let mut allowed_execute = false;
+        let allowed_read;
+        let allowed_write;
+        let allowed_execute;
 
         if context.user_id == owner {
             allowed_read = (permissions & 0o400) != 0;

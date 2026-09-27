@@ -85,17 +85,21 @@ impl MountTable {
 // ==========================================
 // 6.1 — VFS API
 // ==========================================
-pub struct VFS<P: Provider> {
-    provider: P,
+pub struct VFS {
+    providers: std::collections::HashMap<String, Box<dyn Provider>>,
     mount_table: MountTable,
 }
 
-impl<P: Provider> VFS<P> {
-    pub fn new(provider: P) -> Self {
+impl VFS {
+    pub fn new() -> Self {
         Self {
-            provider,
+            providers: std::collections::HashMap::new(),
             mount_table: MountTable::new(),
         }
+    }
+
+    pub fn register_provider(&mut self, name: String, provider: Box<dyn Provider>) {
+        self.providers.insert(name, provider);
     }
 
     pub fn mount(&mut self, path: Path, provider_name: String) {
@@ -112,11 +116,25 @@ impl<P: Provider> VFS<P> {
         handle_mgr: &mut HandleManager,
         obj_mgr: &mut ObjectManager,
         process_id: ProcessId,
+        security_context: &hyber_core::SecurityContext,
         path: &Path,
         rights: Rights,
     ) -> Result<HandleId, String> {
+        let provider_name = self.mount_table.find_provider(path)
+            .ok_or_else(|| format!("No provider mounted for path: {}", path))?;
+            
         let object_id = ns_mgr.resolve(path, ns_mgr.root())?;
-        handle_mgr.open(obj_mgr, process_id, object_id, rights)
+        
+        let obj = obj_mgr.lookup(object_id).ok_or("Object not found")?;
+        hyber_core::SecurityManager::check_access(
+            security_context,
+            obj.owner,
+            obj.group,
+            obj.permissions,
+            rights,
+        )?;
+
+        handle_mgr.open(obj_mgr, process_id, object_id, rights, provider_name)
     }
 
     pub fn close(
@@ -143,7 +161,11 @@ impl<P: Provider> VFS<P> {
         handle_mgr.check_rights(process_id, handle_id, Rights::read_only())?;
         let object_id = handle.object_id;
         let offset = handle.offset;
-        let bytes_read = self.provider.read(object_id, offset, buffer)?;
+        
+        let provider = self.providers.get(&handle.provider_name)
+            .ok_or_else(|| format!("Provider {} not found", handle.provider_name))?;
+            
+        let bytes_read = provider.read(object_id, offset, buffer)?;
         handle_mgr.update_offset(process_id, handle_id, bytes_read as u64)?;
         Ok(bytes_read)
     }
@@ -151,7 +173,7 @@ impl<P: Provider> VFS<P> {
     pub fn write(
         &mut self,
         handle_mgr: &mut HandleManager,
-        obj_mgr: &mut ObjectManager, // Added to update metadata
+        obj_mgr: &mut ObjectManager,
         process_id: ProcessId,
         handle_id: HandleId,
         buffer: &[u8],
@@ -164,10 +186,14 @@ impl<P: Provider> VFS<P> {
         handle_mgr.check_rights(process_id, handle_id, write_rights)?;
         let object_id = handle.object_id;
         let offset = handle.offset;
-        let bytes_written = self.provider.write(object_id, offset, buffer)?;
+        let provider_name = handle.provider_name.clone();
+        
+        let provider = self.providers.get_mut(&provider_name)
+            .ok_or_else(|| format!("Provider {} not found", provider_name))?;
+
+        let bytes_written = provider.write(object_id, offset, buffer)?;
         handle_mgr.update_offset(process_id, handle_id, bytes_written as u64)?;
         
-        // Update Core Metadata (Phase 8 completeness)
         if let Some(obj) = obj_mgr.lookup_mut(object_id) {
             let new_size = offset + (bytes_written as u64);
             if new_size > obj.size {
@@ -186,12 +212,29 @@ impl<P: Provider> VFS<P> {
         &mut self,
         ns_mgr: &mut NamespaceManager,
         obj_mgr: &mut ObjectManager,
+        security_context: &hyber_core::SecurityContext,
         parent_path: &Path,
         name: &str,
         obj_type: ObjectType,
     ) -> Result<ObjectId, String> {
+        let provider_name = self.mount_table.find_provider(parent_path)
+            .ok_or_else(|| format!("No provider mounted for path: {}", parent_path))?;
+            
         let parent_id = ns_mgr.resolve(parent_path, ns_mgr.root())?;
-        self.provider.create(obj_mgr, ns_mgr, parent_id, name, obj_type)
+        
+        let parent_obj = obj_mgr.lookup(parent_id).ok_or("Parent directory not found")?;
+        hyber_core::SecurityManager::check_access(
+            security_context,
+            parent_obj.owner,
+            parent_obj.group,
+            parent_obj.permissions,
+            Rights { write: true, ..Rights::empty() },
+        )?;
+
+        let provider = self.providers.get_mut(&provider_name)
+            .ok_or_else(|| format!("Provider {} not found", provider_name))?;
+            
+        provider.create(obj_mgr, ns_mgr, parent_id, name, obj_type)
     }
 
     pub fn remove(
@@ -201,32 +244,49 @@ impl<P: Provider> VFS<P> {
         parent_path: &Path,
         name: &str,
     ) -> Result<(), String> {
+        let provider_name = self.mount_table.find_provider(parent_path)
+            .ok_or_else(|| format!("No provider mounted for path: {}", parent_path))?;
         let parent_id = ns_mgr.resolve(parent_path, ns_mgr.root())?;
-        self.provider.remove(obj_mgr, ns_mgr, parent_id, name)
+        
+        let provider = self.providers.get_mut(&provider_name)
+            .ok_or_else(|| format!("Provider {} not found", provider_name))?;
+            
+        provider.remove(obj_mgr, ns_mgr, parent_id, name)
     }
 
     /// 7.6 Requirement:  rename in VFS level
         pub fn rename(
         &mut self,
         ns_mgr: &mut NamespaceManager,
-        obj_mgr: &mut ObjectManager, // Added here too
+        obj_mgr: &mut ObjectManager,
         old_parent_path: &Path,
         old_name: &str,
         new_parent_path: &Path,
         new_name: &str,
     ) -> Result<(), String> {
+        let provider_name = self.mount_table.find_provider(old_parent_path)
+            .ok_or_else(|| format!("No provider mounted for path: {}", old_parent_path))?;
+            
         let old_parent_id = ns_mgr.resolve(old_parent_path, ns_mgr.root())?;
         let new_parent_id = ns_mgr.resolve(new_parent_path, ns_mgr.root())?;
-        self.provider.rename(obj_mgr, ns_mgr, old_parent_id, old_name, new_parent_id, new_name)
+        
+        let provider = self.providers.get_mut(&provider_name)
+            .ok_or_else(|| format!("Provider {} not found", provider_name))?;
+            
+        provider.rename(obj_mgr, ns_mgr, old_parent_id, old_name, new_parent_id, new_name)
     }
 
     pub fn enumerate(&self, ns_mgr: &NamespaceManager, path: &Path) -> Result<Vec<(String, ObjectId)>, String> {
+        let provider_name = self.mount_table.find_provider(path)
+            .ok_or_else(|| format!("No provider mounted for path: {}", path))?;
         let dir_id = ns_mgr.resolve(path, ns_mgr.root())?;
-        self.provider.enumerate(dir_id)
+        
+        let provider = self.providers.get(&provider_name)
+            .ok_or_else(|| format!("Provider {} not found", provider_name))?;
+            
+        provider.enumerate(dir_id)
     }
 
-    pub fn provider(&self) -> &P { &self.provider }
-    pub fn provider_mut(&mut self) -> &mut P { &mut self.provider }
 
     /// Get all active mount points for introspection
     pub fn list_mounts(&self) -> &[Mount] {

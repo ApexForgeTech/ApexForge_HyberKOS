@@ -17,6 +17,7 @@ pub struct Handle {
     pub object_id: ObjectId,
     pub rights: Rights,
     pub offset: u64, // 5.5: Current read/write position (for File objects)
+    pub provider_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +34,7 @@ impl HandleTable {
         }
     }
 
-    pub fn allocate_handle(&mut self, object_id: ObjectId, rights: Rights) -> HandleId {
+    pub fn allocate_handle(&mut self, object_id: ObjectId, rights: Rights, provider_name: String) -> HandleId {
         let handle_id = HandleId(self.next_handle_id);
         self.next_handle_id += 1;
 
@@ -41,7 +42,8 @@ impl HandleTable {
             handle_id,
             object_id,
             rights,
-            offset: 0, // Initial offset is always 0
+            offset: 0,
+            provider_name,
         };
 
         self.handles.insert(handle_id, handle);
@@ -85,13 +87,14 @@ impl HandleManager {
         process_id: ProcessId,
         object_id: ObjectId,
         rights: Rights,
+        provider_name: String,
     ) -> Result<HandleId, String> {
         if !object_manager.retain(object_id) {
             return Err(format!("Cannot open: Object {:?} is destroyed or does not exist", object_id));
         }
 
         let table = self.get_or_create_table(process_id);
-        let handle_id = table.allocate_handle(object_id, rights);
+        let handle_id = table.allocate_handle(object_id, rights, provider_name);
 
         Ok(handle_id)
     }

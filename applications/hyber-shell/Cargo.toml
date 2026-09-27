@@ -10,3 +10,4 @@ hyber-namespace = { path = "../../crates/hyber-namespace" }
 hyber-handle = { path = "../../crates/hyber-handle" }
 hyber-vfs = { path = "../../crates/hyber-vfs" }
 hyber-hostfs = { path = "../../backends/linux/hyber-hostfs" }
+hyber-process = { path = "../../crates/hyber-process" }
