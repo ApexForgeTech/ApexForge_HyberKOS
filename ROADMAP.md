@@ -2049,6 +2049,42 @@ exit
 
 ---
 
+# 13.6. Phase 12.5 — Advanced Lua Integration
+
+## Objective
+
+Expose all advanced abstractions (Phases 1-11) fully to Lua, turning Lua into the primary System Controller rather than just a simple script runner.
+
+---
+
+# 13.6.1 — Process Management in Lua
+
+Expose process spawning and IPC to Lua:
+
+```lua
+local pid = hyber.proc.spawn("/apps/editor.lua")
+hyber.proc.wait(pid)
+```
+
+---
+
+# 13.6.2 — Advanced Metadata & Security
+
+Allow Lua to modify extended metadata and evaluate security rules directly:
+
+```lua
+hyber.obj.meta_set(path, "sys.role", "string", "daemon")
+local can_write = hyber.sec.check_access(path, "WRITE")
+```
+
+---
+
+# 13.6.3 — Phase 12.5 Exit Criteria
+
+Lua can fully control processes, permissions, and IPC, effectively acting as the orchestrator for the operating system's user space.
+
+---
+
 # 14. Phase 13 — Hyber Application API
 
 ## Objective
@@ -2608,13 +2644,25 @@ Service Object
 
 ---
 
-# 19.2 — Service Manifest
+# 19.2 — Service Definition (Lua-Driven)
 
-Example:
+Instead of static TOML/INI files, use Lua scripts to define and control services dynamically.
 
-```toml
-name = "network"
-startup = "automatic"
+Example (`/services/network.lua`):
+
+```lua
+return {
+    name = "network",
+    startup = "automatic",
+    dependencies = {"dns"},
+    start = function()
+        hyber.log.info("Starting network interface...")
+        -- setup logic
+    end,
+    stop = function()
+        hyber.log.info("Shutting down network...")
+    end
+}
 ```
 
 ---
@@ -2783,6 +2831,10 @@ Design a Hyber security layer.
 
 A Hyber application can create a network connection without knowing Linux networking internals.
 
+# 21.7 — Go Integration for Networking
+
+Once user-space network daemons are needed, leverage **Go (Golang)**. Its goroutines and robust standard library make it the ideal language for implementing high-performance user-space network stacks, proxies, and services within HyberKOS.
+
 ---
 
 # 22. Phase 21 — Native Kernel Preparation
@@ -2839,9 +2891,9 @@ may be supported.
 
 ---
 
-# 22.3 — Boot
+# 22.3 — Boot (ASM / C / C++)
 
-Implement:
+Implement using **Assembly** and **C/C++** (or bare-metal Rust):
 
 ```text
 boot entry
@@ -2850,11 +2902,13 @@ stack
 early console
 ```
 
+These operations require the lowest-level hardware manipulation where Rust's memory safety model might be too restrictive.
+
 ---
 
-# 22.4 — GDT / IDT
+# 22.4 — GDT / IDT (ASM)
 
-Implement architecture-specific structures.
+Implement architecture-specific structures utilizing **Assembly** macros and instructions for precise CPU control.
 
 ---
 
@@ -3308,9 +3362,11 @@ Port the service and runtime ecosystem.
 
 ---
 
-# 29.1 — Init System
+# 29.1 — Init System (init.lua)
 
-Create the first native system manager.
+Create the first native system manager driven entirely by Lua.
+
+The kernel boots, mounts the VFS, and immediately executes `/system/init.lua` which orchestrates the rest of the OS startup.
 
 ---
 
@@ -3354,45 +3410,37 @@ Applications
 
 ---
 
-# 30. Phase 29 — Multi-Language Ecosystem
+# 30. Phase 29 — Multi-Language Ecosystem (Polyglot OS)
 
 ## Objective
 
-Expand application language support.
+Expand application language support to ensure every task is written in the best tool for the job.
 
 Implement one language at a time.
 
-Recommended order:
+Recommended roles:
 
 ```text
-C
- ↓
-Rust
- ↓
-Lua
- ↓
-C++
- ↓
-Python
- ↓
-Go
- ↓
-Java/Kotlin
- ↓
-JavaScript/TypeScript
+C / C++             -> Hardware Drivers, GUI Compositors, Low-level performance
+Rust                -> Kernel Core, VFS, Object Managers, Security
+Lua                 -> Init system, Service Management, System Automation
+Go                  -> Networking Stack, Microservices, Background Daemons
+Java / Kotlin       -> Enterprise Applications, Android-like App Ecosystem
+JavaScript / TS     -> Desktop Environment, Window Manager UI
+Python              -> Data processing, Scripting, AI/ML Tooling
 ```
-
-The exact order can change based on technical requirements.
 
 ---
 
-# 30.1 — C
+# 30.1 — C / C++
 
 Create:
 
 ```text
 libhyber
 ```
+
+Provide C-compatible ABI interoperability. High-performance gaming and graphics APIs.
 
 ---
 
@@ -3404,23 +3452,19 @@ Create:
 hyber-rs
 ```
 
+Idiomatic Rust bindings for kernel development and safe systems programming.
+
 ---
 
 # 30.3 — Lua
 
 Already implemented.
 
-Improve its API.
+Will act as the primary Orchestrator and init system for HyberKOS.
 
 ---
 
-# 30.4 — C++
-
-Provide C-compatible ABI interoperability.
-
----
-
-# 30.5 — Python
+# 30.4 — Python
 
 Build:
 
@@ -3430,7 +3474,7 @@ Python → Hyber API
 
 ---
 
-# 30.6 — Go
+# 30.5 — Go (Golang)
 
 Build:
 
@@ -3438,9 +3482,11 @@ Build:
 Go → Hyber API
 ```
 
+Focus Go specifically on networking applications and highly concurrent background tasks.
+
 ---
 
-# 30.7 — JVM
+# 30.6 — JVM (Java / Kotlin)
 
 Build:
 
@@ -3454,14 +3500,14 @@ Hyber API
 
 ---
 
-# 30.8 — JavaScript / TypeScript
+# 30.7 — JavaScript / TypeScript
 
 Build:
 
 ```text
 JS/TS
  ↓
-Runtime
+Runtime (e.g. V8 / Bun / Deno)
  ↓
 Hyber API
 ```
@@ -3508,25 +3554,29 @@ touch
 
 ---
 
-# 31.4 — GUI Toolkit
+# 31.4 — GUI Toolkit (Backend)
 
-Possible implementation:
+Written in:
 
 ```text
-Rust
 C++
+Rust
 ```
+
+To provide hardware acceleration, compositing, and rendering pipelines (e.g. Vulkan / OpenGL wrappers).
 
 ---
 
-# 31.5 — React/TypeScript Layer
+# 31.5 — React/TypeScript Desktop Layer
 
-Later provide:
+The actual user-facing window manager, taskbars, and desktop applications will be built with web technologies to ensure breathtaking aesthetics and rapid development:
 
 ```text
-React
- ↓
-Hyber GUI Runtime
+React / HTML / CSS / TS
+       ↓
+Hyber GUI Runtime (WebView/V8)
+       ↓
+C++/Rust Compositor
 ```
 
 ---
@@ -4529,6 +4579,9 @@ Virtual Namespaces
 PHASE 12
 Lua Runtime
 
+PHASE 12.5
+Advanced Lua Integration
+
 PHASE 13
 Hyber Application API / ABI
 
@@ -4578,10 +4631,10 @@ PHASE 28
 Native Services + Runtime
 
 PHASE 29
-Multi-Language Ecosystem
+Multi-Language Ecosystem (Polyglot OS)
 
 PHASE 30
-GUI
+GUI (React/TypeScript Desktop)
 
 PHASE 31
 Package Ecosystem
