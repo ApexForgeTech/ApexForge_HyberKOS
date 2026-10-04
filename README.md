@@ -225,6 +225,25 @@ A conceptual namespace may contain:
 └── developer/
 ```
 
+Application-owned data is intentionally separated by lifetime and ownership.
+User configuration, persistent application data, state, cache, temporary data,
+and live runtime data are not interchangeable:
+
+```text
+/users/<user>/.config/<app-id>/       configuration
+/users/<user>/.local/share/<app-id>/  persistent application data
+/users/<user>/.local/state/<app-id>/  recoverable state
+/users/<user>/.cache/<app-id>/        disposable cache
+/temporary/users/<user>/<app-id>/     disposable temporary data
+/runtime/users/<user>/                live session/runtime data
+/data/services/<service-id>/          service-owned persistent data
+```
+
+The logical application-directory API, user/group/session model, shell history,
+and Lua profile contract are mandatory integration gates between reliable
+HyberFS and package management. They are tracked as `Special_1`–`Special_8` in
+the roadmap; they are not additional numbered platform phases.
+
 Not every entry has to represent physical storage.
 
 Some namespaces may be backed by virtual providers:
@@ -582,6 +601,12 @@ The current implementation is **v0.12.5**: Phase 12.5 is complete, and the
 Lua-only foundation of Phase 14 is available through the `hyber` CLI. Phase 13
 (the stable C/Rust/multi-language API) is intentionally deferred until after
 Phase 30, as recorded in the roadmap.
+
+The roadmap also defines the `Special_1`–`Special_8` integration gate between
+Phase 16 (HyberFS Reliability) and Phase 17 (Package Manager). These specials
+cover identity, sessions, application data directories, shell history/input,
+Lua profiles, manifests/sandboxing, and service/network boundaries before
+packages are allowed to bypass those contracts.
 
 Implemented capabilities include:
 * A fully functional **Object and Handle Manager** with strong/weak reference counting and capability revocation.

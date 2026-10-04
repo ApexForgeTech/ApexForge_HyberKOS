@@ -1193,6 +1193,23 @@ Some entries may be persistent.
 
 Others may be virtual.
 
+Application data is separated by owner and lifetime. The canonical contract is:
+
+```text
+/apps/<app-id>/                         installed application content
+/users/<user>/.config/<app-id>/         configuration
+/users/<user>/.local/share/<app-id>/    persistent application data
+/users/<user>/.local/state/<app-id>/    recoverable state
+/users/<user>/.cache/<app-id>/          disposable cache
+/temporary/users/<user>/<app-id>/       temporary data
+/runtime/users/<user>/                  live session state
+/data/services/<service-id>/            service-owned data
+```
+
+Identity, sessions, shell history/input, Lua profiles, manifests, and these
+data scopes are integrated in the roadmap's `Special_1`–`Special_8` gate before
+package installation.
+
 ---
 
 # 21. Filesystem Architecture
@@ -1578,6 +1595,11 @@ No single language should dominate the entire architecture.
 | React           | GUI/application frontend                                     |
 | HyberLang       | Future native language                                       |
 | Other languages | Through Hyber API/ABI                                        |
+
+The language map does not make Lua the operating-system architecture. Rust
+owns core security, lifecycle, and object boundaries; Lua provides user-space
+orchestration/configuration; Go provides selected user-space service and
+network data-plane implementations under Hyber supervision.
 
 ---
 
@@ -2178,6 +2200,11 @@ hyber-shell
 ```
 
 The shell should interact with Hyber abstractions.
+
+The shell's interactive input, history controller, GUI previous/next buttons,
+user/session isolation, and Lua profile loading are defined together by the
+`Special_4` and `Special_5` roadmap gates. A history navigation action changes
+the input buffer only; it does not execute a command until explicit submission.
 
 Example:
 

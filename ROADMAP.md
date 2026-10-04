@@ -2805,13 +2805,372 @@ recovery never invents or silently drops committed user data
 
 ---
 
+# Special Integration Gate — Special_*
+
+Phase 16 (HyberFS Reliability) is complete as a filesystem phase, but Phase 17
+must not begin until the following mandatory special phases are complete. These
+phases do not renumber or replace Phase 17. They connect reliable storage to
+identity, sessions, shell behavior, Lua configuration, application data, and
+the future service/network boundaries.
+
+Every special phase preserves the rule that Lua orchestrates user-space policy
+without becoming the kernel, process model, VFS, or public ABI.
+
+---
+
+# Special_1 — Identity, Users, and Groups
+
+## Objective
+
+Turn the existing `UserId`, `GroupId`, owner/group fields, permissions, and
+capabilities into a coherent Hyber account model before package installation
+and service ownership are introduced.
+
+## Responsibilities
+
+```text
+User Object and Group Object
+username/group-name validation
+stable UserId/GroupId allocation
+primary and supplementary memberships
+account states: active, locked, disabled, service, guest
+home-directory and service-account ownership
+reserved identity policy for root/system users
+```
+
+IDs are Hyber identifiers, not host UIDs/GIDs. The model supports Linux-like
+owner/group/other permissions and Windows-like named groups without copying
+either operating system's internal ABI.
+
+## Language Boundary
+
+```text
+Rust → account registry, validation, credential/session types, security checks
+Lua  → capability-checked administrative workflows
+Go   → not required for identity correctness
+```
+
+The registry is persisted on HyberFS, uses atomic updates, rejects duplicate
+names and IDs, protects reserved identities, and records administrative
+mutations for audit.
+
+## Exit Criteria
+
+```text
+users/groups can be created, looked up, disabled, and listed
+primary/supplementary membership is deterministic
+SecurityContext uses the same owner/group checks everywhere
+reserved IDs and duplicate names are rejected
+home and service ownership are validated
+account corruption is detected before session creation
+```
+
+---
+
+# Special_2 — Sessions, Authentication, and Credential Boundaries
+
+## Objective
+
+Create a user-space authentication/session boundary that produces a complete,
+least-privilege Hyber `SecurityContext` without placing password or login
+policy in the kernel, shell, Lua profile, or GUI.
+
+## Responsibilities
+
+```text
+credential records and password-hash storage
+authentication result and session ID
+primary/supplementary groups and capability derivation
+logout and session invalidation
+locked/disabled/expired account policy
+interactive, service, and non-interactive sessions
+```
+
+Passwords and tokens are never stored in plaintext. Authentication failures do
+not reveal whether a username exists. A failed profile or shell cannot elevate
+a session.
+
+## Language Boundary
+
+```text
+Rust → credential/session types and security boundary
+Lua  → trusted administrative workflows only
+Go   → optional future auth/network payload, never authority
+```
+
+## Exit Criteria
+
+```text
+successful login yields a least-privilege SecurityContext
+logout invalidates the session
+locked/disabled users cannot create sessions
+supplementary groups/capabilities are tested
+credential data is protected and non-plaintext
+shell/services/apps consume the same session context
+```
+
+---
+
+# Special_3 — Home, Runtime, Cache, and Application Data Layout
+
+## Objective
+
+Define standard locations so configuration, persistent data, cache, temporary
+files, and live runtime state never get mixed together.
+
+## Canonical Layout
+
+```text
+/apps/<app-id>/                         installed/read-only app files
+/data/services/<service-id>/            service persistent data
+/data/shared/<namespace>/               capability-controlled shared data
+/data/logs/                             persistent logs
+/runtime/users/<user-id>/               live sessions/runtime
+/runtime/services/<service-id>/         live service state
+/runtime/sockets/                       live IPC endpoints
+/temporary/users/<user-id>/<app-id>/    disposable user-app data
+/temporary/system/                      disposable system staging
+/users/<user>/Documents/
+/users/<user>/Downloads/
+/users/<user>/.config/<app-id>/         configuration
+/users/<user>/.local/share/<app-id>/    persistent app data
+/users/<user>/.local/state/<app-id>/    recoverable app state
+/users/<user>/.cache/<app-id>/          disposable cache
+/users/<user>/.local/bin/               user executables
+```
+
+Applications use logical APIs (`app.config_dir()`, `app.data_dir()`,
+`app.state_dir()`, `app.cache_dir()`, `app.temp_dir()`, and
+`app.runtime_dir()`) rather than hardcoded host paths.
+
+## Rules
+
+```text
+/apps is installation/read-only content
+cache deletion cannot destroy the only user-data copy
+/runtime and /temporary are not backup data
+service data is owned by service identities
+shared data requires explicit capability
+quotas and cleanup policy are explicit per class
+```
+
+## Language Boundary
+
+```text
+Rust → path-provider, ownership, quotas, cleanup, VFS/security integration
+Lua  → user-space app access through logical directory APIs
+Go   → service/app consumers only, never storage-layout authority
+```
+
+## Exit Criteria
+
+```text
+new users receive correct home trees and ownership
+apps receive isolated config/data/state/cache/temp/runtime paths
+cross-user access is denied by default
+runtime/temp cleanup is safe and observable
+persistent paths survive remount; cache/temp are disposable
+```
+
+---
+
+# Special_4 — Shell Input, History, and Navigation
+
+## Objective
+
+Make command input consistent across keyboard, GUI buttons, and future input
+devices, including reliable history navigation.
+
+## Responsibilities
+
+```text
+input buffer and cursor
+Up/Down history navigation
+GUI previous/next buttons using the same history controller
+session and persistent history
+history limits, deduplication, sensitive-command filtering
+reverse search and clear operations
+EOF, interrupt, cancel, and redraw behavior
+```
+
+Up/Down changes the input buffer only; it never executes a command. Execution
+requires explicit submission. History is per user/session, permission
+protected, bounded, and never stores passwords or declared secrets.
+
+## Language Boundary
+
+```text
+Rust → shell parser, line editor, history controller, state machine
+Lua  → aliases/functions/hooks through a restricted API
+Go   → not required for interactive shell correctness
+GUI  → calls the same shell controller, never a duplicate history engine
+```
+
+## Exit Criteria
+
+```text
+keyboard and GUI navigation are identical
+history is isolated per user/session
+reverse search and clear are deterministic
+secret-like commands are filtered or explicitly confirmed
+invalid commands cannot corrupt the input buffer
+shell restart preserves only configured persistent history
+```
+
+---
+
+# Special_5 — Lua Shell Profiles and Environment
+
+## Objective
+
+Provide a safe Bashrc/Zshrc-like configuration model without making Lua the
+operating-system architecture.
+
+## Profile Order
+
+```text
+/etc/hyber/profile.lua
+/users/<user>/.hyber_profile.lua
+/users/<user>/.hyber_login.lua       (login shells only)
+/users/<user>/.hyberrc.lua           (interactive shells)
+```
+
+Profiles may define aliases, prompt functions, environment variables,
+completion, key bindings, and shell hooks. They may not define the kernel
+process model, bypass permissions, or access the host without capabilities.
+
+Profile execution is sandboxed and capability-aware. A profile error logs a
+warning and opens safe mode; it cannot prevent recovery or silently grant
+privileges. Non-interactive scripts do not execute interactive profiles unless
+explicitly requested.
+
+## Language Boundary
+
+```text
+Rust → profile loader, ordering, limits, safe-mode fallback
+Lua  → profile content, aliases, prompt, environment, user hooks
+Go   → not required
+```
+
+## Exit Criteria
+
+```text
+login/non-login/interactive ordering is tested
+system profile cannot be overridden to elevate privileges
+profile failures are recoverable
+environment changes are session-scoped
+aliases and prompt customization use stable shell APIs
+```
+
+---
+
+# Special_6 — Application Manifest, Sandbox, and Data Permissions
+
+## Objective
+
+Connect application identity to the data layout, user/group model, and
+capability system before Phase 17 packages are installed.
+
+## Manifest Scope
+
+```text
+application ID/version and entrypoint/runtime
+requested capabilities
+config/data/state/cache/temp/runtime scopes
+publisher and user-facing name
+service/background policy
+network policy
+resource quotas
+```
+
+Manifest permissions are requests, not grants. Rust validates and grants least
+privilege; Lua can read the resulting context but cannot enlarge it. Go apps
+receive the same manifest-derived context.
+
+## Exit Criteria
+
+```text
+application IDs are unique and validated
+paths cannot escape assigned data roots
+requested capabilities require policy approval
+manifest upgrades are versioned and reversible
+GUI/background/service policy is explicit
+package installation can consume this contract unchanged
+```
+
+---
+
+# Special_7 — Service and Network Boundary Preparation
+
+## Objective
+
+Prepare the contracts that Phase 18 services and Phase 20 networking consume,
+without prematurely implementing their complete supervisors or network stacks.
+
+## Explicit Language Plan
+
+```text
+Rust → service lifecycle/control plane, Hyber objects, security, socket API
+Lua  → declarative service definitions, startup policy, health checks, admin
+Go   → service payloads and user-space network daemons/data plane
+```
+
+The service supervisor and security authority are not Lua or Go. Go services
+are ordinary supervised Hyber applications. Lua cannot kill arbitrary
+processes or open unrestricted sockets. Host adapters remain isolated and
+temporary; native networking remains a later Rust-first phase.
+
+## Exit Criteria
+
+```text
+service manifest schema is versioned
+Rust supervisor boundary is defined
+Lua definition validation rules are defined
+Go daemon lifecycle and IPC contract is defined
+capability/network policy is explicit
+service/socket ownership maps to users/groups
+Phase 18/20 can begin without redefining identity or data paths
+```
+
+---
+
+# Special_8 — Cross-Layer Integration, Migration, and Gate Review
+
+## Objective
+
+Integrate reliable storage, identities, sessions, shell, Lua profiles,
+application data, and service boundaries before package management begins.
+
+## Required Integration Tests
+
+```text
+create user/group → login → create home tree → start shell
+load profile → set prompt/alias → navigate persistent history
+launch app → verify config/data/cache/temp/runtime isolation
+deny cross-user and undeclared-capability access
+restart session → verify only persistent classes survive
+mount/remount HyberFS → verify accounts and app data
+define Lua service → validate Rust supervision boundary
+launch Go payload contract test → verify identity/capabilities
+inject input event → verify shell/UI consumes one neutral event
+```
+
+No Phase 17 package format or installer may bypass these contracts. Any
+incompatible storage, identity, manifest, shell, or capability change requires
+an explicit migration/version decision. The gate is complete only when all
+special-phase, workspace, corruption, and security tests pass.
+
+---
+
 # 18. Phase 17 — Package Manager
 
 ## Objective
 
-Turn Lua applications and their resources into verifiable, installable
-packages on the Phase 15/16 storage foundation. This phase does not freeze the
-future multi-language ABI.
+Turn Lua applications, Go service payloads, and later language applications
+into verifiable, installable packages on the Phase 15/16 storage foundation.
+Installation consumes the `Special_1`–`Special_8` identity, session,
+data-directory, manifest, capability, and service contracts; it does not
+redefine them or freeze the future multi-language ABI.
 
 ---
 
@@ -2821,10 +3180,13 @@ Define:
 
 ```text
 package metadata
+application ID and runtime/language
 files
 permissions
+capabilities and data scopes
 dependencies
 entrypoint
+service/background policy
 signature
 ```
 
@@ -5069,6 +5431,30 @@ HyberFS
 
 PHASE 16
 HyberFS Reliability
+
+SPECIAL_1
+Identity, Users, and Groups
+
+SPECIAL_2
+Sessions, Authentication, and Credential Boundaries
+
+SPECIAL_3
+Home, Runtime, Cache, and Application Data Layout
+
+SPECIAL_4
+Shell Input, History, and Navigation
+
+SPECIAL_5
+Lua Shell Profiles and Environment
+
+SPECIAL_6
+Application Manifest, Sandbox, and Data Permissions
+
+SPECIAL_7
+Service and Network Boundary Preparation
+
+SPECIAL_8
+Cross-Layer Integration, Migration, and Gate Review
 
 PHASE 17
 Package Manager

@@ -39,6 +39,15 @@ When the shell starts, it mounts `~/hyber-host/` as **HostFS** and creates the f
 └── temporary/    ← MemFS  (temporary scratch space)
 ```
 
+The `/config` namespace remains a system-level compatibility area. Per-user
+application data follows the special integration contract: configuration is
+under `/users/<user>/.config/<app-id>`, persistent data under
+`.local/share/<app-id>`, recoverable state under `.local/state/<app-id>`, cache
+under `.cache/<app-id>`, temporary data under `/temporary/users/<user>/<app-id>`,
+and live session data under `/runtime/users/<user>/`. These boundaries are
+formalized by `Special_3` and enforced through logical application-directory
+APIs rather than hardcoded host paths.
+
 ---
 
 ## Standard Operations
