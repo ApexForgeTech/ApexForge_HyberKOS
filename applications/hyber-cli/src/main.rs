@@ -1,5 +1,5 @@
 //! HyberKOS Developer Toolchain — `hyber` CLI
-//! Phase 14 — Developer Toolchain
+//! Phase 14A — Lua Foundation Developer Toolchain
 //!
 //! ## Commands
 //!
@@ -57,7 +57,7 @@ fn main() {
         }
         "version" | "--version" | "-v" => {
             println!("hyber {}", env!("CARGO_PKG_VERSION"));
-            println!("HyberKOS Developer Toolchain — Phase 14");
+            println!("HyberKOS Developer Toolchain — Phase 14A");
             Ok(())
         }
         other => {
@@ -78,7 +78,7 @@ fn print_help() {
         "HyberKOS Developer Toolchain v{}",
         env!("CARGO_PKG_VERSION")
     );
-    println!("Phase 14 — Lua Application Runner & Inspector");
+    println!("Phase 14A — Lua Application Runner & Inspector");
     println!();
     println!("USAGE:");
     println!("  hyber <COMMAND> [OPTIONS]");

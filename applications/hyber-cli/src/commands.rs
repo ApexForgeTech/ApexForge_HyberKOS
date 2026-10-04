@@ -103,8 +103,10 @@ pub fn trace(args: &[String]) -> Result<(), String> {
 
 pub fn new_app(args: &[String]) -> Result<(), String> {
     let name = one_path(args, "new <name>")?;
-    if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
-        return Err("application name must be one simple directory name".into());
+    if !is_valid_app_name(&name) {
+        return Err(
+            "application name must contain only ASCII letters, digits, '-' or '_' and start with a letter or digit".into(),
+        );
     }
     let dir = PathBuf::from(&name);
     if dir.exists() {
@@ -123,6 +125,12 @@ pub fn new_app(args: &[String]) -> Result<(), String> {
     }
     println!("Created Lua application at {}", dir.display());
     Ok(())
+}
+
+fn is_valid_app_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn one_path(args: &[String], usage: &str) -> Result<String, String> {
@@ -166,4 +174,25 @@ fn script_path(input: &str) -> Result<PathBuf, String> {
         let _ = (permissions.read, permissions.write); // parsed now; Phase 13 enforces portable manifests.
     }
     Ok(canonical_entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_app_name;
+
+    #[test]
+    fn accepts_safe_application_names() {
+        assert!(is_valid_app_name("calculator"));
+        assert!(is_valid_app_name("app_2"));
+        assert!(is_valid_app_name("demo-app"));
+    }
+
+    #[test]
+    fn rejects_path_or_toml_injection_names() {
+        assert!(!is_valid_app_name("../escape"));
+        assert!(!is_valid_app_name("bad/name"));
+        assert!(!is_valid_app_name("bad\"\nversion = \"evil"));
+        assert!(!is_valid_app_name("_starts-with-symbol"));
+        assert!(!is_valid_app_name(""));
+    }
 }

@@ -2356,6 +2356,20 @@ Define and prototype persistent HyberFS storage. This phase is not the native
 kernel filesystem implementation; that work is reserved for Phase 25 after the
 native VFS and device layers exist.
 
+## Implementation Languages
+
+The filesystem format and on-disk rules are language-neutral and must be
+specified in documentation first. The executable Phase 15 prototype and its
+tests should be written in Rust because it is memory-safe, portable, and
+already matches the existing Hyber object/VFS code. Rust is the implementation
+language here, not part of the public filesystem format or future application
+ABI.
+
+Lua may orchestrate demonstrations and test scenarios once the relevant Hyber
+APIs exist, but Lua must not define the on-disk format or storage invariants.
+C/C++ and assembly are not required for this user-space design/prototype;
+low-level native storage work belongs to Phases 21–25.
+
 Do not start earlier.
 
 The Object/Node/VFS semantics should already be proven.
