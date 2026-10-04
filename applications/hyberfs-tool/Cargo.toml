@@ -1,0 +1,8 @@
+[package]
+name = "hyberfs-tool"
+version = "0.15.0"
+edition = "2021"
+description = "HyberFS Phase 15 image and inspection tool"
+
+[dependencies]
+hyber-fs = { path = "../../crates/hyber-fs" }

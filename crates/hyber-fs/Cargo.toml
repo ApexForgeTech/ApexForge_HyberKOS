@@ -1,0 +1,7 @@
+[package]
+name = "hyber-fs"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 15 user-space HyberFS format and prototype"
+
+[dependencies]

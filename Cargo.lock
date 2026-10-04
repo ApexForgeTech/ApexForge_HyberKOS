@@ -121,6 +121,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyber-fs"
+version = "0.1.0"
+
+[[package]]
 name = "hyber-handle"
 version = "0.1.0"
 dependencies = [
@@ -223,6 +227,13 @@ dependencies = [
  "hyber-handle",
  "hyber-namespace",
  "hyber-object",
+]
+
+[[package]]
+name = "hyberfs-tool"
+version = "0.15.0"
+dependencies = [
+ "hyber-fs",
 ]
 
 [[package]]

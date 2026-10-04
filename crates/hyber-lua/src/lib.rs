@@ -57,6 +57,14 @@
 //! | `hyber.log.info(msg)` | info print |
 //! | `hyber.log.warn(msg)` | warning print |
 //! | `hyber.log.error(msg)` | error print |
+//!
+//! ### `hyber.input` *(early, OS-neutral event queue)*
+//! | Function | Description |
+//! |---|---|
+//! | `hyber.input.next()` | consume the next input event or return `nil` |
+//! | `hyber.input.pending()` | number of queued events |
+//! | `hyber.input.emit(kind, code, value)` | inject a synthetic event; capability checked |
+//! | `hyber.input.clear()` | discard queued events |
 
 use hyber_core::{MetadataValue, Path, ProcessId, Rights, SecurityContext, SecurityManager};
 use hyber_handle::HandleManager;
@@ -65,6 +73,7 @@ use hyber_object::ObjectManager;
 use hyber_process::ProcessManager;
 use hyber_vfs::VFS;
 use mlua::prelude::*;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 // ── Shared kernel state ───────────────────────────────────────────────────────
@@ -77,6 +86,15 @@ struct KernelState {
     proc_mgr: Arc<Mutex<ProcessManager>>,
     process_id: ProcessId,
     security_context: SecurityContext,
+    input_queue: VecDeque<InputEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct InputEvent {
+    kind: String,
+    code: String,
+    value: i64,
+    timestamp: u64,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -114,6 +132,7 @@ pub fn run_lua_script(
         proc_mgr,
         process_id,
         security_context,
+        input_queue: VecDeque::new(),
     }));
 
     let exec_res = (|| -> Result<(), mlua::Error> {
@@ -143,6 +162,7 @@ fn build_hyber_table(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<()>
     hyber.set("obj", build_obj(lua, Arc::clone(&state))?)?;
     hyber.set("proc", build_proc(lua, Arc::clone(&state))?)?;
     hyber.set("sec", build_sec(lua, Arc::clone(&state))?)?;
+    hyber.set("input", build_input(lua, Arc::clone(&state))?)?;
     hyber.set("log", build_log(lua)?)?;
     hyber.set(
         "cls",
@@ -640,6 +660,83 @@ fn build_sec(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
     Ok(t)
 }
 
+// ── hyber.input ─────────────────────────────────────────────────────────────
+
+/// Input is intentionally an OS-neutral event queue.  A future display/input
+/// subsystem can feed this queue; tests and privileged system scripts can
+/// inject synthetic events through the capability-checked `emit` function.
+fn build_input(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>> {
+    let t = lua.create_table()?;
+
+    {
+        let state = Arc::clone(&state);
+        t.set(
+            "next",
+            lua.create_function(move |lua, ()| {
+                let mut ks = lock(&state)?;
+                match ks.input_queue.pop_front() {
+                    Some(event) => {
+                        let out = lua.create_table()?;
+                        out.set("kind", event.kind)?;
+                        out.set("code", event.code)?;
+                        out.set("value", event.value)?;
+                        out.set("timestamp", event.timestamp)?;
+                        Ok(LuaValue::Table(out))
+                    }
+                    None => Ok(LuaValue::Nil),
+                }
+            })?,
+        )?;
+    }
+
+    {
+        let state = Arc::clone(&state);
+        t.set(
+            "pending",
+            lua.create_function(move |_lua, ()| Ok(lock(&state)?.input_queue.len() as u64))?,
+        )?;
+    }
+
+    {
+        let state = Arc::clone(&state);
+        t.set(
+            "clear",
+            lua.create_function(move |_lua, ()| {
+                lock(&state)?.input_queue.clear();
+                Ok(())
+            })?,
+        )?;
+    }
+
+    {
+        let state = Arc::clone(&state);
+        t.set(
+            "emit",
+            lua.create_function(move |_lua, (kind, code, value): (String, String, i64)| {
+                let mut ks = lock(&state)?;
+                SecurityManager::check_capability(&ks.security_context, "CAP_INPUT_INJECT")
+                    .map_err(lua_err)?;
+                if kind.is_empty() || kind.len() > 32 || code.is_empty() || code.len() > 64 {
+                    return Err(lua_err("input kind/code has an invalid length".into()));
+                }
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                ks.input_queue.push_back(InputEvent {
+                    kind,
+                    code,
+                    value,
+                    timestamp,
+                });
+                Ok(true)
+            })?,
+        )?;
+    }
+
+    Ok(t)
+}
+
 // ── hyber.log ────────────────────────────────────────────────────────────────
 
 fn build_log(lua: &Lua) -> LuaResult<LuaTable<'_>> {
@@ -726,5 +823,43 @@ fn metadata_to_lua<'lua>(lua: &'lua Lua, val: &MetadataValue) -> LuaResult<LuaVa
             }
             Ok(LuaValue::Table(t))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_queue_round_trip_is_available_to_lua() {
+        let mut objects = ObjectManager::new();
+        let namespaces = NamespaceManager::new(&mut objects);
+        let handles = HandleManager::new();
+        let mut processes = ProcessManager::new();
+        let process_id = processes
+            .create_process(&mut objects, None, SecurityContext::root(), None)
+            .expect("process");
+        processes.start_process(process_id).expect("start");
+        let script = r#"
+            assert(hyber.input.pending() == 0)
+            assert(hyber.input.emit("keyboard", "KEY_A", 1))
+            assert(hyber.input.pending() == 1)
+            local event = hyber.input.next()
+            assert(event.kind == "keyboard")
+            assert(event.code == "KEY_A")
+            assert(event.value == 1)
+            assert(hyber.input.pending() == 0)
+        "#;
+        let (_, _, _, _, result) = run_lua_script(
+            script,
+            VFS::new(),
+            namespaces,
+            handles,
+            objects,
+            Arc::new(Mutex::new(processes)),
+            process_id,
+            SecurityContext::root(),
+        );
+        assert!(result.is_ok(), "Lua input script failed: {result:?}");
     }
 }

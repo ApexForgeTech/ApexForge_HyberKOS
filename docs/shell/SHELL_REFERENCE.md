@@ -583,6 +583,35 @@ print(content)
 
 ---
 
+## `hyber.input` — Early Input Events
+
+Lua receives OS-neutral input events from the current runtime queue. Synthetic
+event injection is capability-protected and is intended for tests, system UI,
+and trusted input adapters; it is not a replacement for the future native
+keyboard/touch device subsystem.
+
+```lua
+-- Number of queued events
+local count = hyber.input.pending()
+
+-- Consume one event, or nil when the queue is empty
+local event = hyber.input.next()
+if event then
+    print(event.kind, event.code, event.value, event.timestamp)
+end
+
+-- Requires CAP_INPUT_INJECT (root/system adapters have it)
+hyber.input.emit("keyboard", "KEY_ENTER", 1)
+
+-- Discard events belonging to this runtime
+hyber.input.clear()
+```
+
+The event queue deliberately does not expose Linux evdev codes or host device
+handles. A future GUI/input subsystem can feed the same neutral event shape.
+
+---
+
 ## `hyber.ns` — Namespace
 
 ```lua

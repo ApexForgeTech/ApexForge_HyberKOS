@@ -12,5 +12,7 @@ members = [
     "crates/hyber-memfs",
     "backends/linux/hyber-hostfs",
     "applications/hyber-shell", "applications/hyber-cli", "crates/hyber-lua",
+    "crates/hyber-fs",
+    "applications/hyberfs-tool",
 ]
 resolver = "2"

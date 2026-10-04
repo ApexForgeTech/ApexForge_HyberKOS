@@ -2352,9 +2352,20 @@ kernel, object model, VFS architecture, GUI architecture, or public ABI.
 
 ## Objective
 
-Define and prototype persistent HyberFS storage. This phase is not the native
-kernel filesystem implementation; that work is reserved for Phase 25 after the
-native VFS and device layers exist.
+Define, document, and prototype a persistent HyberFS volume with deterministic
+on-disk semantics. The result must be readable by a future implementation in a
+different language or operating system; Rust is only the implementation
+language of this prototype.
+
+This phase is not the native kernel filesystem implementation. The native
+block-device, kernel VFS boundary, and boot-time root filesystem are reserved
+for Phases 21–25 after the native process, object, VFS, and device layers exist.
+
+Phase 15 owns the on-disk format, formatting, user-space mount/unmount,
+objects, nodes, directories, file data, metadata, allocation, and minimal
+metadata journaling. It does not own native kernel integration, hardware
+drivers, the public application ABI, full recovery policy, encryption,
+compression, snapshots, deduplication, or network filesystems.
 
 ## Implementation Languages
 
@@ -2370,9 +2381,26 @@ APIs exist, but Lua must not define the on-disk format or storage invariants.
 C/C++ and assembly are not required for this user-space design/prototype;
 low-level native storage work belongs to Phases 21–25.
 
-Do not start earlier.
+## Recommended Rust Component Boundaries
 
-The Object/Node/VFS semantics should already be proven.
+Keep format encoding separate from storage behavior:
+
+```text
+hyberfs-format   → fixed-width on-disk records and validation
+hyberfs          → volume, objects, directories, data, allocation, journal
+hyberfs-tool     → format, inspect, check, mount, and test commands
+hyberfs-tests    → integration, property, corruption, and reopen tests
+```
+
+The format layer must not perform I/O, and the volume layer must depend on an
+abstract block-device interface. The first block device is a regular-file
+backend; a future native block device can implement the same interface without
+changing the on-disk format.
+
+Before implementation, Object/Node/VFS semantics, object types and lifetime,
+namespace lookup, permission vocabulary, and error/result conventions must be
+documented. The prototype must use Hyber abstractions rather than Linux inode
+numbers, file descriptors, paths, or process IDs in the on-disk format.
 
 ---
 
@@ -2388,20 +2416,31 @@ Define:
 
 ```text
 block size
+on-disk byte order
+fixed-width integer sizes
+alignment and reserved fields
+format compatibility rules
 superblock
 Object IDs
 Object records
 Node records
 directory format
+name encoding and validation
 metadata
 allocation
 journal
 checksums
 ```
 
-This is a persistent storage design/prototype. It is not the final application
-API, and it must not make Lua, Linux file descriptors, or Linux syscalls part
-of Hyber's system architecture.
+The specification is normative. Every field must define its type, width,
+alignment, valid range, owner, and recovery behavior. Host-native struct
+layout, pointers, Rust enum layout, and compiler ABI must never be written
+directly to disk.
+
+The format must define canonical naming rules: empty names, `.` and `..`, path
+separators, invalid UTF-8, and duplicate names must have explicit behavior.
+Malformed mandatory fields must fail validation; unknown optional fields may be
+skipped.
 
 ---
 
@@ -2413,7 +2452,9 @@ Create:
 hyberfs.img
 ```
 
-for development.
+for development. Formatting must validate image size, alignment, truncation,
+and arithmetic overflow before writing. It must never overwrite an existing
+image without an explicit force/confirmation mode.
 
 Initially use:
 
@@ -2421,7 +2462,8 @@ Initially use:
 QEMU
 ```
 
-or a Linux-hosted disk-image tool.
+or a Linux-hosted Rust disk-image tool. The image is a regular-file test
+backend only; Linux filesystem semantics must not become HyberFS semantics.
 
 ---
 
@@ -2436,7 +2478,16 @@ UUID
 block size
 filesystem size
 feature flags
+root object ID
+object/data/allocation/journal region locations
+clean/unclean state
+format checksum
 ```
+
+Mount must reject invalid magic, unsupported required versions, impossible or
+overlapping regions, invalid block sizes, and checksum failures. Redundant
+superblock copies, if used, require deterministic disagreement and selection
+rules.
 
 ---
 
@@ -2451,6 +2502,13 @@ Object #100
 type = DIRECTORY
 ```
 
+Object records must define stable `ObjectId`, type, state, owner/group,
+permissions or capability metadata, timestamps, logical size, and a generation
+or record version. Object IDs must not be reused while live references,
+directory entries, or journal transactions can refer to the old object.
+Deletion removes namespace references first and reclaims storage only after the
+object is no longer reachable or open under the documented rules.
+
 ---
 
 # 16.5 — Directory Index
@@ -2460,6 +2518,11 @@ Implement:
 ```text
 name → ObjectId
 ```
+
+Directory operations must have deterministic lookup, insertion, replacement,
+and removal behavior. Duplicate names, invalid names, missing-object targets,
+and directory cycles must be rejected. `.` and `..` are resolution concepts,
+not ordinary stored entries.
 
 ---
 
@@ -2481,6 +2544,11 @@ Then later:
 extent tree
 ```
 
+Define logical offsets, physical ranges, holes, maximum file size,
+partial-block writes, truncate, append, and end-of-file behavior. The initial
+direct-extent format must reserve a documented extension path for larger files;
+host pointers and host file offsets must never become persistent identifiers.
+
 ---
 
 # 16.7 — Metadata Store
@@ -2496,6 +2564,10 @@ flags
 extended metadata
 ```
 
+Metadata updates must validate type, length, ownership, timestamp units, and
+bounded key/value sizes. Unknown optional metadata may be skipped, while
+malformed mandatory metadata must fail validation or the operation.
+
 ---
 
 # 16.8 — Allocation Manager
@@ -2508,21 +2580,99 @@ allocation
 deallocation
 ```
 
-Start with a bitmap.
+The current Phase 15 prototype uses deterministic serialized-state slot
+capacity accounting rather than pretending that file data already has a native
+block bitmap. Its allocator must reject payloads that exceed the inactive slot
+capacity and must leave the previous committed generation intact on failure.
+
+A persistent per-data-block bitmap and extent allocator are required before
+native block-device integration; they are not silently implied by the current
+user-space snapshot representation.
 
 Optimize later.
+
+Reserved metadata, object, data, and journal regions must never overlap.
+Detect double allocation, freeing reserved/out-of-range blocks, and arithmetic
+overflow. Allocation changes must be part of the transaction model before an
+operation is acknowledged.
 
 ---
 
 # 16.9 — Journal
 
-Implement basic crash-consistency transactions.
+Implement a minimal metadata transaction boundary.
 
-Start with metadata transactions.
+The current prototype journals by writing a complete new state to the
+inactive copy-on-write slot, flushing it, and then updating the superblock.
+This is an atomic snapshot journal boundary, not yet a block-level record log.
+
+Each snapshot has a monotonic generation, bounded payload, checksum, and
+deterministic newest-valid-slot selection. Interrupted writes must leave either
+the previous or the new valid generation visible, never a partially decoded
+state. A block-level record journal, crash injection, and advanced repair
+remain Phase 16 responsibilities.
 
 ---
 
-# 16.10 — Phase 15 Exit Criteria
+# 16.10 — Mount, Unmount, and Operations
+
+Define the user-space lifecycle:
+
+```text
+format → validate → mount → operate → flush → clean unmount
+```
+
+Mount validates the superblock, region layout, root object, directory roots,
+object records, and allocation boundaries before exposing the volume. A failed
+mount exposes no partially initialized state. Unmount drains or rejects active
+operations, flushes committed transactions, writes clean state, and releases
+resources. Remount must reproduce the same logical namespace and file data.
+
+Define behavior for:
+
+```text
+create, open, read, write, append, truncate
+mkdir, lookup, enumerate, rename, unlink
+metadata read/write
+mount, sync, unmount
+```
+
+Every operation returns a typed result and distinguishes at least invalid input,
+missing object, already exists, not-a-directory, is-a-directory, permission
+denied, no space, corrupt format, unsupported feature, busy, and I/O failure.
+
+# 16.11 — Invariants and Validation
+
+The prototype must validate that:
+
+```text
+all referenced objects exist
+each allocated block has at most one owner
+reserved regions are never data allocations
+directory entries target compatible object types
+object sizes match data mappings
+free-space accounting matches allocation records
+the root object exists and is a directory
+committed journal records are structurally valid
+```
+
+Provide both an in-process checker and a standalone inspection/check command.
+Diagnostics must identify the object, block, or transaction violating an
+invariant.
+
+# 16.12 — Testing and Acceptance
+
+Use Rust unit, integration, property, deterministic reopen, and corruption
+tests. Cover valid and malformed images, invalid versions, empty/nested
+directories, duplicate names, small and multi-block files, overwrite, append,
+truncate, rename, unlink/reclamation, metadata persistence, out-of-space,
+overflow, clean remount, and interrupted metadata transactions.
+
+Property tests should generate operation sequences and compare the mounted
+filesystem with a simple reference model. Tests must not depend on host
+filesystem ordering.
+
+# 16.13 — Phase 15 Exit Criteria
 
 HyberFS can:
 
@@ -2539,7 +2689,14 @@ unmount
 remount
 ```
 
-and preserve data.
+and preserve data. In addition, the normative specification, deterministic
+format/version validation, object/directory/data/metadata invariants, slot
+capacity accounting, atomic snapshot transactions, safe invalid-image failure,
+and Rust unit/integration/property tests must all pass.
+
+Phase 15 is complete only for this user-space format/prototype scope. Phase 16
+may add aggressive crash injection, recovery repair, and broader checksums; an
+incompatible format change requires a new version or documented migration.
 
 ---
 
@@ -2549,6 +2706,18 @@ and preserve data.
 
 Make the Phase 15 HyberFS design/prototype trustworthy before optimizing it or
 porting it into the native kernel storage stack.
+
+## Implementation Languages and Responsibilities
+
+```text
+Rust        → recovery engine, validators, fault-injection harness, hyberfsck
+Lua         → optional test scenarios and trusted orchestration only
+Go          → not required for filesystem correctness or recovery
+C/C++/ASM   → not used in this user-space reliability phase
+```
+
+Recovery must remain independent of Lua and Go. A damaged or interrupted Lua
+runtime must not prevent the filesystem checker from validating an image.
 
 ---
 
@@ -2620,7 +2789,19 @@ journal state
 
 # 17.5 — Phase 16 Exit Criteria
 
-The filesystem survives intentionally simulated failures without silently corrupting its structure.
+The filesystem survives intentionally simulated failures without silently
+corrupting its structure. The phase is complete only when:
+
+```text
+fault-injected slot writes are tested
+newest-valid-generation recovery is tested
+bad superblock/slot checksums are detected
+truncated payloads are rejected safely
+orphan/dangling/cyclic object graphs are reported
+allocation and region invariants are checked
+hyberfsck returns a deterministic result and non-zero failure status
+recovery never invents or silently drops committed user data
+```
 
 ---
 
@@ -2722,9 +2903,24 @@ removed
 
 ## Objective
 
-Create the user-space service architecture and lifecycle supervisor. Services
-may initially be Lua-driven and use the available process/pipe primitives;
-the complete language-neutral IPC contract remains Phase 19.
+Create the user-space service architecture and lifecycle supervisor. The
+service manager itself is a Rust system component because it owns Hyber
+processes, objects, security contexts, dependencies, and restart policy. Lua
+is the declarative/configuration and orchestration layer; it must not be the
+supervisor, scheduler, process model, or service ABI. Go is used for selected
+high-concurrency service implementations and network daemons, not for the
+core supervisor.
+
+Service roles are therefore explicit:
+
+```text
+Rust → service manager, lifecycle, dependency graph, security, supervision
+Lua  → service definitions, init policy, automation, administrative commands
+Go   → optional service payloads, proxies, network daemons, background workers
+```
+
+All three communicate through Hyber objects and the Phase 19 IPC contract;
+Lua and Go never receive unrestricted host process or socket access.
 
 ---
 
@@ -2758,6 +2954,11 @@ return {
     end
 }
 ```
+
+The Lua file describes policy and callbacks; the Rust service manager validates
+the schema, creates the process, applies capabilities, and invokes lifecycle
+actions. A Go service is launched as an ordinary supervised application and
+cannot bypass the same manifest or capability checks.
 
 ---
 
@@ -2804,6 +3005,18 @@ network access. Dependency ordering must not bypass these checks.
 # 19.6 — Phase 18 Exit Criteria
 
 The system can start and manage user-space services through Hyber abstractions.
+The exit criteria require:
+
+```text
+Rust supervisor starts/stops/restarts/status-checks services
+Lua definitions are schema-validated and cannot alter supervisor internals
+Go service payloads run under the same process/security model
+dependency cycles and missing dependencies are rejected
+crash loops are rate-limited with explicit failure state
+capabilities are least-privilege and auditable
+GUI close does not implicitly terminate a service
+service communication uses Hyber IPC primitives
+```
 
 ---
 
@@ -2882,7 +3095,23 @@ without direct Linux-specific communication.
 
 ## Objective
 
-Create Hyber-native networking abstractions.
+Create Hyber-native user-space networking abstractions and a host-backed
+networking implementation. This phase does not yet replace the kernel network
+stack; that work belongs to Phase 27.
+
+## Language Responsibilities
+
+```text
+Rust → Hyber NetworkInterface/Socket object model, security boundary, API
+Go   → user-space networking data plane, clients, proxies, DNS/HTTP services,
+       connection pools, concurrent background daemons
+Lua  → configuration, service startup, policy, health checks, automation
+```
+
+Go networking is written from a clean Hyber-facing implementation boundary. It
+may use a narrowly isolated host adapter in this phase, but host sockets must
+never leak through the public Hyber object model. Lua does not implement TCP,
+UDP, DNS, packet scheduling, or socket lifetime.
 
 ---
 
@@ -2912,6 +3141,20 @@ Initially map to Linux networking.
 
 Later implement native networking.
 
+The Phase 20 implementation is split into two explicit layers:
+
+```text
+Hyber Rust socket/object boundary
+        ↓
+Go user-space TCP/UDP clients and services
+        ↓
+isolated host-network adapter (temporary)
+```
+
+The Go layer must define timeouts, cancellation, bounded buffers, connection
+limits, error mapping, and shutdown behavior. It must not define kernel
+syscalls or freeze the final native networking ABI.
+
 ---
 
 # 21.4 — DNS
@@ -2936,7 +3179,22 @@ A Hyber application can create a network connection without knowing Linux networ
 
 # 21.7 — Go Integration for Networking
 
-Once user-space network daemons are needed, leverage **Go (Golang)**. Its goroutines and robust standard library make it the ideal language for implementing high-performance user-space network stacks, proxies, and services within HyberKOS.
+Implement the user-space networking daemons in Go from the Hyber-facing
+boundary:
+
+```text
+Go network daemon
+ ↓
+Hyber Network API / IPC
+ ↓
+Rust socket and security boundary
+```
+
+Start with DNS/client utilities, TCP/UDP clients, a bounded proxy, and a
+health-check daemon. Each daemon must have explicit lifecycle, cancellation,
+back-pressure, retry, timeout, logging, and capability requirements. Go is not
+used for the native kernel network stack; Phase 27 defines that Rust-first
+native implementation.
 
 ---
 
