@@ -291,7 +291,7 @@ impl HyberShell {
         let stdin = io::stdin();
         let mut stdout = io::stdout();
 
-        println!("HyberKOS Shell v0.12.0  (Phase 12 — Lua Runtime enabled)");
+        println!("HyberKOS Shell v0.12.5  (Phase 12.5 — Advanced Lua Orchestration)");
         println!("Type 'exit' to quit.\n");
 
         while self.running {
@@ -1588,6 +1588,7 @@ impl HyberShell {
             ns_mgr,
             handle_mgr,
             obj_mgr,
+            self.proc_mgr.clone(),
             self.process_id,
             sec_ctx,
         );

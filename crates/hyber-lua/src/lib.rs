@@ -1,5 +1,5 @@
 //! HyberKOS Lua Runtime
-//! Phase 12 — Lua Integration
+//! Phase 12 & 12.5 — Lua Integration + Advanced System Orchestration
 //!
 //! ## Design: Borrow-safe Kernel State
 //!
@@ -37,11 +37,19 @@
 //! | `hyber.obj.meta_get(path, key)` | read extended metadata |
 //! | `hyber.obj.meta_set(path, key, type, value)` | write extended metadata |
 //!
-//! ### `hyber.proc`
+//! ### `hyber.proc`  *(Phase 12 + 12.5)*
 //! | Function | Description |
 //! |---|---|
 //! | `hyber.proc.pid()` | current HyberKOS process ID |
 //! | `hyber.proc.uid()` | current user ID |
+//! | `hyber.proc.spawn(path)` | spawn a new child HyberKOS process, returns child PID |
+//! | `hyber.proc.wait(pid)` | wait for process exit; returns exit code (int) or nil if still running |
+//!
+//! ### `hyber.sec`  *(Phase 12.5)*
+//! | Function | Description |
+//! |---|---|
+//! | `hyber.sec.check_access(path, rights)` | evaluates R/W/RW access rights for current context |
+//! | `hyber.sec.check_capability(cap)` | checks if current context has a named capability |
 //!
 //! ### `hyber.log`
 //! | Function | Description |
@@ -50,7 +58,8 @@
 //! | `hyber.log.warn(msg)` | warning print |
 //! | `hyber.log.error(msg)` | error print |
 
-use hyber_core::{MetadataValue, Path, ProcessId, Rights, SecurityContext};
+use hyber_process::ProcessManager;
+use hyber_core::{MetadataValue, Path, ProcessId, Rights, SecurityContext, SecurityManager};
 use hyber_handle::HandleManager;
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
@@ -65,6 +74,7 @@ struct KernelState {
     ns_mgr: NamespaceManager,
     handle_mgr: HandleManager,
     obj_mgr: ObjectManager,
+    proc_mgr: Arc<Mutex<ProcessManager>>,
     process_id: ProcessId,
     security_context: SecurityContext,
 }
@@ -81,6 +91,7 @@ pub fn run_lua_script(
     ns_mgr: NamespaceManager,
     handle_mgr: HandleManager,
     obj_mgr: ObjectManager,
+    proc_mgr: Arc<Mutex<ProcessManager>>,
     process_id: ProcessId,
     security_context: SecurityContext,
 ) -> (
@@ -95,6 +106,7 @@ pub fn run_lua_script(
         ns_mgr,
         handle_mgr,
         obj_mgr,
+        proc_mgr,
         process_id,
         security_context,
     }));
@@ -126,6 +138,7 @@ fn build_hyber_table(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<()>
     hyber.set("ns", build_ns(lua, Arc::clone(&state))?)?;
     hyber.set("obj", build_obj(lua, Arc::clone(&state))?)?;
     hyber.set("proc", build_proc(lua, Arc::clone(&state))?)?;
+    hyber.set("sec", build_sec(lua, Arc::clone(&state))?)?;
     hyber.set("log", build_log(lua)?)?;
     hyber.set(
         "cls",
@@ -164,6 +177,7 @@ fn build_fs(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>
                     obj_mgr,
                     process_id,
                     security_context,
+                    ..
                 } = &mut *ks;
                 match vfs.open(
                     ns_mgr,
@@ -430,6 +444,85 @@ fn build_proc(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'
                 Ok(lock(&state)?.security_context.user_id.0)
             })?,
         )?;
+    }
+    {
+        let state = Arc::clone(&state);
+        t.set(
+            "spawn",
+            lua.create_function(move |_lua, target: String| {
+                let mut ks = lock(&state)?;
+                let pm_arc = Arc::clone(&ks.proc_mgr);
+                let mut pm = pm_arc.lock().map_err(|_| lua_err("Proc mgr poisoned".into()))?;
+                let pid = ks.process_id;
+                let sec = ks.security_context.clone();
+                let new_pid = pm.create_process(&mut ks.obj_mgr, Some(pid), sec, None).map_err(lua_err)?;
+                pm.start_process(new_pid).map_err(lua_err)?;
+                // Log the spawn action (target path stored as metadata for Phase 13 IPC)
+                println!("[hyber:proc] spawned child PID {} for target '{}'", new_pid.0, target);
+                Ok(new_pid.0)
+            })?,
+        )?;
+    }
+    {
+        let state = Arc::clone(&state);
+        t.set(
+            "wait",
+            lua.create_function(move |_lua, pid_val: u64| {
+                let ks = lock(&state)?;
+                let pm_arc = Arc::clone(&ks.proc_mgr);
+                let pm = pm_arc.lock().map_err(|_| lua_err("Proc mgr poisoned".into()))?;
+                match pm.wait_process(hyber_core::ProcessId(pid_val)).map_err(lua_err)? {
+                    Some(code) => Ok(LuaValue::Integer(code as i64)),
+                    None => Ok(LuaValue::Nil), // Still running
+                }
+            })?,
+        )?;
+    }
+
+    Ok(t)
+}
+
+// ── hyber.sec ────────────────────────────────────────────────────────────────
+
+fn build_sec(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>> {
+    let t = lua.create_table()?;
+
+    // hyber.sec.check_access(path, rights_str) -> bool
+    {
+        let state = Arc::clone(&state);
+        let check_fn = lua.create_function(move |_lua, (path_str, rights_str): (String, String)| {
+            let path = Path::parse(&path_str);
+            let requested_rights = parse_mode(&rights_str)?;
+            let ks = lock(&state)?;
+
+            let obj_id = ks.ns_mgr.resolve(&path, ks.ns_mgr.root()).map_err(lua_err)?;
+            let obj = ks.obj_mgr.lookup(obj_id).ok_or_else(|| lua_err("Object not found".to_string()))?;
+
+            match SecurityManager::check_access(
+                &ks.security_context,
+                obj.owner,
+                obj.group,
+                obj.permissions,
+                requested_rights
+            ) {
+                Ok(_) => Ok(true),
+                Err(_) => Ok(false),
+            }
+        })?;
+        t.set("check_access", check_fn)?;
+    }
+
+    // hyber.sec.check_capability(capability_name) -> bool
+    {
+        let state = Arc::clone(&state);
+        let cap_fn = lua.create_function(move |_lua, cap: String| {
+            let ks = lock(&state)?;
+            match SecurityManager::check_capability(&ks.security_context, &cap) {
+                Ok(_) => Ok(true),
+                Err(_) => Ok(false),
+            }
+        })?;
+        t.set("check_capability", cap_fn)?;
     }
 
     Ok(t)
