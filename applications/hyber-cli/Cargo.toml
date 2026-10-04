@@ -1,0 +1,24 @@
+[package]
+name = "hyber-cli"
+version = "0.14.0"
+edition = "2021"
+description = "HyberKOS Developer Toolchain — Phase 14"
+
+[[bin]]
+name = "hyber"
+path = "src/main.rs"
+
+[dependencies]
+hyber-core       = { path = "../../crates/hyber-core" }
+hyber-object     = { path = "../../crates/hyber-object" }
+hyber-namespace  = { path = "../../crates/hyber-namespace" }
+hyber-handle     = { path = "../../crates/hyber-handle" }
+hyber-vfs        = { path = "../../crates/hyber-vfs" }
+hyber-lua        = { path = "../../crates/hyber-lua" }
+hyber-process    = { path = "../../crates/hyber-process" }
+hyber-device     = { path = "../../crates/hyber-device" }
+hyber-service    = { path = "../../crates/hyber-service" }
+hyber-memfs      = { path = "../../crates/hyber-memfs" }
+hyber-hostfs     = { path = "../../backends/linux/hyber-hostfs" }
+toml             = "0.8"
+serde            = { version = "1", features = ["derive"] }

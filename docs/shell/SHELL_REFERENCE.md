@@ -1,6 +1,6 @@
 # HyberKOS Shell — Command Reference
 
-> **Phase 7–12 | hyber-shell v0.12.0**
+> **Phase 7–12.5 | hyber-shell v0.12.5**
 
 This document covers all currently available commands in `hyber-shell`. The shell is the first user-space environment of HyberKOS. Every operation passes through the HyberKOS Object/Handle model — raw Linux system calls are never invoked directly.
 
@@ -646,7 +646,19 @@ print("Tag: " .. tag)
 ```lua
 local pid = hyber.proc.pid()   -- HyberKOS Process ID (u64)
 local uid = hyber.proc.uid()   -- Current user ID (u32)
+local child_pid = hyber.proc.spawn("/apps/worker.lua")
+local exit_code = hyber.proc.wait(child_pid) -- nil while still running
 ```
+
+## `hyber.sec` — Security Checks
+
+```lua
+local writable = hyber.sec.check_access("/runtime/test.txt", "w")
+local is_admin = hyber.sec.check_capability("CAP_SYS_ADMIN")
+```
+
+`check_access` accepts `r`, `w`, or `rw`; it returns `false` when the current
+process context lacks the requested permission.
 
 ---
 

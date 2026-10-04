@@ -15,7 +15,7 @@ use std::collections::HashMap;
 // ── 5.1 & 5.5 — Handle ───────────────────────────────────────────────────────
 
 /// Flags that control handle behaviour across process boundaries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HandleFlags {
     /// If true, this handle is copied to a child process on spawn.
     pub inheritable: bool,
@@ -27,12 +27,6 @@ impl HandleFlags {
     }
 
     pub fn not_inheritable() -> Self {
-        Self { inheritable: false }
-    }
-}
-
-impl Default for HandleFlags {
-    fn default() -> Self {
         Self { inheritable: false }
     }
 }
@@ -98,21 +92,6 @@ impl HandleTable {
 
     pub fn get_handle_mut(&mut self, handle_id: HandleId) -> Option<&mut Handle> {
         self.handles.get_mut(&handle_id)
-    }
-
-    /// Clone only inheritable handles (used when spawning a child process).
-    pub fn clone_inheritable(&self, new_table: &mut HandleTable) {
-        for handle in self.handles.values() {
-            if handle.flags.inheritable {
-                // Re-allocate in child table preserving object_id and rights
-                new_table.allocate_handle(
-                    handle.object_id,
-                    handle.rights,
-                    handle.provider_name.clone(),
-                    handle.flags,
-                );
-            }
-        }
     }
 }
 
@@ -240,6 +219,42 @@ impl HandleManager {
         if required.execute && !handle.rights.execute {
             return Err(format!(
                 "Handle {:?} does not have EXECUTE permission",
+                handle_id
+            ));
+        }
+        if required.delete && !handle.rights.delete {
+            return Err(format!(
+                "Handle {:?} does not have DELETE permission",
+                handle_id
+            ));
+        }
+        if required.rename && !handle.rights.rename {
+            return Err(format!(
+                "Handle {:?} does not have RENAME permission",
+                handle_id
+            ));
+        }
+        if required.enumerate && !handle.rights.enumerate {
+            return Err(format!(
+                "Handle {:?} does not have ENUMERATE permission",
+                handle_id
+            ));
+        }
+        if required.connect && !handle.rights.connect {
+            return Err(format!(
+                "Handle {:?} does not have CONNECT permission",
+                handle_id
+            ));
+        }
+        if required.wait && !handle.rights.wait {
+            return Err(format!(
+                "Handle {:?} does not have WAIT permission",
+                handle_id
+            ));
+        }
+        if required.signal && !handle.rights.signal {
+            return Err(format!(
+                "Handle {:?} does not have SIGNAL permission",
                 handle_id
             ));
         }
@@ -406,15 +421,33 @@ mod tests {
         let file_id = hyber_core::ObjectId(1);
 
         // Both processes open the same object with RW
-        hm.open(&mut obj_mgr, p1, file_id, Rights::read_write(), "hostfs".into())
-            .unwrap();
+        hm.open(
+            &mut obj_mgr,
+            p1,
+            file_id,
+            Rights::read_write(),
+            "hostfs".into(),
+        )
+        .unwrap();
         // Re-retain for second process open
         obj_mgr.retain(file_id);
-        hm.open(&mut obj_mgr, p2, file_id, Rights::read_write(), "hostfs".into())
-            .unwrap();
+        hm.open(
+            &mut obj_mgr,
+            p2,
+            file_id,
+            Rights::read_write(),
+            "hostfs".into(),
+        )
+        .unwrap();
 
         // Revoke WRITE from all handles on file_id
-        hm.revoke_rights(file_id, Rights { write: true, ..Rights::empty() });
+        hm.revoke_rights(
+            file_id,
+            Rights {
+                write: true,
+                ..Rights::empty()
+            },
+        );
 
         // Neither process can write now
         for (pid, hid) in [(p1, HandleId(1)), (p2, HandleId(1))] {

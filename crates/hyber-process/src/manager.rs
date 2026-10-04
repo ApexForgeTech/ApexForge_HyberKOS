@@ -1,8 +1,9 @@
 //! HyberKOS Process Manager
 //! Phase 10 — Process & Thread Model
 //!
-//! FIX (Gap 2): create_process() now inherits parent's inheritable handles
-//!              into the child via HandleManager::inherit_into_child().
+//! Handle inheritance is available through `create_process_with_handles()`;
+//! the simpler `create_process()` is intentionally used when no handle table
+//! is in scope.
 //!
 //! FIX (Gap 5): Minimal Pipe support added here so processes can communicate
 //!              via stdin/stdout before Phase 19 IPC arrives.
@@ -77,10 +78,7 @@ impl Pipe {
 
     /// Returns true if there are bytes waiting to be read.
     pub fn has_data(&self) -> bool {
-        self.buffer
-            .lock()
-            .map(|b| !b.is_empty())
-            .unwrap_or(false)
+        self.buffer.lock().map(|b| !b.is_empty()).unwrap_or(false)
     }
 }
 
@@ -157,7 +155,10 @@ impl ProcessManager {
         handle_mgr: Option<&mut HandleManager>,
     ) -> Result<ProcessId, String> {
         if let Some(parent) = parent_id {
-            let parent_process = self.processes.get(&parent).ok_or("Parent process not found")?;
+            let parent_process = self
+                .processes
+                .get(&parent)
+                .ok_or("Parent process not found")?;
             if parent_process.state == ProcessState::Zombie {
                 return Err("Cannot create a child of a terminated process".to_string());
             }
@@ -231,42 +232,24 @@ impl ProcessManager {
     }
 
     /// Write to the stdout pipe of a process (if one is connected).
-    pub fn write_stdout(
-        &self,
-        pid: ProcessId,
-        data: &[u8],
-    ) -> Result<usize, String> {
+    pub fn write_stdout(&self, pid: ProcessId, data: &[u8]) -> Result<usize, String> {
         let proc = self
             .processes
             .get(&pid)
             .ok_or_else(|| format!("Process {:?} not found", pid))?;
-        let pipe_id = proc
-            .stdout_pipe
-            .ok_or("Process has no stdout pipe")?;
-        let pipe = self
-            .pipes
-            .get(&pipe_id)
-            .ok_or("Pipe object not found")?;
+        let pipe_id = proc.stdout_pipe.ok_or("Process has no stdout pipe")?;
+        let pipe = self.pipes.get(&pipe_id).ok_or("Pipe object not found")?;
         pipe.write(data)
     }
 
     /// Read from the stdin pipe of a process (if one is connected).
-    pub fn read_stdin(
-        &self,
-        pid: ProcessId,
-        out: &mut [u8],
-    ) -> Result<usize, String> {
+    pub fn read_stdin(&self, pid: ProcessId, out: &mut [u8]) -> Result<usize, String> {
         let proc = self
             .processes
             .get(&pid)
             .ok_or_else(|| format!("Process {:?} not found", pid))?;
-        let pipe_id = proc
-            .stdin_pipe
-            .ok_or("Process has no stdin pipe")?;
-        let pipe = self
-            .pipes
-            .get(&pipe_id)
-            .ok_or("Pipe object not found")?;
+        let pipe_id = proc.stdin_pipe.ok_or("Process has no stdin pipe")?;
+        let pipe = self.pipes.get(&pipe_id).ok_or("Pipe object not found")?;
         pipe.read(out)
     }
 
@@ -404,10 +387,9 @@ impl Default for ProcessManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyber_core::{SecurityContext, ObjectType};
+    use hyber_core::{ObjectType, SecurityContext};
     use hyber_handle::{HandleFlags, HandleManager};
     use hyber_object::ObjectManager;
-
 
     #[test]
     fn pipe_connects_two_processes() {

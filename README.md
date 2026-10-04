@@ -578,12 +578,19 @@ The architecture is evolving as the implementation grows.
 
 The project is currently focused on establishing a strong foundation for the core system abstractions before moving toward more advanced operating-system capabilities.
 
-As of the latest development phase (**Phase 12**), the system has successfully integrated:
+The current implementation is **v0.12.5**: Phase 12.5 is complete, and the
+Lua-only foundation of Phase 14 is available through the `hyber` CLI. Phase 13
+(the stable C/Rust/multi-language API) is intentionally deferred until after
+Phase 30, as recorded in the roadmap.
+
+Implemented capabilities include:
 * A fully functional **Object and Handle Manager** with strong/weak reference counting and capability revocation.
 * A **Virtual Filesystem (VFS)** supporting multiple Providers (HostFS, MemFS, Process, Device, Service).
 * A unified **Namespace** exposing all system resources as paths.
 * A **Process Model** (Phase 10) with hierarchical handle inheritance and early IPC (pipes).
-* A built-in **Lua 5.4 Runtime** (Phase 12) integrated seamlessly with the Object and Namespace models.
+* A built-in **Lua 5.4 Runtime** (Phase 12) integrated with the Object and Namespace models.
+* Phase 12.5 Lua orchestration primitives for process spawning, waiting, metadata, and security checks.
+* A Phase 14 Lua developer CLI: `hyber run`, `inspect`, `ns`, `handles`, `mount`, `trace`, and `new`.
 
 Expect significant architectural changes during development.
 

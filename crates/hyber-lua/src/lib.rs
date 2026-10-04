@@ -58,11 +58,11 @@
 //! | `hyber.log.warn(msg)` | warning print |
 //! | `hyber.log.error(msg)` | error print |
 
-use hyber_process::ProcessManager;
 use hyber_core::{MetadataValue, Path, ProcessId, Rights, SecurityContext, SecurityManager};
 use hyber_handle::HandleManager;
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
+use hyber_process::ProcessManager;
 use hyber_vfs::VFS;
 use mlua::prelude::*;
 use std::sync::{Arc, Mutex};
@@ -85,6 +85,11 @@ struct KernelState {
 ///
 /// All kernel state is moved into `Arc<Mutex<KernelState>>` for the duration
 /// of the script and returned on success so the shell can swap it back in.
+#[allow(
+    clippy::arc_with_non_send_sync,
+    clippy::too_many_arguments,
+    reason = "mlua invokes this single-threaded runtime synchronously; the state is split into explicit managers for the shell boundary"
+)]
 pub fn run_lua_script(
     script: &str,
     vfs: VFS,
@@ -127,7 +132,6 @@ pub fn run_lua_script(
     (ks.vfs, ks.ns_mgr, ks.handle_mgr, ks.obj_mgr, exec_res)
 }
 
-
 // ── Lua table builder ─────────────────────────────────────────────────────────
 
 fn build_hyber_table(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<()> {
@@ -149,7 +153,6 @@ fn build_hyber_table(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<()>
             Ok(())
         })?,
     )?;
-
 
     globals.set("hyber", hyber)?;
     Ok(())
@@ -231,46 +234,59 @@ fn build_fs(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>
             // file:read([size]) -> string | nil
             {
                 let state = Arc::clone(&state);
-                let read_fn = lua.create_function(move |lua, (this, _): (LuaTable, Option<usize>)| {
-                    let hid: u64 = this.get("_hid")?;
-                    if hid == 0 {
-                        return Err(lua_err("Handle already closed".to_string()));
-                    }
-                    let mut buf = vec![0u8; 4096];
-                    let n = {
-                        let mut ks = lock(&state)?;
-                        let KernelState { vfs, handle_mgr, process_id, .. } = &mut *ks;
-                        vfs.read(handle_mgr, *process_id, hyber_core::HandleId(hid), &mut buf)
-                            .map_err(lua_err)?
-                    };
-                    if n == 0 {
-                        Ok(LuaValue::Nil)
-                    } else {
-                        Ok(LuaValue::String(lua.create_string(&buf[..n])?))
-                    }
-                })?;
+                let read_fn =
+                    lua.create_function(move |lua, (this, size): (LuaTable, Option<usize>)| {
+                        let hid: u64 = this.get("_hid")?;
+                        if hid == 0 {
+                            return Err(lua_err("Handle already closed".to_string()));
+                        }
+                        let mut buf = vec![0u8; size.unwrap_or(4096).max(1)];
+                        let n = {
+                            let mut ks = lock(&state)?;
+                            let KernelState {
+                                vfs,
+                                handle_mgr,
+                                process_id,
+                                ..
+                            } = &mut *ks;
+                            vfs.read(handle_mgr, *process_id, hyber_core::HandleId(hid), &mut buf)
+                                .map_err(lua_err)?
+                        };
+                        if n == 0 {
+                            Ok(LuaValue::Nil)
+                        } else {
+                            Ok(LuaValue::String(lua.create_string(&buf[..n])?))
+                        }
+                    })?;
                 file.set("read", read_fn)?;
             }
 
             // file:write(data) -> bytes_written
             {
                 let state = Arc::clone(&state);
-                let write_fn = lua.create_function(move |_lua, (this, data): (LuaTable, String)| {
-                    let hid: u64 = this.get("_hid")?;
-                    if hid == 0 {
-                        return Err(lua_err("Handle already closed".to_string()));
-                    }
-                    let mut ks = lock(&state)?;
-                    let KernelState { vfs, handle_mgr, obj_mgr, process_id, .. } = &mut *ks;
-                    vfs.write(
-                        handle_mgr,
-                        obj_mgr,
-                        *process_id,
-                        hyber_core::HandleId(hid),
-                        data.as_bytes(),
-                    )
-                    .map_err(lua_err)
-                })?;
+                let write_fn =
+                    lua.create_function(move |_lua, (this, data): (LuaTable, String)| {
+                        let hid: u64 = this.get("_hid")?;
+                        if hid == 0 {
+                            return Err(lua_err("Handle already closed".to_string()));
+                        }
+                        let mut ks = lock(&state)?;
+                        let KernelState {
+                            vfs,
+                            handle_mgr,
+                            obj_mgr,
+                            process_id,
+                            ..
+                        } = &mut *ks;
+                        vfs.write(
+                            handle_mgr,
+                            obj_mgr,
+                            *process_id,
+                            hyber_core::HandleId(hid),
+                            data.as_bytes(),
+                        )
+                        .map_err(lua_err)
+                    })?;
                 file.set("write", write_fn)?;
             }
 
@@ -284,7 +300,13 @@ fn build_fs(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>
                     }
                     {
                         let mut ks = lock(&state)?;
-                        let KernelState { vfs, handle_mgr, obj_mgr, process_id, .. } = &mut *ks;
+                        let KernelState {
+                            vfs,
+                            handle_mgr,
+                            obj_mgr,
+                            process_id,
+                            ..
+                        } = &mut *ks;
                         vfs.close(handle_mgr, obj_mgr, *process_id, hyber_core::HandleId(hid))
                             .map_err(lua_err)?;
                     }
@@ -324,19 +346,15 @@ fn build_ns(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>
         let list_fn = lua.create_function(move |lua, path_str: String| {
             let path = Path::parse(&path_str);
             let ks = lock(&state)?;
-            let dir_id = ks
-                .ns_mgr
-                .resolve(&path, ks.ns_mgr.root())
-                .map_err(lua_err)?;
             let nodes = ks
-                .ns_mgr
-                .list_directory(dir_id)
-                .ok_or_else(|| lua_err("Not a directory".to_string()))?;
+                .vfs
+                .enumerate_secure(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path)
+                .map_err(lua_err)?;
             let result = lua.create_table()?;
-            for (i, node) in nodes.iter().enumerate() {
+            for (i, (name, object_id)) in nodes.iter().enumerate() {
                 let entry = lua.create_table()?;
-                entry.set("name", node.name.clone())?;
-                entry.set("obj_id", node.object_id.0)?;
+                entry.set("name", name.clone())?;
+                entry.set("obj_id", object_id.0)?;
                 result.set(i + 1, entry)?;
             }
             Ok(result)
@@ -366,6 +384,14 @@ fn build_obj(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
                 .obj_mgr
                 .lookup(obj_id)
                 .ok_or_else(|| lua_err("Object not found".to_string()))?;
+            SecurityManager::check_access(
+                &ks.security_context,
+                obj.owner,
+                obj.group,
+                obj.permissions,
+                Rights::read_only(),
+            )
+            .map_err(lua_err)?;
             let out = lua.create_table()?;
             out.set("id", obj.id.0)?;
             out.set("type", obj.object_type.to_string())?;
@@ -392,6 +418,18 @@ fn build_obj(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
                 .ns_mgr
                 .resolve(&path, ks.ns_mgr.root())
                 .map_err(lua_err)?;
+            let obj = ks
+                .obj_mgr
+                .lookup(obj_id)
+                .ok_or_else(|| lua_err("Object not found".to_string()))?;
+            SecurityManager::check_access(
+                &ks.security_context,
+                obj.owner,
+                obj.group,
+                obj.permissions,
+                Rights::read_only(),
+            )
+            .map_err(lua_err)?;
             match ks.obj_mgr.get_metadata(obj_id, &key) {
                 Some(v) => metadata_to_lua(lua, v),
                 None => Ok(LuaValue::Nil),
@@ -412,6 +450,21 @@ fn build_obj(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
                     .ns_mgr
                     .resolve(&path, ks.ns_mgr.root())
                     .map_err(lua_err)?;
+                let obj = ks
+                    .obj_mgr
+                    .lookup(obj_id)
+                    .ok_or_else(|| lua_err("Object not found".to_string()))?;
+                SecurityManager::check_access(
+                    &ks.security_context,
+                    obj.owner,
+                    obj.group,
+                    obj.permissions,
+                    Rights {
+                        write: true,
+                        ..Rights::empty()
+                    },
+                )
+                .map_err(lua_err)?;
                 ks.obj_mgr
                     .set_metadata(obj_id, &key, meta_val)
                     .map_err(lua_err)?;
@@ -440,9 +493,7 @@ fn build_proc(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'
         let state = Arc::clone(&state);
         t.set(
             "uid",
-            lua.create_function(move |_lua, ()| {
-                Ok(lock(&state)?.security_context.user_id.0)
-            })?,
+            lua.create_function(move |_lua, ()| Ok(lock(&state)?.security_context.user_id.0))?,
         )?;
     }
     {
@@ -451,14 +502,63 @@ fn build_proc(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'
             "spawn",
             lua.create_function(move |_lua, target: String| {
                 let mut ks = lock(&state)?;
+                let target_path = Path::parse(&target).normalize();
+                let target_id = ks
+                    .ns_mgr
+                    .resolve(&target_path, ks.ns_mgr.root())
+                    .map_err(lua_err)?;
+                let target_obj = ks
+                    .obj_mgr
+                    .lookup(target_id)
+                    .ok_or_else(|| lua_err("Spawn target does not exist".to_string()))?;
+                if target_obj.object_type != hyber_core::ObjectType::File {
+                    return Err(lua_err("Spawn target is not a file".to_string()));
+                }
+                SecurityManager::check_access(
+                    &ks.security_context,
+                    target_obj.owner,
+                    target_obj.group,
+                    target_obj.permissions,
+                    Rights::read_only(),
+                )
+                .map_err(lua_err)?;
                 let pm_arc = Arc::clone(&ks.proc_mgr);
-                let mut pm = pm_arc.lock().map_err(|_| lua_err("Proc mgr poisoned".into()))?;
+                let mut pm = pm_arc
+                    .lock()
+                    .map_err(|_| lua_err("Proc mgr poisoned".into()))?;
                 let pid = ks.process_id;
                 let sec = ks.security_context.clone();
-                let new_pid = pm.create_process(&mut ks.obj_mgr, Some(pid), sec, None).map_err(lua_err)?;
+                let new_pid = {
+                    let KernelState {
+                        obj_mgr,
+                        handle_mgr,
+                        ..
+                    } = &mut *ks;
+                    pm.create_process_with_handles(obj_mgr, Some(pid), sec, None, Some(handle_mgr))
+                        .map_err(lua_err)?
+                };
                 pm.start_process(new_pid).map_err(lua_err)?;
+                let process_dir = ks
+                    .ns_mgr
+                    .resolve(&Path::parse("/processes"), ks.ns_mgr.root())
+                    .map_err(lua_err)?;
+                let process_object = pm
+                    .get_process(new_pid)
+                    .ok_or_else(|| lua_err("Created process disappeared".to_string()))?
+                    .object_id;
+                {
+                    let KernelState {
+                        ns_mgr, obj_mgr, ..
+                    } = &mut *ks;
+                    ns_mgr
+                        .create_node(obj_mgr, process_dir, &new_pid.0.to_string(), process_object)
+                        .map_err(lua_err)?;
+                }
                 // Log the spawn action (target path stored as metadata for Phase 13 IPC)
-                println!("[hyber:proc] spawned child PID {} for target '{}'", new_pid.0, target);
+                println!(
+                    "[hyber:proc] spawned child PID {} for target '{}'",
+                    new_pid.0, target
+                );
                 Ok(new_pid.0)
             })?,
         )?;
@@ -470,8 +570,13 @@ fn build_proc(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'
             lua.create_function(move |_lua, pid_val: u64| {
                 let ks = lock(&state)?;
                 let pm_arc = Arc::clone(&ks.proc_mgr);
-                let pm = pm_arc.lock().map_err(|_| lua_err("Proc mgr poisoned".into()))?;
-                match pm.wait_process(hyber_core::ProcessId(pid_val)).map_err(lua_err)? {
+                let pm = pm_arc
+                    .lock()
+                    .map_err(|_| lua_err("Proc mgr poisoned".into()))?;
+                match pm
+                    .wait_process(hyber_core::ProcessId(pid_val))
+                    .map_err(lua_err)?
+                {
                     Some(code) => Ok(LuaValue::Integer(code as i64)),
                     None => Ok(LuaValue::Nil), // Still running
                 }
@@ -490,25 +595,32 @@ fn build_sec(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
     // hyber.sec.check_access(path, rights_str) -> bool
     {
         let state = Arc::clone(&state);
-        let check_fn = lua.create_function(move |_lua, (path_str, rights_str): (String, String)| {
-            let path = Path::parse(&path_str);
-            let requested_rights = parse_mode(&rights_str)?;
-            let ks = lock(&state)?;
+        let check_fn =
+            lua.create_function(move |_lua, (path_str, rights_str): (String, String)| {
+                let path = Path::parse(&path_str);
+                let requested_rights = parse_mode(&rights_str)?;
+                let ks = lock(&state)?;
 
-            let obj_id = ks.ns_mgr.resolve(&path, ks.ns_mgr.root()).map_err(lua_err)?;
-            let obj = ks.obj_mgr.lookup(obj_id).ok_or_else(|| lua_err("Object not found".to_string()))?;
+                let obj_id = ks
+                    .ns_mgr
+                    .resolve(&path, ks.ns_mgr.root())
+                    .map_err(lua_err)?;
+                let obj = ks
+                    .obj_mgr
+                    .lookup(obj_id)
+                    .ok_or_else(|| lua_err("Object not found".to_string()))?;
 
-            match SecurityManager::check_access(
-                &ks.security_context,
-                obj.owner,
-                obj.group,
-                obj.permissions,
-                requested_rights
-            ) {
-                Ok(_) => Ok(true),
-                Err(_) => Ok(false),
-            }
-        })?;
+                match SecurityManager::check_access(
+                    &ks.security_context,
+                    obj.owner,
+                    obj.group,
+                    obj.permissions,
+                    requested_rights,
+                ) {
+                    Ok(_) => Ok(true),
+                    Err(_) => Ok(false),
+                }
+            })?;
         t.set("check_access", check_fn)?;
     }
 

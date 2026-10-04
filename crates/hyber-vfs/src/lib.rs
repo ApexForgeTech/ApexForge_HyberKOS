@@ -115,7 +115,7 @@ impl VFS {
     }
 
     pub fn lookup(&self, ns_mgr: &NamespaceManager, path: &Path) -> Result<ObjectId, String> {
-        ns_mgr.resolve(path, ns_mgr.root())
+        ns_mgr.resolve(&path.normalize(), ns_mgr.root())
     }
 
     #[allow(clippy::too_many_arguments)] // Manager ownership is explicit at this layer.
@@ -129,12 +129,13 @@ impl VFS {
         path: &Path,
         rights: Rights,
     ) -> Result<HandleId, String> {
+        let path = path.normalize();
         let provider_name = self
             .mount_table
-            .find_provider(path)
+            .find_provider(&path)
             .ok_or_else(|| format!("No provider mounted for path: {}", path))?;
 
-        let object_id = ns_mgr.resolve(path, ns_mgr.root())?;
+        let object_id = ns_mgr.resolve(&path, ns_mgr.root())?;
 
         let obj = obj_mgr.lookup(object_id).ok_or("Object not found")?;
         hyber_core::SecurityManager::check_access(
@@ -235,12 +236,13 @@ impl VFS {
         name: &str,
         obj_type: ObjectType,
     ) -> Result<ObjectId, String> {
+        let parent_path = parent_path.normalize();
         let provider_name = self
             .mount_table
-            .find_provider(parent_path)
+            .find_provider(&parent_path)
             .ok_or_else(|| format!("No provider mounted for path: {}", parent_path))?;
 
-        let parent_id = ns_mgr.resolve(parent_path, ns_mgr.root())?;
+        let parent_id = ns_mgr.resolve(&parent_path, ns_mgr.root())?;
 
         let parent_obj = obj_mgr
             .lookup(parent_id)
@@ -272,11 +274,12 @@ impl VFS {
         parent_path: &Path,
         name: &str,
     ) -> Result<(), String> {
+        let parent_path = parent_path.normalize();
         let provider_name = self
             .mount_table
-            .find_provider(parent_path)
+            .find_provider(&parent_path)
             .ok_or_else(|| format!("No provider mounted for path: {}", parent_path))?;
-        let parent_id = ns_mgr.resolve(parent_path, ns_mgr.root())?;
+        let parent_id = ns_mgr.resolve(&parent_path, ns_mgr.root())?;
         let parent = obj_mgr
             .lookup(parent_id)
             .ok_or("Parent directory not found")?;
@@ -312,13 +315,15 @@ impl VFS {
         new_parent_path: &Path,
         new_name: &str,
     ) -> Result<(), String> {
+        let old_parent_path = old_parent_path.normalize();
+        let new_parent_path = new_parent_path.normalize();
         let provider_name = self
             .mount_table
-            .find_provider(old_parent_path)
+            .find_provider(&old_parent_path)
             .ok_or_else(|| format!("No provider mounted for path: {}", old_parent_path))?;
         let destination_provider = self
             .mount_table
-            .find_provider(new_parent_path)
+            .find_provider(&new_parent_path)
             .ok_or_else(|| format!("No provider mounted for path: {}", new_parent_path))?;
         if provider_name != destination_provider {
             return Err(
@@ -326,8 +331,8 @@ impl VFS {
             );
         }
 
-        let old_parent_id = ns_mgr.resolve(old_parent_path, ns_mgr.root())?;
-        let new_parent_id = ns_mgr.resolve(new_parent_path, ns_mgr.root())?;
+        let old_parent_id = ns_mgr.resolve(&old_parent_path, ns_mgr.root())?;
+        let new_parent_id = ns_mgr.resolve(&new_parent_path, ns_mgr.root())?;
         for parent_id in [old_parent_id, new_parent_id] {
             let parent = obj_mgr
                 .lookup(parent_id)
@@ -370,17 +375,18 @@ impl VFS {
     /// 2. If the provider returns Err — fall back to NamespaceManager.
     ///    This is the path for HostFS and MemFS, where the namespace IS the source
     ///    of truth and the provider has nothing extra to add.
-    pub fn enumerate(
+    fn enumerate(
         &self,
         ns_mgr: &NamespaceManager,
         path: &Path,
     ) -> Result<Vec<(String, ObjectId)>, String> {
+        let path = path.normalize();
         let provider_name = self
             .mount_table
-            .find_provider(path)
+            .find_provider(&path)
             .ok_or_else(|| format!("No provider mounted for path: {}", path))?;
 
-        let dir_id = ns_mgr.resolve(path, ns_mgr.root())?;
+        let dir_id = ns_mgr.resolve(&path, ns_mgr.root())?;
 
         let provider = self
             .providers
@@ -398,6 +404,33 @@ impl VFS {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Enumerate a directory after checking the caller's read/enumerate
+    /// rights. Integrations should use this entry point instead of the legacy
+    /// provider-only helper above.
+    pub fn enumerate_secure(
+        &self,
+        ns_mgr: &NamespaceManager,
+        obj_mgr: &ObjectManager,
+        security_context: &hyber_core::SecurityContext,
+        path: &Path,
+    ) -> Result<Vec<(String, ObjectId)>, String> {
+        let normalized = path.normalize();
+        let dir_id = ns_mgr.resolve(&normalized, ns_mgr.root())?;
+        let object = obj_mgr.lookup(dir_id).ok_or("Directory object not found")?;
+        hyber_core::SecurityManager::check_access(
+            security_context,
+            object.owner,
+            object.group,
+            object.permissions,
+            Rights {
+                read: true,
+                enumerate: true,
+                ..Rights::empty()
+            },
+        )?;
+        self.enumerate(ns_mgr, &normalized)
     }
 
     /// Get all active mount points for introspection
@@ -430,6 +463,20 @@ mod tests {
         assert_eq!(
             mounts.find_provider(&Path::parse("/processes-old")),
             Some("host".into())
+        );
+    }
+
+    #[test]
+    fn provider_selection_normalizes_before_routing() {
+        let mut mounts = MountTable::new();
+        mounts.mount(Path::parse("/"), "host".into());
+        mounts.mount(Path::parse("/processes"), "proc".into());
+
+        // VFS public operations normalize before consulting this table.  Keep
+        // the routing invariant explicit here as well.
+        assert_eq!(
+            mounts.find_provider(&Path::parse("/temporary/../processes/1").normalize()),
+            Some("proc".into())
         );
     }
 }

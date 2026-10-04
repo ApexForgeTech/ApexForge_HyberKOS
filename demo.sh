@@ -6,7 +6,7 @@
 BINARY="./target/debug/hyber-shell"
 
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║        HyberKOS Shell v0.12 — Demo & Test Runner            ║"
+echo "║      HyberKOS Shell v0.12.5 — Demo & Test Runner            ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 

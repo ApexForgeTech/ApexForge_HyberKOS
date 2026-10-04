@@ -181,6 +181,13 @@ impl Provider for HostFSProvider {
             .lookup(parent_id, name)
             .ok_or_else(|| format!("Node '{}' not found in parent {:?}", name, parent_id))?;
 
+        if obj_mgr
+            .lookup(obj_id)
+            .is_some_and(|object| object.references > 1)
+        {
+            return Err("Cannot remove an object with active handles".to_string());
+        }
+
         // 2. Get the Linux path and delete it.  A non-empty directory must not
         // be erased implicitly: the caller has to remove its children first.
         let linux_path = self.get_linux_path(obj_id);

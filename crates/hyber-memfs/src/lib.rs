@@ -130,6 +130,13 @@ impl Provider for MemFSProvider {
 
         if obj_mgr
             .lookup(obj_id)
+            .is_some_and(|object| object.references > 1)
+        {
+            return Err("Cannot remove an object with active handles".to_string());
+        }
+
+        if obj_mgr
+            .lookup(obj_id)
             .map(|o| o.object_type == ObjectType::Directory)
             .unwrap_or(false)
             && ns_mgr
@@ -213,10 +220,14 @@ impl Provider for MemFSProvider {
         // MemFS directory listing comes from NamespaceManager, not our entries map.
         // We signal this by returning Ok(None) — VFS will fall back to NamespaceManager.
         // The entry existing in our map confirms the dir exists in MemFS.
-        let _ = self
-            .entries
-            .get(&dir_id)
-            .ok_or_else(|| format!("MemFS dir {:?} not registered", dir_id))?;
+        // Mount roots are created by the namespace/VFS layer, so they do not
+        // have a MemFS data entry. VFS validates the object and falls back to
+        // NamespaceManager for the authoritative directory contents.
+        if let Some(entry) = self.entries.get(&dir_id) {
+            if !entry.is_directory {
+                return Err(format!("MemFS object {:?} is not a directory", dir_id));
+            }
+        }
         Ok(None)
     }
 }

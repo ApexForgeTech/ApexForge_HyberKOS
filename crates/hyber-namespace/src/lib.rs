@@ -7,6 +7,7 @@ use hyber_object::ObjectManager;
 pub struct NamespaceManager {
     root: ObjectId,
     directory_contents: HashMap<ObjectId, HashMap<String, ObjectId>>, // Maps directory ObjectId to a mapping of names to ObjectIds
+    parent_directories: HashMap<ObjectId, ObjectId>,
 }
 
 impl NamespaceManager {
@@ -17,10 +18,13 @@ impl NamespaceManager {
         // Initialize empty contents for the root directory
         let mut directory_contents = HashMap::new();
         directory_contents.insert(root_id, HashMap::new());
+        let mut parent_directories = HashMap::new();
+        parent_directories.insert(root_id, root_id);
 
         Self {
             root: root_id,
             directory_contents,
+            parent_directories,
         }
     }
 
@@ -78,6 +82,13 @@ impl NamespaceManager {
 
         // Add to parent's contents
         parent_contents.insert(name.to_string(), object_id);
+        if parent_obj.object_type == ObjectType::Directory
+            && object_manager
+                .lookup(object_id)
+                .is_some_and(|object| object.object_type == ObjectType::Directory)
+        {
+            self.parent_directories.insert(object_id, parent);
+        }
 
         Ok(node)
     }
@@ -113,11 +124,11 @@ impl NamespaceManager {
                 continue;
             }
             if name == ".." {
-                // The namespace deliberately has no parent pointers.  Callers
-                // should normalize relative paths against their working path
-                // before resolving; an unresolved parent is never silently
-                // treated as the current directory.
-                return Err("Cannot resolve an unanchored '..' path component".to_string());
+                current_dir = *self
+                    .parent_directories
+                    .get(&current_dir)
+                    .ok_or_else(|| format!("Parent directory for {:?} is unknown", current_dir))?;
+                continue;
             }
 
             //check if the current directory has an entry named as the current component
@@ -136,7 +147,11 @@ impl NamespaceManager {
 
     pub fn remove_node(&mut self, parent_id: ObjectId, name: &str) -> Option<ObjectId> {
         let contents = self.directory_contents.get_mut(&parent_id)?;
-        contents.remove(name)
+        let object_id = contents.remove(name)?;
+        if object_id != self.root {
+            self.parent_directories.remove(&object_id);
+        }
+        Some(object_id)
     }
 
     /// Renames a node from old parent/name to new parent/name cleanly
@@ -167,6 +182,12 @@ impl NamespaceManager {
             .lookup(old_parent_id, old_name)
             .ok_or_else(|| format!("Node '{}' not found in old parent", old_name))?;
 
+        // A directory cannot be moved into itself or one of its descendants.
+        // Otherwise resolution would create an unreachable namespace cycle.
+        if obj_id == new_parent_id || self.is_descendant(new_parent_id, obj_id) {
+            return Err("Cannot move a directory into itself or its descendant".to_string());
+        }
+
         // 2. Remove from old parent
         self.remove_node(old_parent_id, old_name);
 
@@ -186,11 +207,35 @@ impl NamespaceManager {
             if let Some(old_contents) = self.directory_contents.get_mut(&old_parent_id) {
                 old_contents.insert(old_name.to_string(), obj_id);
             }
+            if self.directory_contents.contains_key(&obj_id) {
+                self.parent_directories.insert(obj_id, old_parent_id);
+            }
             return Err(format!("Node '{}' already exists in new parent", new_name));
         }
 
         new_parent_contents.insert(new_name.to_string(), obj_id);
+        if self.directory_contents.contains_key(&obj_id) {
+            self.parent_directories.insert(obj_id, new_parent_id);
+        }
         Ok(())
+    }
+
+    fn is_descendant(&self, candidate: ObjectId, ancestor: ObjectId) -> bool {
+        let mut current = candidate;
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(current) {
+            if current == ancestor {
+                return true;
+            }
+            let Some(parent) = self.parent_directories.get(&current) else {
+                return false;
+            };
+            if *parent == current {
+                return false;
+            }
+            current = *parent;
+        }
+        true
     }
     pub fn initialize_directory(&mut self, dir_id: ObjectId) -> Result<(), String> {
         if self.directory_contents.contains_key(&dir_id) {
@@ -211,14 +256,6 @@ impl NamespaceManager {
     }
 }
 
-impl Default for NamespaceManager {
-    fn default() -> Self {
-        // This is a placeholder - real initialization requires ObjectManager
-        // Use NamespaceManager::new() instead
-        panic!("Use NamespaceManager::new(object_manager) to create a NamespaceManager")
-    }
-}
-
 impl NamespaceManager {
     /// Create a sentinel/placeholder NamespaceManager that is intentionally empty.
     ///
@@ -235,9 +272,12 @@ impl NamespaceManager {
         let mut directory_contents = std::collections::HashMap::new();
         let sentinel = ObjectId(u64::MAX);
         directory_contents.insert(sentinel, std::collections::HashMap::new());
+        let mut parent_directories = std::collections::HashMap::new();
+        parent_directories.insert(sentinel, sentinel);
         Self {
             root: sentinel,
             directory_contents,
+            parent_directories,
         }
     }
 }
@@ -261,5 +301,39 @@ mod tests {
             .create_node(&objects, root, "missing", hyber_core::ObjectId(999))
             .is_err());
         assert!(namespace.create_node(&objects, root, "valid", file).is_ok());
+    }
+
+    #[test]
+    fn relative_parent_resolution_uses_namespace_parents() {
+        let mut objects = ObjectManager::new();
+        let mut namespace = NamespaceManager::new(&mut objects);
+        let root = namespace.root();
+        let dir = objects.create_object(ObjectType::Directory);
+        namespace.create_node(&objects, root, "dir", dir).unwrap();
+        namespace.initialize_directory(dir).unwrap();
+        assert_eq!(
+            namespace.resolve(&hyber_core::Path::parse(".."), dir),
+            Ok(root)
+        );
+    }
+
+    #[test]
+    fn directory_cannot_move_into_descendant() {
+        let mut objects = ObjectManager::new();
+        let mut namespace = NamespaceManager::new(&mut objects);
+        let root = namespace.root();
+        let parent = objects.create_object(ObjectType::Directory);
+        let child = objects.create_object(ObjectType::Directory);
+        namespace
+            .create_node(&objects, root, "parent", parent)
+            .unwrap();
+        namespace.initialize_directory(parent).unwrap();
+        namespace
+            .create_node(&objects, parent, "child", child)
+            .unwrap();
+        namespace.initialize_directory(child).unwrap();
+        assert!(namespace
+            .rename_node(root, "parent", child, "moved")
+            .is_err());
     }
 }

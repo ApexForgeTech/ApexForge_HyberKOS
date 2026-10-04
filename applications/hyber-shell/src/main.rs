@@ -11,7 +11,6 @@ use hyber_core::{
 use hyber_device::{DeviceClass, DeviceManager, DeviceProvider};
 use hyber_handle::HandleManager;
 use hyber_hostfs::HostFSProvider;
-use hyber_lua;
 use hyber_memfs::MemFSProvider;
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
@@ -402,7 +401,6 @@ impl HyberShell {
             "help" => self.cmd_help(args),
             "cls" | "clear" => self.cmd_cls(args),
 
-
             // Phase 12 — Lua Runtime
             "lua" => self.cmd_lua(args),
             "luafile" => self.cmd_luafile(args),
@@ -499,20 +497,18 @@ impl HyberShell {
         let (flags, positional) = Self::parse_flags(args);
         let path_str = positional.first().copied().unwrap_or(".");
         let path = self.resolve_path(path_str);
+        let security_context = self
+            .proc_mgr
+            .lock()
+            .map_err(|_| "Process manager lock poisoned")?
+            .get_process(self.process_id)
+            .ok_or("Shell process not found")?
+            .security_context
+            .clone();
 
-        let nodes = match self.vfs.enumerate(&self.ns_mgr, &path) {
-            Ok(nodes) => nodes,
-            Err(_) => {
-                // Fallback to NamespaceManager listing if no provider is mounted here
-                let dir_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
-                self.ns_mgr
-                    .list_directory(dir_id)
-                    .ok_or("Failed to list directory")?
-                    .into_iter()
-                    .map(|n| (n.name, n.object_id))
-                    .collect()
-            }
-        };
+        let nodes =
+            self.vfs
+                .enumerate_secure(&self.ns_mgr, &self.obj_mgr, &security_context, &path)?;
 
         let long_format = flags.contains(&"l".to_string());
         let show_all = flags.contains(&"a".to_string());
@@ -627,7 +623,25 @@ impl HyberShell {
 
         // Check if file already exists (update modified_at)
         if let Ok(obj_id) = self.ns_mgr.resolve(&path, self.ns_mgr.root()) {
+            let context = self
+                .proc_mgr
+                .lock()
+                .map_err(|_| "Process manager lock poisoned")?
+                .get_process(self.process_id)
+                .ok_or("Shell process not found")?
+                .security_context
+                .clone();
             if let Some(obj) = self.obj_mgr.lookup_mut(obj_id) {
+                hyber_core::SecurityManager::check_access(
+                    &context,
+                    obj.owner,
+                    obj.group,
+                    obj.permissions,
+                    Rights {
+                        write: true,
+                        ..Rights::empty()
+                    },
+                )?;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .expect("Time went backwards")
@@ -712,7 +726,9 @@ impl HyberShell {
             .map(|o| o.object_type == ObjectType::Directory)
             .unwrap_or(false)
         {
-            let entries = self.vfs.enumerate(&self.ns_mgr, path)?;
+            let entries = self
+                .vfs
+                .enumerate_secure(&self.ns_mgr, &self.obj_mgr, context, path)?;
             for (name, _) in entries {
                 let child = Path::parse(&format!("{}/{}", path, name)).normalize();
                 self.remove_tree(&child, context)?;
@@ -905,10 +921,14 @@ impl HyberShell {
             Rights::read_only(),
         )?;
 
-        let handle_obj_id = self.handle_mgr.get_handle(self.process_id, handle)
+        let handle_obj_id = self
+            .handle_mgr
+            .get_handle(self.process_id, handle)
             .ok_or("Handle disappeared")?
             .object_id;
-        let is_device = self.obj_mgr.lookup(handle_obj_id)
+        let is_device = self
+            .obj_mgr
+            .lookup(handle_obj_id)
             .map(|o| o.object_type == ObjectType::Device)
             .unwrap_or(false);
 
@@ -946,20 +966,25 @@ impl HyberShell {
         let (_flags, positional) = Self::parse_flags(args);
         let path_str = positional.first().copied().unwrap_or(".");
         let path = self.resolve_path(path_str);
-        let dir_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
-
+        let context = self
+            .proc_mgr
+            .lock()
+            .map_err(|_| "Process manager lock poisoned")?
+            .get_process(self.process_id)
+            .ok_or("Shell process not found")?
+            .security_context
+            .clone();
         let nodes = self
-            .ns_mgr
-            .list_directory(dir_id)
-            .ok_or("Failed to list directory")?;
+            .vfs
+            .enumerate_secure(&self.ns_mgr, &self.obj_mgr, &context, &path)?;
 
         println!(
             "{:<20} | {:<12} | {:<10} | {:<5} | Size",
             "Name", "ObjectId", "Type", "Refs"
         );
         println!("{}", "-".repeat(65));
-        for node in nodes {
-            let obj = self.obj_mgr.lookup(node.object_id);
+        for (name, object_id) in nodes {
+            let obj = self.obj_mgr.lookup(object_id);
             let obj_type = obj
                 .map(|o| o.object_type.to_string())
                 .unwrap_or("?".to_string());
@@ -967,7 +992,7 @@ impl HyberShell {
             let size = obj.map(|o| o.size).unwrap_or(0);
             println!(
                 "{:<20} | {:<12} | {:<10} | {:<5} | {}",
-                node.name, node.object_id, obj_type, refs, size
+                name, object_id, obj_type, refs, size
             );
         }
         Ok(())
@@ -982,6 +1007,21 @@ impl HyberShell {
         let obj_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
 
         let obj = self.obj_mgr.lookup(obj_id).ok_or("Object not found")?;
+        let context = self
+            .proc_mgr
+            .lock()
+            .map_err(|_| "Process manager lock poisoned")?
+            .get_process(self.process_id)
+            .ok_or("Shell process not found")?
+            .security_context
+            .clone();
+        hyber_core::SecurityManager::check_access(
+            &context,
+            obj.owner,
+            obj.group,
+            obj.permissions,
+            Rights::read_only(),
+        )?;
 
         println!("Object ID:   {}", obj.id);
         println!("Type:        {}", obj.object_type);
@@ -1179,6 +1219,30 @@ impl HyberShell {
 
         let path = self.resolve_path(positional[1]);
         let obj_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
+        let context = self
+            .proc_mgr
+            .lock()
+            .map_err(|_| "Process manager lock poisoned")?
+            .get_process(self.process_id)
+            .ok_or("Shell process not found")?
+            .security_context
+            .clone();
+        let object = self.obj_mgr.lookup(obj_id).ok_or("Object not found")?;
+        let metadata_rights = if matches!(action, "set" | "rm") {
+            Rights {
+                write: true,
+                ..Rights::empty()
+            }
+        } else {
+            Rights::read_only()
+        };
+        hyber_core::SecurityManager::check_access(
+            &context,
+            object.owner,
+            object.group,
+            object.permissions,
+            metadata_rights,
+        )?;
 
         match action {
             "ls" => {
@@ -1262,7 +1326,12 @@ impl HyberShell {
             uid // Default gid to uid
         };
 
-        if let Some(proc) = self.proc_mgr.lock().unwrap().get_process_mut(self.process_id) {
+        if let Some(proc) = self
+            .proc_mgr
+            .lock()
+            .unwrap()
+            .get_process_mut(self.process_id)
+        {
             proc.security_context.user_id = UserId(uid);
             proc.security_context.group_id = GroupId(gid);
             // If changing to non-root, clear capabilities
@@ -1370,19 +1439,17 @@ impl HyberShell {
         if depth >= max_depth {
             return Ok(());
         }
-        // Try virtual provider enumerate first, then namespace fallback
-        let entries = match self.vfs.enumerate(&self.ns_mgr, path) {
-            Ok(e) => e,
-            Err(_) => {
-                let dir_id = self.ns_mgr.resolve(path, self.ns_mgr.root())?;
-                self.ns_mgr
-                    .list_directory(dir_id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|n| (n.name, n.object_id))
-                    .collect()
-            }
-        };
+        let security_context = self
+            .proc_mgr
+            .lock()
+            .map_err(|_| "Process manager lock poisoned")?
+            .get_process(self.process_id)
+            .ok_or("Shell process not found")?
+            .security_context
+            .clone();
+        let entries =
+            self.vfs
+                .enumerate_secure(&self.ns_mgr, &self.obj_mgr, &security_context, path)?;
         let mut sorted = entries;
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         let count = sorted.len();
@@ -1424,7 +1491,7 @@ impl HyberShell {
     }
 
     fn cmd_help(&self, _args: &[&str]) -> Result<(), String> {
-        println!("=== HyberKOS Shell Commands (Phase 12) ===\n");
+        println!("=== HyberKOS Shell Commands (Phase 12.5) ===\n");
         println!("Standard Commands:");
         println!("  pwd                     Print working directory");
         println!("  cd <path>               Change directory");
@@ -1454,7 +1521,7 @@ impl HyberShell {
         println!("  lsdev                   List registered devices (/devices)");
         println!("  lssvc                   List registered services (/services)");
         println!();
-        println!("Phase 12 — Lua Runtime:");
+        println!("Phase 12/12.5 — Lua Runtime & Orchestration:");
         println!("  lua <script>            Execute inline Lua (quote the script)");
         println!("  luafile <path>          Execute a Lua script file from the namespace");
         println!("  Lua API:");
@@ -1466,6 +1533,8 @@ impl HyberShell {
         println!("    hyber.obj.info(path)           Object metadata table");
         println!("    hyber.obj.meta_get/set(...)    Extended metadata");
         println!("    hyber.proc.pid() / .uid()      Process info");
+        println!("    hyber.proc.spawn(path) / .wait(pid) Process control");
+        println!("    hyber.sec.check_access(...)     Security check");
         println!("    hyber.log.info/warn/error(s)   Logging");
         println!("    hyber.cls()                    Clear terminal screen");
         println!();
@@ -1552,8 +1621,12 @@ impl HyberShell {
             }
             script_bytes.extend_from_slice(&buf[..n]);
         }
-        self.vfs
-            .close(&mut self.handle_mgr, &mut self.obj_mgr, self.process_id, handle)?;
+        self.vfs.close(
+            &mut self.handle_mgr,
+            &mut self.obj_mgr,
+            self.process_id,
+            handle,
+        )?;
 
         let script = String::from_utf8(script_bytes)
             .map_err(|_| "Lua script file is not valid UTF-8".to_string())?;
@@ -1566,10 +1639,7 @@ impl HyberShell {
         // We need to *move* the managers into the Lua runtime and get them back.
         // Use std::mem::replace with placeholder values.
         let vfs = std::mem::replace(&mut self.vfs, VFS::new());
-        let ns_mgr = std::mem::replace(
-            &mut self.ns_mgr,
-            NamespaceManager::new_placeholder(),
-        );
+        let ns_mgr = std::mem::replace(&mut self.ns_mgr, NamespaceManager::new_placeholder());
         let handle_mgr = std::mem::replace(&mut self.handle_mgr, HandleManager::new());
         let obj_mgr = std::mem::replace(&mut self.obj_mgr, ObjectManager::new());
 

@@ -2005,6 +2005,12 @@ hyber.service
 hyber.metadata
 ```
 
+This is the planned Lua-facing surface, not a claim that every subsystem is
+already implemented. In the current roadmap state, filesystem/process/object
+metadata/security operations and early pipe primitives are available; full IPC,
+network, and service APIs are introduced by their later phases and must not be
+treated as Phase 12 completion requirements.
+
 ---
 
 # 13.3 — File Example
@@ -2043,7 +2049,7 @@ start
 open Hyber Objects
 use Handles
 read/write files
-communicate with services
+use the currently available process and pipe primitives
 exit
 ```
 
@@ -2053,13 +2059,18 @@ exit
 
 ## Objective
 
-Expose all advanced abstractions (Phases 1-11) fully to Lua, turning Lua into the primary System Controller rather than just a simple script runner.
+Expose the currently implemented foundational abstractions (Phases 1–11) to
+Lua, turning Lua into the primary user-space orchestrator rather than just a
+simple script runner. This phase provides early process control, metadata,
+security checks, and the available pipe primitives; the complete IPC model
+remains reserved for Phase 19.
 
 ---
 
 # 13.6.1 — Process Management in Lua
 
-Expose process spawning and IPC to Lua:
+Expose process spawning and the currently available pipe primitives to Lua;
+the complete IPC contract remains a later-phase responsibility:
 
 ```lua
 local pid = hyber.proc.spawn("/apps/editor.lua")
@@ -2081,15 +2092,37 @@ local can_write = hyber.sec.check_access(path, "WRITE")
 
 # 13.6.3 — Phase 12.5 Exit Criteria
 
-Lua can fully control processes, permissions, and IPC, effectively acting as the orchestrator for the operating system's user space.
+Lua can control the implemented process model, permission checks, metadata,
+and early pipe-based communication. It acts as the user-space orchestrator
+without replacing the language-neutral kernel, object, VFS, or future full IPC
+architecture.
 
 ---
 
 # 14. Phase 13 — Hyber Application API
 
+> **⚠️ IMPLEMENTATION NOTE (Deferred):**
+> Phase 13 (C API / `libhyber` / multi-language SDK) is intentionally deferred to **after Phase 30 (GUI)**.
+> The reason: a stable ABI/API cannot be frozen until the full kernel abstraction surface (kernel, native VFS, native process model) is mature.
+> Prematurely publishing a C ABI would require breaking changes as the system evolves.
+>
+> **When to implement:** After Phase 30 (GUI), revisit Phase 13 and implement:
+> - `libhyber` C shared library
+> - `hyber.h` public C header
+> - Rust idiomatic bindings (`hyber-rs`)
+> - Python, Go, Java, Kotlin, JS/TS bindings
+>
+> **Phase 14A (Lua Foundation Developer Toolchain)** is implemented NOW
+> (current version) and remains Lua-only until the deferred Phase 13 API/ABI is implemented.
+> This current work is Phase 14A (Lua Foundation). After Phase 13, Phase 14B
+> extends it for Lua applications and compiled/multi-language applications.
+
 ## Objective
 
-Formalize the API that every language will eventually use.
+Formalize the application model and API that every language will eventually
+use. This phase is intentionally implemented only after the GUI has exposed
+the real requirements for applications, windows, surfaces, events, handles,
+IPC, services, and permissions.
 
 ---
 
@@ -2151,7 +2184,9 @@ C++
 
 # 14.5 — ABI Design
 
-Only after the API is sufficiently stable should the project define a more formal ABI.
+Only after the API is sufficiently stable should the project define a more
+formal ABI. GUI-specific contracts must be designed here, but GUI internals
+must not be exposed as an accidental language-specific ABI.
 
 Do not freeze the entire syscall ABI yet.
 
@@ -2171,11 +2206,33 @@ applications can use the same Hyber concepts.
 
 ---
 
-# 15. Phase 14 — Developer Toolchain
+# 15. Phase 14A — Lua Foundation Developer Toolchain (Current)
 
 ## Objective
 
 Make HyberKOS pleasant to develop for.
+
+## Scope and Status
+
+Phase 14A is a Lua-only foundation toolchain. It runs scripts in an isolated
+in-memory Hyber context and exposes inspection/debugging workflows; it is not a
+stable application ABI, package manager, service manager, or GUI runtime.
+
+The currently implemented command surface is:
+
+```text
+hyber run
+hyber new
+hyber inspect
+hyber ns
+hyber handles
+hyber mount
+hyber trace
+```
+
+`hyber build` and `hyber package` are intentionally not Phase 14A
+requirements. Build/package workflows belong to later application and package
+phases and must not be presented as completed commands until implemented.
 
 ---
 
@@ -2191,8 +2248,7 @@ Example:
 
 ```text
 hyber run app.lua
-hyber build
-hyber package
+hyber new example
 hyber inspect
 hyber mount
 ```
@@ -2264,23 +2320,31 @@ READ
 
 ---
 
-# 15.5 — Phase 14 Exit Criteria
+# 15.5 — Phase 14A Exit Criteria
 
-A developer can:
+A Lua developer can:
 
 ```text
-create application
- ↓
-build
- ↓
-run
- ↓
-debug
- ↓
-inspect
+scaffold an application
+validate a hyber.toml manifest
+run a Lua entrypoint
+inspect objects, namespaces, handles, mounts, and resolution traces
+debug the current in-memory context
 ```
 
-using Hyber tools.
+Phase 14A is complete only for this foundation scope. The following remain
+explicitly out of scope until later phases:
+
+```text
+stable cross-language ABI
+portable manifest permission enforcement
+package build/install/signing
+long-running service supervision
+GUI application lifecycle integration
+```
+
+The Lua toolchain must consume Hyber abstractions and must not define the
+kernel, object model, VFS architecture, GUI architecture, or public ABI.
 
 ---
 
@@ -2288,7 +2352,9 @@ using Hyber tools.
 
 ## Objective
 
-Now begin the native filesystem.
+Define and prototype persistent HyberFS storage. This phase is not the native
+kernel filesystem implementation; that work is reserved for Phase 25 after the
+native VFS and device layers exist.
 
 Do not start earlier.
 
@@ -2318,6 +2384,10 @@ allocation
 journal
 checksums
 ```
+
+This is a persistent storage design/prototype. It is not the final application
+API, and it must not make Lua, Linux file descriptors, or Linux syscalls part
+of Hyber's system architecture.
 
 ---
 
@@ -2463,7 +2533,8 @@ and preserve data.
 
 ## Objective
 
-Make HyberFS trustworthy before optimizing it.
+Make the Phase 15 HyberFS design/prototype trustworthy before optimizing it or
+porting it into the native kernel storage stack.
 
 ---
 
@@ -2543,7 +2614,9 @@ The filesystem survives intentionally simulated failures without silently corrup
 
 ## Objective
 
-Turn applications into installable packages.
+Turn Lua applications and their resources into verifiable, installable
+packages on the Phase 15/16 storage foundation. This phase does not freeze the
+future multi-language ABI.
 
 ---
 
@@ -2610,6 +2683,11 @@ register package
 register application
 ```
 
+Installation must be atomic or recoverable: failed verification, dependency
+resolution, or extraction must not leave a partially registered application.
+Updates need rollback metadata, and removal must refuse to delete files still
+owned by another installed package.
+
 ---
 
 # 18.5 — Phase 17 Exit Criteria
@@ -2630,7 +2708,9 @@ removed
 
 ## Objective
 
-Create the system service architecture.
+Create the user-space service architecture and lifecycle supervisor. Services
+may initially be Lua-driven and use the available process/pipe primitives;
+the complete language-neutral IPC contract remains Phase 19.
 
 ---
 
@@ -2678,6 +2758,11 @@ restart
 status
 ```
 
+Define explicit service states, readiness/failure reporting, crash handling,
+restart policy, and clean shutdown. A service is an independent user-space
+process; closing a GUI window must not stop it unless an explicit policy or
+administrative request says so.
+
 ---
 
 # 19.4 — Dependencies
@@ -2695,6 +2780,10 @@ dns.service
 # 19.5 — Security
 
 Services should run with restricted permissions.
+
+Service definitions must declare required capabilities, run under an explicit
+security context, and be denied undeclared object, namespace, device, and
+network access. Dependency ordering must not bypass these checks.
 
 ---
 
@@ -3410,13 +3499,15 @@ Applications
 
 ---
 
-# 30. Phase 29 — Multi-Language Ecosystem (Polyglot OS)
+# 30. Phase 29 — Runtime and Language Preparation
 
 ## Objective
 
-Expand application language support to ensure every task is written in the best tool for the job.
-
-Implement one language at a time.
+Prepare the runtime, embedding, tooling, and binding requirements for a future
+polyglot ecosystem. Phase 29 may contain research prototypes and internal
+adapters, but it must not publish or freeze `libhyber`, `hyber.h`, a stable
+ABI, or official language SDKs. Those belong to the deferred Phase 13 gate
+after Phase 30.
 
 Recommended roles:
 
@@ -3432,27 +3523,28 @@ Python              -> Data processing, Scripting, AI/ML Tooling
 
 ---
 
-# 30.1 — C / C++
+# 30.1 — C / C++ Preparation
 
-Create:
+Investigate:
 
 ```text
-libhyber
+prototype C boundary
 ```
 
-Provide C-compatible ABI interoperability. High-performance gaming and graphics APIs.
+Document ABI requirements and experiment with internal adapters. Do not
+publish `libhyber` or freeze the public C ABI here.
 
 ---
 
-# 30.2 — Rust
+# 30.2 — Rust Preparation
 
-Create:
+Prototype:
 
 ```text
-hyber-rs
+internal Rust adapter experiments
 ```
 
-Idiomatic Rust bindings for kernel development and safe systems programming.
+The official `hyber-rs` API is created only by Phase 13 after the GUI gate.
 
 ---
 
@@ -3460,13 +3552,15 @@ Idiomatic Rust bindings for kernel development and safe systems programming.
 
 Already implemented.
 
-Will act as the primary Orchestrator and init system for HyberKOS.
+Will act as the primary user-space orchestrator and init system for HyberKOS;
+it does not define the kernel architecture, object model, VFS architecture, or
+public application ABI.
 
 ---
 
-# 30.4 — Python
+# 30.4 — Python Preparation
 
-Build:
+Research and prototype:
 
 ```text
 Python → Hyber API
@@ -3474,9 +3568,9 @@ Python → Hyber API
 
 ---
 
-# 30.5 — Go (Golang)
+# 30.5 — Go (Golang) Preparation
 
-Build:
+Research and prototype:
 
 ```text
 Go → Hyber API
@@ -3486,9 +3580,9 @@ Focus Go specifically on networking applications and highly concurrent backgroun
 
 ---
 
-# 30.6 — JVM (Java / Kotlin)
+# 30.6 — JVM (Java / Kotlin) Preparation
 
-Build:
+Research and prototype:
 
 ```text
 Java/Kotlin
@@ -3500,9 +3594,9 @@ Hyber API
 
 ---
 
-# 30.7 — JavaScript / TypeScript
+# 30.7 — JavaScript / TypeScript Preparation
 
-Build:
+Research and prototype:
 
 ```text
 JS/TS
@@ -3515,6 +3609,13 @@ Hyber API
 ---
 
 # 31. Phase 30 — GUI
+
+> **📌 PHASE 13 GATE:**
+> Complete the GUI and the underlying native abstractions first. Once Phase 30
+> is complete, start the deferred Phase 13 implementation: `libhyber`,
+> `hyber.h`, `hyber-rs`, the official language bindings, and the public ABI.
+> Phase 14A remains the early Lua foundation; after Phase 13, implement Phase
+> 14B as Lua Application Integration. Phase 30 itself does not freeze the ABI.
 
 ## Objective
 
@@ -3556,34 +3657,134 @@ touch
 
 # 31.4 — GUI Toolkit (Backend)
 
-Written in:
+Rust-first implementation:
 
 ```text
-C++
 Rust
 ```
 
-To provide hardware acceleration, compositing, and rendering pipelines (e.g. Vulkan / OpenGL wrappers).
+Use C or C++ only when a concrete platform, GPU, or specialized-rendering
+requirement justifies the FFI boundary. C++ is not a mandatory GUI layer.
+The backend provides hardware acceleration, compositing, and rendering
+pipelines (for example Vulkan/OpenGL wrappers).
 
 ---
 
 # 31.5 — React/TypeScript Desktop Layer
 
-The actual user-facing window manager, taskbars, and desktop applications will be built with web technologies to ensure breathtaking aesthetics and rapid development:
+React/HTML/CSS/TypeScript are a user-facing presentation layer. They must not
+own process scheduling, filesystem access, IPC, device access, or application
+termination. The desktop layer may include the shell, taskbar, launcher,
+settings, notifications, and application UI:
 
 ```text
 React / HTML / CSS / TS
        ↓
-Hyber GUI Runtime (WebView/V8)
+Hyber GUI Runtime (runtime choice is replaceable)
        ↓
-C++/Rust Compositor
+GUI IPC
+       ↓
+Rust-first Window Manager / Compositor
 ```
+
+WebView, V8, or another JavaScript runtime is an implementation detail of the
+GUI runtime, not a HyberKOS architectural dependency. A future native widget
+runtime must remain possible without changing the application model.
+
+## 31.5.1 — Process and Lifecycle Separation
+
+The GUI must keep these concepts separate:
+
+```text
+Window     ≠     Application     ≠     Process     ≠     Service
+```
+
+Closing or crashing a renderer must not implicitly terminate the owning
+application process or an independent background service. The system must
+distinguish:
+
+```text
+close_window()
+request_close_application()
+terminate_process()
+```
+
+Window state and application/process state are managed by the OS/GUI
+subsystem, not by React. A minimized, hidden, suspended, or closed window may
+leave its application running according to an explicit application policy.
+
+## 31.5.2 — Independent GUI and Application Processes
+
+The minimum process topology is:
+
+```text
+GUI Runtime / Renderer
+          │ GUI IPC
+          ▼
+Window Manager / Compositor
+          │ Application IPC
+          ▼
+Application Process
+          │ service IPC
+          ▼
+Independent Background Service (when required)
+```
+
+The topology must support these failure boundaries:
+
+```text
+renderer crash       → window/session recovery, application policy applies
+window close         → close request, not automatic process kill
+desktop restart      → services and eligible applications may survive
+application crash    → its windows/resources are reclaimed, other apps survive
+```
+
+## 31.5.3 — System UI, Applications, and Capabilities
+
+System UI (desktop, launcher, taskbar, notifications) and user applications
+are separate clients with different capabilities. Applications request
+capabilities such as window creation, input access, or screen capture through
+Hyber security objects; they never receive unrestricted device or host access.
+
+## 31.5.4 — Provisional Contracts Before Phase 13
+
+GUI work before Phase 13 may use internal, versioned, provisional contracts for
+windows, surfaces, events, and sessions. These contracts are implementation
+interfaces only. Phase 13 later formalizes the language-neutral public
+Application/GUI API and ABI after the GUI requirements are proven; GUI
+internals must not leak into that ABI accidentally.
 
 ---
 
 # 31.6 — Phase 30 Exit Criteria
 
-HyberKOS can boot into a graphical environment and launch applications.
+HyberKOS can boot into a graphical environment, launch applications, and has
+documented and exercised the native application/GUI concepts required to
+implement the deferred Phase 13 API. At minimum, window/application/process
+separation, close-vs-terminate semantics, renderer failure recovery, and
+background-service independence are demonstrated. Phase 30 does not itself
+freeze the public ABI.
+
+---
+
+# 31.7 — Phase 14B — Lua Application Integration (After Phase 13)
+
+After Phase 13 defines the application and GUI contracts, adapt Lua to the
+same public model:
+
+```text
+Lua
+ ↓
+Hyber Application API
+ ↓
+Hyber GUI API
+ ↓
+IPC and Hyber Services
+```
+
+Phase 14B is the final Lua application layer. It must consume the common
+Application API rather than define the kernel, object model, VFS, GUI
+architecture, or public ABI itself.
 
 ---
 
@@ -4583,10 +4784,13 @@ PHASE 12.5
 Advanced Lua Integration
 
 PHASE 13
-Hyber Application API / ABI
+Hyber Application API / ABI (deferred until after GUI)
 
-PHASE 14
-Developer Toolchain
+PHASE 14A
+Lua Foundation Developer Toolchain
+
+PHASE 14B
+Lua Application Integration (after Phase 13)
 
 PHASE 15
 HyberFS
@@ -4631,10 +4835,10 @@ PHASE 28
 Native Services + Runtime
 
 PHASE 29
-Multi-Language Ecosystem (Polyglot OS)
+Runtime and Language Preparation
 
 PHASE 30
-GUI (React/TypeScript Desktop)
+GUI (Rust-first backend, React/TypeScript desktop)
 
 PHASE 31
 Package Ecosystem
