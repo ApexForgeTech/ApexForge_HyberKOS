@@ -209,14 +209,14 @@ impl Provider for MemFSProvider {
         Ok(buffer.len())
     }
 
-    fn enumerate(&self, dir_id: ObjectId) -> Result<Vec<(String, ObjectId)>, String> {
+    fn enumerate(&self, dir_id: ObjectId) -> Result<Option<Vec<(String, ObjectId)>>, String> {
         // MemFS directory listing comes from NamespaceManager, not our entries map.
-        // We signal this by returning an error — VFS will fall back to NamespaceManager.
+        // We signal this by returning Ok(None) — VFS will fall back to NamespaceManager.
         // The entry existing in our map confirms the dir exists in MemFS.
         let _ = self
             .entries
             .get(&dir_id)
             .ok_or_else(|| format!("MemFS dir {:?} not registered", dir_id))?;
-        Err("MemFS defers directory listing to NamespaceManager".to_string())
+        Ok(None)
     }
 }

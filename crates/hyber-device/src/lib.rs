@@ -227,7 +227,7 @@ impl Provider for DeviceProvider {
         ))
     }
 
-    fn enumerate(&self, _dir_id: ObjectId) -> Result<Vec<(String, ObjectId)>, String> {
+    fn enumerate(&self, _dir_id: ObjectId) -> Result<Option<Vec<(String, ObjectId)>>, String> {
         let mgr = self
             .device_mgr
             .lock()
@@ -237,6 +237,6 @@ impl Provider for DeviceProvider {
             .into_iter()
             .map(|d| (d.name.clone(), d.object_id))
             .collect();
-        Ok(entries)
+        Ok(Some(entries))
     }
 }

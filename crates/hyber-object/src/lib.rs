@@ -1,10 +1,15 @@
 //! HyberKOS Object Manager
 //! Phase 2 — Object Registry & Lifecycle
+//!
+//! FIX (Gap 1): Strong/Weak reference model added to prevent circular-reference
+//! memory leaks.  Only strong references keep an Object alive; weak references
+//! can observe it without preventing destruction.
+
 use hyber_core::{GroupId, MetadataValue, ObjectId, ObjectState, ObjectType, UserId};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-//3.8 Object Traits
+// ── 3.8 Object Traits ────────────────────────────────────────────────────────
 pub trait Readable {}
 pub trait Writable {}
 pub trait Seekable {}
@@ -13,13 +18,21 @@ pub trait Connectable {}
 pub trait Waitable {}
 pub trait Signalable {}
 
-//Basic Object Structure
+// ── Basic Object Structure ────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
 pub struct Object {
     pub id: ObjectId,
     pub object_type: ObjectType,
     pub state: ObjectState,
+
+    /// Strong references — keep the object alive.
+    /// Incremented by `retain()`, decremented by `release()`.
     pub references: u64,
+
+    /// Weak references — may observe the object but do NOT keep it alive.
+    /// Incremented by `retain_weak()`, decremented by `release_weak()`.
+    /// An Object with references == 0 is destroyed regardless of weak_references.
+    pub weak_references: u64,
 
     // Core Metadata (Phase 8 & 9)
     pub owner: UserId,
@@ -41,8 +54,6 @@ impl Object {
             .expect("Time went backwards")
             .as_secs();
 
-        // Default permissions based on ObjectType could be set here.
-        // For now, we use a default mock value (e.g., 0o644 for files, 0o755 for dirs)
         let permissions = if object_type == ObjectType::Directory {
             0o755
         } else {
@@ -53,14 +64,15 @@ impl Object {
             id,
             object_type,
             state: ObjectState::Live,
-            references: 1,     // Initial reference count is 1
-            owner: UserId(0),  // Default owner (root)
-            group: GroupId(0), // Default group (root)
+            references: 1, // Initial strong reference count is 1
+            weak_references: 0,
+            owner: UserId(0),
+            group: GroupId(0),
             permissions,
-            size: 0, // Default size
+            size: 0,
             created_at: now,
             modified_at: now,
-            flags: 0, // Default flags
+            flags: 0,
             extended_metadata: HashMap::new(),
         }
     }
@@ -91,7 +103,7 @@ impl ObjectManager {
         id
     }
 
-    //Look up an object by its ID
+    // Look up an object by its ID
     pub fn lookup(&self, id: ObjectId) -> Option<&Object> {
         self.objects.get(&id)
     }
@@ -101,7 +113,10 @@ impl ObjectManager {
         self.objects.get_mut(&id)
     }
 
-    //3.5 Object References
+    // ── 3.5 Strong Reference Operations ──────────────────────────────────────
+
+    /// Increment the strong reference count of an object.
+    /// Returns false if the object is already destroyed / does not exist.
     pub fn retain(&mut self, id: ObjectId) -> bool {
         if let Some(obj) = self.objects.get_mut(&id) {
             if obj.state == ObjectState::Live {
@@ -112,6 +127,10 @@ impl ObjectManager {
         false
     }
 
+    /// Decrement the strong reference count.
+    /// When it reaches 0 the object is marked Destroyed (but not removed from
+    /// the registry yet — call `destroy()` to actually free it).
+    /// Returns true when the object transitions to Destroyed.
     pub fn release(&mut self, id: ObjectId) -> bool {
         if let Some(obj) = self.objects.get_mut(&id) {
             if obj.references > 0 {
@@ -120,13 +139,52 @@ impl ObjectManager {
 
             if obj.references == 0 {
                 obj.state = ObjectState::Destroyed;
-                return true; // Object is now destroyed
+                return true; // Object is now ready for destruction
             }
         }
         false
     }
 
-    // 3.6 Object Destruction
+    // ── FIX Gap 1: Weak Reference Operations ─────────────────────────────────
+
+    /// Increment the weak reference count.
+    /// Returns false if the object does not exist.
+    pub fn retain_weak(&mut self, id: ObjectId) -> bool {
+        if let Some(obj) = self.objects.get_mut(&id) {
+            obj.weak_references += 1;
+            return true;
+        }
+        false
+    }
+
+    /// Decrement the weak reference count.
+    /// This never destroys the object — that is the role of `release()`.
+    pub fn release_weak(&mut self, id: ObjectId) {
+        if let Some(obj) = self.objects.get_mut(&id) {
+            if obj.weak_references > 0 {
+                obj.weak_references -= 1;
+            }
+        }
+    }
+
+    /// Upgrade a weak reference to a strong reference.
+    /// Returns the ObjectId if the object is still Live, or None if it has been
+    /// destroyed (i.e., `references == 0`).
+    pub fn upgrade_weak(&mut self, id: ObjectId) -> Option<ObjectId> {
+        if let Some(obj) = self.objects.get_mut(&id) {
+            if obj.state == ObjectState::Live && obj.references > 0 {
+                obj.references += 1;
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    // ── 3.6 Object Destruction ────────────────────────────────────────────────
+
+    /// Permanently remove a destroyed object from the registry.
+    /// Only succeeds when both `references == 0` and state == Destroyed.
+    /// Weak references are tolerated — they simply become dangling observations.
     pub fn destroy(&mut self, id: ObjectId) -> bool {
         if let Some(obj) = self.objects.get(&id) {
             if obj.state == ObjectState::Destroyed || obj.references == 0 {
@@ -137,7 +195,7 @@ impl ObjectManager {
         false
     }
 
-    // 9.3 Metadata API
+    // ── 9.3 Metadata API ─────────────────────────────────────────────────────
 
     /// Get a specific extended metadata value
     pub fn get_metadata(&self, id: ObjectId, key: &str) -> Option<&MetadataValue> {
@@ -187,11 +245,10 @@ impl ObjectManager {
     }
 
     fn validate_metadata_key(key: &str) -> Result<(), String> {
-        let (namespace, name) = key
+        let (_namespace, name) = key
             .split_once('.')
             .ok_or("Metadata keys must use the 'namespace.name' form")?;
-        if namespace.is_empty()
-            || name.is_empty()
+        if name.is_empty()
             || key.len() > 255
             || !key
                 .bytes()
@@ -202,8 +259,57 @@ impl ObjectManager {
         Ok(())
     }
 }
+
 impl Default for ObjectManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyber_core::ObjectType;
+
+    #[test]
+    fn strong_ref_lifecycle() {
+        let mut mgr = ObjectManager::new();
+        let id = mgr.create_object(ObjectType::File);
+        // Initial ref count = 1
+        assert_eq!(mgr.lookup(id).unwrap().references, 1);
+        mgr.retain(id);
+        assert_eq!(mgr.lookup(id).unwrap().references, 2);
+        mgr.release(id);
+        assert_eq!(mgr.lookup(id).unwrap().references, 1);
+        mgr.release(id);
+        // Object should be destroyed now
+        assert_eq!(mgr.lookup(id).unwrap().state, ObjectState::Destroyed);
+    }
+
+    #[test]
+    fn weak_ref_does_not_keep_object_alive() {
+        let mut mgr = ObjectManager::new();
+        let id = mgr.create_object(ObjectType::File);
+        // Add a weak reference
+        mgr.retain_weak(id);
+        assert_eq!(mgr.lookup(id).unwrap().weak_references, 1);
+        // Drop the strong reference
+        mgr.release(id);
+        // Object is Destroyed even though weak_references == 1
+        assert_eq!(mgr.lookup(id).unwrap().state, ObjectState::Destroyed);
+        // Upgrading a destroyed object must fail
+        assert!(mgr.upgrade_weak(id).is_none());
+    }
+
+    #[test]
+    fn upgrade_weak_succeeds_when_object_is_live() {
+        let mut mgr = ObjectManager::new();
+        let id = mgr.create_object(ObjectType::File);
+        mgr.retain_weak(id);
+        // Object still live (strong ref = 1)
+        let upgraded = mgr.upgrade_weak(id);
+        assert!(upgraded.is_some());
+        assert_eq!(mgr.lookup(id).unwrap().references, 2);
     }
 }

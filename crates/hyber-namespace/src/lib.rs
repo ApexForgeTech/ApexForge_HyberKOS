@@ -219,6 +219,29 @@ impl Default for NamespaceManager {
     }
 }
 
+impl NamespaceManager {
+    /// Create a sentinel/placeholder NamespaceManager that is intentionally empty.
+    ///
+    /// This is used by the shell's `run_lua_script` to temporarily swap out
+    /// the real namespace manager via `std::mem::replace` while handing
+    /// ownership to the Lua runtime.  The placeholder is NEVER used for
+    /// actual namespace operations — it will be immediately replaced with
+    /// the real one returned by `run_lua_script`.
+    ///
+    /// ObjectId(u64::MAX) is used as a sentinel root that will never match
+    /// any real object created by ObjectManager (which starts at id 1).
+    pub fn new_placeholder() -> Self {
+        use hyber_core::ObjectId;
+        let mut directory_contents = std::collections::HashMap::new();
+        let sentinel = ObjectId(u64::MAX);
+        directory_contents.insert(sentinel, std::collections::HashMap::new());
+        Self {
+            root: sentinel,
+            directory_contents,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::NamespaceManager;

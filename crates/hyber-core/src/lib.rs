@@ -193,6 +193,17 @@ impl Path {
             is_absolute,
         }
     }
+    pub fn parent_and_name(&self) -> Option<(Self, String)> {
+        let mut comps = self.components.clone();
+        let name = comps.pop()?.0;
+        Some((
+            Self {
+                components: comps,
+                is_absolute: self.is_absolute,
+            },
+            name,
+        ))
+    }
 }
 
 impl fmt::Display for Path {

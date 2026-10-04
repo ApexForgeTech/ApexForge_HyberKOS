@@ -234,7 +234,7 @@ impl Provider for ServiceProvider {
         Err("/services objects are read-only through VFS.".to_string())
     }
 
-    fn enumerate(&self, _dir_id: ObjectId) -> Result<Vec<(String, ObjectId)>, String> {
+    fn enumerate(&self, _dir_id: ObjectId) -> Result<Option<Vec<(String, ObjectId)>>, String> {
         let mgr = self
             .service_mgr
             .lock()
@@ -244,6 +244,6 @@ impl Provider for ServiceProvider {
             .into_iter()
             .map(|s| (s.name.clone(), s.object_id))
             .collect();
-        Ok(entries)
+        Ok(Some(entries))
     }
 }

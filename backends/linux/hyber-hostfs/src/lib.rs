@@ -325,9 +325,9 @@ impl Provider for HostFSProvider {
         Ok(buffer.len())
     }
 
-    fn enumerate(&self, _dir_id: ObjectId) -> Result<Vec<(String, ObjectId)>, String> {
+    fn enumerate(&self, _dir_id: ObjectId) -> Result<Option<Vec<(String, ObjectId)>>, String> {
         // HyberKOS source of truth is the NamespaceManager, not the Linux disk.
-        // Returning an error forces the VFS to fallback to NamespaceManager::list_directory.
-        Err("HostFS relies on NamespaceManager for directory listing".to_string())
+        // Returning None forces the VFS to fallback to NamespaceManager::list_directory.
+        Ok(None)
     }
 }

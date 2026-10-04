@@ -91,12 +91,12 @@ impl Provider for ProcessProvider {
         Err("Cannot write to process objects".to_string())
     }
 
-    fn enumerate(&self, _dir_id: ObjectId) -> Result<Vec<(String, ObjectId)>, String> {
+    fn enumerate(&self, _dir_id: ObjectId) -> Result<Option<Vec<(String, ObjectId)>>, String> {
         let proc_mgr = self.proc_mgr.lock().map_err(|_| "PoisonError")?;
         let mut entries = Vec::new();
         for proc in proc_mgr.list_processes() {
             entries.push((proc.id.0.to_string(), proc.object_id));
         }
-        Ok(entries)
+        Ok(Some(entries))
     }
 }

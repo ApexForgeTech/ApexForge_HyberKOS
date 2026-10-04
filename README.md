@@ -578,7 +578,34 @@ The architecture is evolving as the implementation grows.
 
 The project is currently focused on establishing a strong foundation for the core system abstractions before moving toward more advanced operating-system capabilities.
 
+As of the latest development phase (**Phase 12**), the system has successfully integrated:
+* A fully functional **Object and Handle Manager** with strong/weak reference counting and capability revocation.
+* A **Virtual Filesystem (VFS)** supporting multiple Providers (HostFS, MemFS, Process, Device, Service).
+* A unified **Namespace** exposing all system resources as paths.
+* A **Process Model** (Phase 10) with hierarchical handle inheritance and early IPC (pipes).
+* A built-in **Lua 5.4 Runtime** (Phase 12) integrated seamlessly with the Object and Namespace models.
+
 Expect significant architectural changes during development.
+
+---
+
+# Quick Start & Shell
+
+HyberKOS provides a user-space shell (`hyber-shell`) to explore its abstractions interactively.
+
+### Running the Shell
+```bash
+cargo run --bin hyber-shell
+```
+
+### Running the Demo
+A test script is available to showcase the current capabilities:
+```bash
+bash demo.sh
+```
+
+### Command Reference
+For a complete list of commands, including VFS manipulation, Object inspection, and Lua scripting, please refer to the **[Shell Command Reference](docs/shell/SHELL_REFERENCE.md)**.
 
 ---
 

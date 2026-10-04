@@ -1,6 +1,20 @@
-use hyber_core::{ObjectType, ProcessId, SecurityContext, ThreadId};
+//! HyberKOS Process Manager
+//! Phase 10 — Process & Thread Model
+//!
+//! FIX (Gap 2): create_process() now inherits parent's inheritable handles
+//!              into the child via HandleManager::inherit_into_child().
+//!
+//! FIX (Gap 5): Minimal Pipe support added here so processes can communicate
+//!              via stdin/stdout before Phase 19 IPC arrives.
+//!              Pipe objects are backed by in-memory byte buffers.
+
+use hyber_core::{ObjectId, ObjectType, ProcessId, SecurityContext, ThreadId};
+use hyber_handle::HandleManager;
 use hyber_object::ObjectManager;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+// ── Process / Thread States ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessState {
@@ -18,29 +32,89 @@ pub enum ThreadState {
     Terminated,
 }
 
-/// 11.2 — Thread Object
+// ── FIX Gap 5: Minimal in-process Pipe ───────────────────────────────────────
+
+/// A simple in-memory byte pipe connecting a writer end to a reader end.
+/// This satisfies the Phase 10 requirement for stdin/stdout between processes
+/// without pulling in full Phase 19 IPC channels.
+#[derive(Debug)]
+pub struct Pipe {
+    pub id: ObjectId,
+    pub buffer: Arc<Mutex<Vec<u8>>>,
+    pub closed: bool,
+}
+
+impl Pipe {
+    pub fn new(id: ObjectId) -> Self {
+        Self {
+            id,
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            closed: false,
+        }
+    }
+
+    /// Write bytes into the pipe buffer.
+    pub fn write(&self, data: &[u8]) -> Result<usize, String> {
+        let mut buf = self
+            .buffer
+            .lock()
+            .map_err(|_| "Pipe buffer lock poisoned")?;
+        buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    /// Read up to `out.len()` bytes from the pipe buffer.
+    pub fn read(&self, out: &mut [u8]) -> Result<usize, String> {
+        let mut buf = self
+            .buffer
+            .lock()
+            .map_err(|_| "Pipe buffer lock poisoned")?;
+        let len = out.len().min(buf.len());
+        out[..len].copy_from_slice(&buf[..len]);
+        buf.drain(..len);
+        Ok(len)
+    }
+
+    /// Returns true if there are bytes waiting to be read.
+    pub fn has_data(&self) -> bool {
+        self.buffer
+            .lock()
+            .map(|b| !b.is_empty())
+            .unwrap_or(false)
+    }
+}
+
+// ── 11.2 — Thread Object ─────────────────────────────────────────────────────
 pub struct Thread {
     pub id: ThreadId,
     pub process_id: ProcessId,
     pub state: ThreadState,
-    pub object_id: hyber_core::ObjectId,
+    pub object_id: ObjectId,
 }
 
-/// 11.1 — Process Object
+// ── 11.1 — Process Object ────────────────────────────────────────────────────
 pub struct Process {
     pub id: ProcessId,
     pub parent_id: Option<ProcessId>,
     pub state: ProcessState,
     pub security_context: SecurityContext,
-    pub linux_pid: Option<u32>, // 11.3 - Linux Process Provider internal mapping
-    pub object_id: hyber_core::ObjectId,
-    pub threads: Vec<ThreadId>, // Process owns threads
+    /// 11.3 - Linux Process Provider internal mapping
+    pub linux_pid: Option<u32>,
+    pub object_id: ObjectId,
+    pub threads: Vec<ThreadId>,
     pub exit_code: Option<i32>,
+
+    // FIX Gap 5: Optional stdio pipe pair (read-end, write-end) as ObjectIds
+    pub stdin_pipe: Option<ObjectId>,
+    pub stdout_pipe: Option<ObjectId>,
 }
 
+// ── Process Manager ───────────────────────────────────────────────────────────
 pub struct ProcessManager {
     processes: HashMap<ProcessId, Process>,
     threads: HashMap<ThreadId, Thread>,
+    /// FIX Gap 5: Registered pipes keyed by their ObjectId
+    pipes: HashMap<ObjectId, Pipe>,
     next_pid: u64,
     next_tid: u64,
 }
@@ -50,18 +124,37 @@ impl ProcessManager {
         Self {
             processes: HashMap::new(),
             threads: HashMap::new(),
+            pipes: HashMap::new(),
             next_pid: 1,
             next_tid: 1,
         }
     }
 
-    /// 11.5 — Process Operations: create
+    // ── 11.5 — Process Operations: create ────────────────────────────────────
+
+    /// Create a new process.
+    ///
+    /// FIX Gap 2: If `handle_mgr` is supplied and the process has a parent,
+    /// inheritable handles are automatically cloned from parent → child.
     pub fn create_process(
         &mut self,
         obj_mgr: &mut ObjectManager,
         parent_id: Option<ProcessId>,
         security_context: SecurityContext,
         linux_pid: Option<u32>,
+    ) -> Result<ProcessId, String> {
+        self.create_process_with_handles(obj_mgr, parent_id, security_context, linux_pid, None)
+    }
+
+    /// Extended variant: optionally accepts a HandleManager to wire up handle
+    /// inheritance from the parent process.
+    pub fn create_process_with_handles(
+        &mut self,
+        obj_mgr: &mut ObjectManager,
+        parent_id: Option<ProcessId>,
+        security_context: SecurityContext,
+        linux_pid: Option<u32>,
+        handle_mgr: Option<&mut HandleManager>,
     ) -> Result<ProcessId, String> {
         if let Some(parent) = parent_id {
             let parent_process = self.processes.get(&parent).ok_or("Parent process not found")?;
@@ -72,12 +165,13 @@ impl ProcessManager {
         if self.next_pid == u64::MAX || self.next_tid == u64::MAX {
             return Err("Process or thread identifier space exhausted".to_string());
         }
+
         let id = ProcessId(self.next_pid);
         self.next_pid += 1;
 
         let obj_id = obj_mgr.create_object(ObjectType::Process);
 
-        // Setup ownership for the process object
+        // Set ownership from the security context
         if let Some(obj) = obj_mgr.lookup_mut(obj_id) {
             obj.owner = security_context.user_id;
             obj.group = security_context.group_id;
@@ -93,16 +187,91 @@ impl ProcessManager {
             object_id: obj_id,
             threads: Vec::new(),
             exit_code: None,
+            stdin_pipe: None,
+            stdout_pipe: None,
         };
 
         self.processes.insert(id, process);
-        // Every process has a primary thread. A process with no thread cannot
-        // satisfy the Phase 10 execution model.
+
+        // FIX Gap 2: Inherit parent handles into the child
+        if let (Some(parent), Some(hm)) = (parent_id, handle_mgr) {
+            hm.inherit_into_child(obj_mgr, parent, id);
+        }
+
+        // Every process starts with a primary thread
         self.create_thread(obj_mgr, id)?;
         Ok(id)
     }
 
-    /// 11.2 — Thread creation
+    // ── FIX Gap 5: Pipe creation ──────────────────────────────────────────────
+
+    /// Create a pipe and wire it as the stdout of `writer_pid` and the stdin
+    /// of `reader_pid`.  Returns the ObjectId of the pipe.
+    pub fn create_pipe(
+        &mut self,
+        obj_mgr: &mut ObjectManager,
+        writer_pid: ProcessId,
+        reader_pid: ProcessId,
+    ) -> Result<ObjectId, String> {
+        if !self.processes.contains_key(&writer_pid) {
+            return Err(format!("Writer process {:?} not found", writer_pid));
+        }
+        if !self.processes.contains_key(&reader_pid) {
+            return Err(format!("Reader process {:?} not found", reader_pid));
+        }
+
+        let pipe_obj_id = obj_mgr.create_object(ObjectType::Pipe);
+        let pipe = Pipe::new(pipe_obj_id);
+        self.pipes.insert(pipe_obj_id, pipe);
+
+        self.processes.get_mut(&writer_pid).unwrap().stdout_pipe = Some(pipe_obj_id);
+        self.processes.get_mut(&reader_pid).unwrap().stdin_pipe = Some(pipe_obj_id);
+
+        Ok(pipe_obj_id)
+    }
+
+    /// Write to the stdout pipe of a process (if one is connected).
+    pub fn write_stdout(
+        &self,
+        pid: ProcessId,
+        data: &[u8],
+    ) -> Result<usize, String> {
+        let proc = self
+            .processes
+            .get(&pid)
+            .ok_or_else(|| format!("Process {:?} not found", pid))?;
+        let pipe_id = proc
+            .stdout_pipe
+            .ok_or("Process has no stdout pipe")?;
+        let pipe = self
+            .pipes
+            .get(&pipe_id)
+            .ok_or("Pipe object not found")?;
+        pipe.write(data)
+    }
+
+    /// Read from the stdin pipe of a process (if one is connected).
+    pub fn read_stdin(
+        &self,
+        pid: ProcessId,
+        out: &mut [u8],
+    ) -> Result<usize, String> {
+        let proc = self
+            .processes
+            .get(&pid)
+            .ok_or_else(|| format!("Process {:?} not found", pid))?;
+        let pipe_id = proc
+            .stdin_pipe
+            .ok_or("Process has no stdin pipe")?;
+        let pipe = self
+            .pipes
+            .get(&pipe_id)
+            .ok_or("Pipe object not found")?;
+        pipe.read(out)
+    }
+
+    // ── 11.2 — Thread creation ────────────────────────────────────────────────
+
     pub fn create_thread(
         &mut self,
         obj_mgr: &mut ObjectManager,
@@ -133,6 +302,8 @@ impl ProcessManager {
         Ok(tid)
     }
 
+    // ── Getters ───────────────────────────────────────────────────────────────
+
     pub fn get_process(&self, id: ProcessId) -> Option<&Process> {
         self.processes.get(&id)
     }
@@ -145,7 +316,12 @@ impl ProcessManager {
         self.threads.get(&id)
     }
 
-    /// 11.5 — Process Operations: start
+    pub fn get_pipe(&self, id: ObjectId) -> Option<&Pipe> {
+        self.pipes.get(&id)
+    }
+
+    // ── 11.5 — Process Operations: start ─────────────────────────────────────
+
     pub fn start_process(&mut self, id: ProcessId) -> Result<(), String> {
         if let Some(p) = self.processes.get_mut(&id) {
             if p.state != ProcessState::Created {
@@ -166,7 +342,8 @@ impl ProcessManager {
         }
     }
 
-    /// 11.5 — Process Operations: stop (terminate)
+    // ── 11.5 — Process Operations: stop (terminate) ───────────────────────────
+
     pub fn stop_process(&mut self, id: ProcessId, exit_code: i32) -> Result<(), String> {
         if let Some(p) = self.processes.get_mut(&id) {
             if p.state == ProcessState::Zombie {
@@ -174,7 +351,7 @@ impl ProcessManager {
             }
             p.state = ProcessState::Zombie;
             p.exit_code = Some(exit_code);
-            // Terminate threads
+            // Terminate all threads
             for tid in &p.threads {
                 if let Some(t) = self.threads.get_mut(tid) {
                     t.state = ThreadState::Terminated;
@@ -186,7 +363,8 @@ impl ProcessManager {
         }
     }
 
-    /// 11.5 — Process Operations: wait
+    // ── 11.5 — Process Operations: wait ──────────────────────────────────────
+
     /// In a real system this would block. Here it returns the exit code if Zombie.
     pub fn wait_process(&self, id: ProcessId) -> Result<Option<i32>, String> {
         let p = self.processes.get(&id).ok_or("Process not found")?;
@@ -197,9 +375,9 @@ impl ProcessManager {
         }
     }
 
-    /// 11.5 — Process Operations: signal
+    // ── 11.5 — Process Operations: signal ────────────────────────────────────
+
     pub fn signal_process(&mut self, id: ProcessId, _signal: u32) -> Result<(), String> {
-        // Conceptually sends a signal to the process.
         let p = self.processes.get_mut(&id).ok_or("Process not found")?;
         if p.state != ProcessState::Running {
             return Err("Cannot signal a zombie process".to_string());
@@ -207,7 +385,8 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// 11.5 — Process Operations: inspect (listing)
+    // ── 11.5 — Process Operations: inspect (listing) ─────────────────────────
+
     pub fn list_processes(&self) -> Vec<&Process> {
         let mut v: Vec<&Process> = self.processes.values().collect();
         v.sort_by_key(|p| p.id);
@@ -218,5 +397,72 @@ impl ProcessManager {
 impl Default for ProcessManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyber_core::{SecurityContext, ObjectType};
+    use hyber_handle::{HandleFlags, HandleManager};
+    use hyber_object::ObjectManager;
+
+
+    #[test]
+    fn pipe_connects_two_processes() {
+        let mut obj_mgr = ObjectManager::new();
+        let mut proc_mgr = ProcessManager::new();
+
+        let writer = proc_mgr
+            .create_process(&mut obj_mgr, None, SecurityContext::root(), None)
+            .unwrap();
+        let reader = proc_mgr
+            .create_process(&mut obj_mgr, None, SecurityContext::root(), None)
+            .unwrap();
+
+        proc_mgr.create_pipe(&mut obj_mgr, writer, reader).unwrap();
+
+        proc_mgr.write_stdout(writer, b"hello pipe").unwrap();
+        let mut buf = [0u8; 16];
+        let n = proc_mgr.read_stdin(reader, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello pipe");
+    }
+
+    #[test]
+    fn handle_inheritance_on_child_creation() {
+        let mut obj_mgr = ObjectManager::new();
+        let mut proc_mgr = ProcessManager::new();
+        let mut handle_mgr = HandleManager::new();
+
+        let parent = proc_mgr
+            .create_process(&mut obj_mgr, None, SecurityContext::root(), None)
+            .unwrap();
+
+        // Give parent an inheritable file handle
+        let file_id = obj_mgr.create_object(ObjectType::File);
+        handle_mgr
+            .open_with_flags(
+                &mut obj_mgr,
+                parent,
+                file_id,
+                hyber_core::Rights::read_only(),
+                "hostfs".into(),
+                HandleFlags::default_inheritable(),
+            )
+            .unwrap();
+
+        // Create child — should inherit the handle
+        let child = proc_mgr
+            .create_process_with_handles(
+                &mut obj_mgr,
+                Some(parent),
+                SecurityContext::root(),
+                None,
+                Some(&mut handle_mgr),
+            )
+            .unwrap();
+
+        assert_eq!(handle_mgr.list_handles(child).len(), 1);
     }
 }

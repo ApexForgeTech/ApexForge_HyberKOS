@@ -40,7 +40,7 @@ pub trait Provider {
 
     fn read(&self, object_id: ObjectId, offset: u64, buffer: &mut [u8]) -> Result<usize, String>;
     fn write(&mut self, object_id: ObjectId, offset: u64, buffer: &[u8]) -> Result<usize, String>;
-    fn enumerate(&self, dir_id: ObjectId) -> Result<Vec<(String, ObjectId)>, String>;
+    fn enumerate(&self, dir_id: ObjectId) -> Result<Option<Vec<(String, ObjectId)>>, String>;
 }
 
 // ==========================================
@@ -388,14 +388,15 @@ impl VFS {
             .ok_or_else(|| format!("Provider '{}' not found", provider_name))?;
 
         match provider.enumerate(dir_id) {
-            Ok(entries) => Ok(entries),
-            Err(_) => {
-                // Provider defers directory listing to NamespaceManager.
+            Ok(Some(entries)) => Ok(entries),
+            Ok(None) => {
+                // Provider explicitly defers directory listing to NamespaceManager.
                 let nodes = ns_mgr
                     .list_directory(dir_id)
                     .ok_or_else(|| format!("Directory not found in namespace: {:?}", dir_id))?;
                 Ok(nodes.into_iter().map(|n| (n.name, n.object_id)).collect())
             }
+            Err(e) => Err(e),
         }
     }
 

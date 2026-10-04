@@ -14,3 +14,4 @@ hyber-process = { path = "../../crates/hyber-process" }
 hyber-device = { path = "../../crates/hyber-device" }
 hyber-service = { path = "../../crates/hyber-service" }
 hyber-memfs = { path = "../../crates/hyber-memfs" }
+hyber-lua = { path = "../../crates/hyber-lua" }

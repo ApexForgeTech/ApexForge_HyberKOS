@@ -1,10 +1,8 @@
 //! HyberKOS Shell — First User-Space Environment
-//! Phase 7–11 — REPL with Standard, Native & Virtual Namespace Commands
+//! Phase 7–12 — REPL with Standard, Native, Virtual Namespace & Lua Commands
 
-use std::cell::RefCell;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use hyber_core::{
@@ -13,6 +11,7 @@ use hyber_core::{
 use hyber_device::{DeviceClass, DeviceManager, DeviceProvider};
 use hyber_handle::HandleManager;
 use hyber_hostfs::HostFSProvider;
+use hyber_lua;
 use hyber_memfs::MemFSProvider;
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
@@ -292,7 +291,7 @@ impl HyberShell {
         let stdin = io::stdin();
         let mut stdout = io::stdout();
 
-        println!("HyberKOS Shell v0.1.0");
+        println!("HyberKOS Shell v0.12.0  (Phase 12 — Lua Runtime enabled)");
         println!("Type 'exit' to quit.\n");
 
         while self.running {
@@ -323,8 +322,48 @@ impl HyberShell {
         println!("Goodbye from HyberKOS!");
     }
 
-    /// Parse and execute a command
+    /// Parse and execute a command line (can contain multiple commands separated by ';')
     fn execute(&mut self, input: &str) {
+        let mut commands = Vec::new();
+        let mut current_cmd = String::new();
+        let mut in_quotes = false;
+        let mut quote_char = ' ';
+
+        for c in input.chars() {
+            if in_quotes {
+                if c == quote_char {
+                    in_quotes = false;
+                }
+                current_cmd.push(c);
+            } else {
+                if c == '"' || c == '\'' {
+                    in_quotes = true;
+                    quote_char = c;
+                    current_cmd.push(c);
+                } else if c == ';' {
+                    if !current_cmd.trim().is_empty() {
+                        commands.push(current_cmd.trim().to_string());
+                    }
+                    current_cmd.clear();
+                } else {
+                    current_cmd.push(c);
+                }
+            }
+        }
+        if !current_cmd.trim().is_empty() {
+            commands.push(current_cmd.trim().to_string());
+        }
+
+        for cmd in commands {
+            self.execute_single(&cmd);
+            if !self.running {
+                break;
+            }
+        }
+    }
+
+    /// Execute a single command
+    fn execute_single(&mut self, input: &str) {
         let parts: Vec<&str> = input.split_whitespace().collect();
         if parts.is_empty() {
             return;
@@ -361,6 +400,12 @@ impl HyberShell {
             "tree" => self.cmd_tree(args),
             "exit" => self.cmd_exit(args),
             "help" => self.cmd_help(args),
+            "cls" | "clear" => self.cmd_cls(args),
+
+
+            // Phase 12 — Lua Runtime
+            "lua" => self.cmd_lua(args),
+            "luafile" => self.cmd_luafile(args),
 
             _ => {
                 eprintln!(
@@ -860,6 +905,13 @@ impl HyberShell {
             Rights::read_only(),
         )?;
 
+        let handle_obj_id = self.handle_mgr.get_handle(self.process_id, handle)
+            .ok_or("Handle disappeared")?
+            .object_id;
+        let is_device = self.obj_mgr.lookup(handle_obj_id)
+            .map(|o| o.object_type == ObjectType::Device)
+            .unwrap_or(false);
+
         let mut buffer = [0u8; 4096];
         loop {
             let bytes =
@@ -869,6 +921,11 @@ impl HyberShell {
                 break;
             }
             print!("{}", String::from_utf8_lossy(&buffer[..bytes]));
+            // Stream-aware break for devices (avoid infinite shell lockup)
+            if is_device {
+                println!("\n[Device output truncated]");
+                break;
+            }
         }
         println!();
 
@@ -1359,8 +1416,15 @@ impl HyberShell {
         Ok(())
     }
 
+    fn cmd_cls(&mut self, _args: &[&str]) -> Result<(), String> {
+        print!("\x1B[2J\x1B[1;1H");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        Ok(())
+    }
+
     fn cmd_help(&self, _args: &[&str]) -> Result<(), String> {
-        println!("=== HyberKOS Shell Commands (Phase 11) ===\n");
+        println!("=== HyberKOS Shell Commands (Phase 12) ===\n");
         println!("Standard Commands:");
         println!("  pwd                     Print working directory");
         println!("  cd <path>               Change directory");
@@ -1371,6 +1435,7 @@ impl HyberShell {
         println!("  mv <src> <dest>         Move/rename");
         println!("  cp <src> <dest>         Copy file");
         println!("  cat <path>              Print file contents");
+        println!("  cls | clear             Clear the terminal screen");
         println!();
         println!("HyberKOS Native Commands:");
         println!("  list [path]             List with Object details");
@@ -1389,6 +1454,21 @@ impl HyberShell {
         println!("  lsdev                   List registered devices (/devices)");
         println!("  lssvc                   List registered services (/services)");
         println!();
+        println!("Phase 12 — Lua Runtime:");
+        println!("  lua <script>            Execute inline Lua (quote the script)");
+        println!("  luafile <path>          Execute a Lua script file from the namespace");
+        println!("  Lua API:");
+        println!("    hyber.fs.open(path, mode)      Open file (r/w/rw)");
+        println!("    file:read() / file:write(s)    Read/write data");
+        println!("    file:close()                   Close handle");
+        println!("    hyber.ns.exists(path)          Check if path exists");
+        println!("    hyber.ns.list(path)            List directory entries");
+        println!("    hyber.obj.info(path)           Object metadata table");
+        println!("    hyber.obj.meta_get/set(...)    Extended metadata");
+        println!("    hyber.proc.pid() / .uid()      Process info");
+        println!("    hyber.log.info/warn/error(s)   Logging");
+        println!("    hyber.cls()                    Clear terminal screen");
+        println!();
         println!("Virtual Namespace (Phase 11):");
         println!("  /processes    -- live processes   (ProcessProvider)");
         println!("  /devices      -- virtual devices  (DeviceProvider)");
@@ -1401,6 +1481,130 @@ impl HyberShell {
         println!("  exit                    Exit shell");
         println!("  help                    Show this help");
         Ok(())
+    }
+
+    // ── Phase 12 — Lua Commands ───────────────────────────────────────────────
+
+    /// `lua <inline_script>`  — execute a Lua one-liner or short script.
+    ///
+    /// Example:
+    ///   lua "hyber.log.info('Hello from Lua!')"  
+    ///   lua "local f = hyber.fs.open('/temporary/.keep','r'); print(f:read()); f:close()"
+    fn cmd_lua(&mut self, args: &[&str]) -> Result<(), String> {
+        if args.is_empty() {
+            return Err(
+                "Usage: lua <script>\nExample: lua \"hyber.log.info('hi')\"\nFor files: luafile <path>"
+                    .to_string(),
+            );
+        }
+        let mut script = args.join(" ");
+        // Strip outer quotes if the user quoted the script to protect ';'
+        let len = script.len();
+        if len >= 2 {
+            let first = script.chars().next().unwrap();
+            let last = script.chars().last().unwrap();
+            if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+                script = script[1..len - 1].to_string();
+            }
+        }
+        self.run_lua_script(&script)
+    }
+
+    /// `luafile <hyber-path>` — read a Lua script file from the HyberKOS
+    /// namespace and execute it.
+    ///
+    /// Example:
+    ///   luafile /apps/scripts/hello.lua
+    fn cmd_luafile(&mut self, args: &[&str]) -> Result<(), String> {
+        let (_flags, positional) = Self::parse_flags(args);
+        if positional.is_empty() {
+            return Err("Usage: luafile <path>".to_string());
+        }
+        let path = self.resolve_path(positional[0]);
+
+        // Read the script via VFS (works for HostFS, MemFS, etc.)
+        let sec_ctx = self
+            .proc_mgr
+            .lock()
+            .unwrap()
+            .get_process(self.process_id)
+            .unwrap()
+            .security_context
+            .clone();
+        let handle = self.vfs.open(
+            &self.ns_mgr,
+            &mut self.handle_mgr,
+            &mut self.obj_mgr,
+            self.process_id,
+            &sec_ctx,
+            &path,
+            Rights::read_only(),
+        )?;
+
+        let mut script_bytes = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = self
+                .vfs
+                .read(&mut self.handle_mgr, self.process_id, handle, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            script_bytes.extend_from_slice(&buf[..n]);
+        }
+        self.vfs
+            .close(&mut self.handle_mgr, &mut self.obj_mgr, self.process_id, handle)?;
+
+        let script = String::from_utf8(script_bytes)
+            .map_err(|_| "Lua script file is not valid UTF-8".to_string())?;
+        self.run_lua_script(&script)
+    }
+
+    /// Internal: hand state over to the Lua runtime, run the script, then
+    /// swap the (potentially mutated) state back in.
+    fn run_lua_script(&mut self, script: &str) -> Result<(), String> {
+        // We need to *move* the managers into the Lua runtime and get them back.
+        // Use std::mem::replace with placeholder values.
+        let vfs = std::mem::replace(&mut self.vfs, VFS::new());
+        let ns_mgr = std::mem::replace(
+            &mut self.ns_mgr,
+            NamespaceManager::new_placeholder(),
+        );
+        let handle_mgr = std::mem::replace(&mut self.handle_mgr, HandleManager::new());
+        let obj_mgr = std::mem::replace(&mut self.obj_mgr, ObjectManager::new());
+
+        let sec_ctx = self
+            .proc_mgr
+            .lock()
+            .unwrap()
+            .get_process(self.process_id)
+            .unwrap()
+            .security_context
+            .clone();
+
+        let (vfs, ns_mgr, handle_mgr, obj_mgr, exec_res) = hyber_lua::run_lua_script(
+            script,
+            vfs,
+            ns_mgr,
+            handle_mgr,
+            obj_mgr,
+            self.process_id,
+            sec_ctx,
+        );
+
+        // Always restore the state
+        self.vfs = vfs;
+        self.ns_mgr = ns_mgr;
+        self.handle_mgr = handle_mgr;
+        self.obj_mgr = obj_mgr;
+
+        match exec_res {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("[lua] {}", e);
+                Err(format!("Lua error: {}", e))
+            }
+        }
     }
 
     /// Cleanup: release all open handles
