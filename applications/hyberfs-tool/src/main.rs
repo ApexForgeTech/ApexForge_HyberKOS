@@ -16,8 +16,12 @@ fn blocks(s: &str) -> Result<u64, String> {
     s.parse().map_err(|_| "blocks must be an integer".into())
 }
 fn open(path: &str, blocks: u64) -> Result<Volume<FileDevice>, String> {
-    Volume::mount(FileDevice::open(path, blocks).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    let volume = Volume::mount(FileDevice::open(path, blocks).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    for warning in volume.recovery_warnings() {
+        eprintln!("recovery warning: {warning}");
+    }
+    Ok(volume)
 }
 
 fn main() {
@@ -31,7 +35,7 @@ fn run() -> Result<(), String> {
     let a: Vec<String> = env::args().collect();
     let result = match a.get(1).map(String::as_str) {
         Some("format") if a.len() == 5 && a[4] == "--force" => {
-            let d = FileDevice::open(&a[2], blocks(&a[3])?).map_err(|e| e.to_string())?;
+            let d = FileDevice::create(&a[2], blocks(&a[3])?, true).map_err(|e| e.to_string())?;
             Volume::format(d).map(|_| ()).map_err(|e| e.to_string())
         }
         Some("check") if a.len() == 4 => {
@@ -71,7 +75,7 @@ fn run() -> Result<(), String> {
         }
         _ => {
             usage();
-            return Ok(());
+            return Err("invalid arguments".into());
         }
     };
     result

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+hyber-auth = { path = "../hyber-auth" }
 hyber-core = { path = "../hyber-core" }
 hyber-object = { path = "../hyber-object" }
 hyber-handle = { path = "../hyber-handle" }

@@ -79,6 +79,7 @@ use std::sync::{Arc, Mutex};
 // ── Shared kernel state ───────────────────────────────────────────────────────
 
 struct KernelState {
+    session: Option<hyber_auth::SessionGuard>,
     vfs: VFS,
     ns_mgr: NamespaceManager,
     handle_mgr: HandleManager,
@@ -124,7 +125,41 @@ pub fn run_lua_script(
     ObjectManager,
     Result<(), mlua::Error>,
 ) {
+    run_lua_script_with_session(
+        script,
+        vfs,
+        ns_mgr,
+        handle_mgr,
+        obj_mgr,
+        proc_mgr,
+        process_id,
+        security_context,
+        None,
+    )
+}
+
+/// Authenticated callers provide a shared guard. Every Hyber operation
+/// refreshes the context, including reads through previously opened handles.
+#[allow(clippy::too_many_arguments, clippy::arc_with_non_send_sync)]
+pub fn run_lua_script_with_session(
+    script: &str,
+    vfs: VFS,
+    ns_mgr: NamespaceManager,
+    handle_mgr: HandleManager,
+    obj_mgr: ObjectManager,
+    proc_mgr: Arc<Mutex<ProcessManager>>,
+    process_id: ProcessId,
+    security_context: SecurityContext,
+    session: Option<hyber_auth::SessionGuard>,
+) -> (
+    VFS,
+    NamespaceManager,
+    HandleManager,
+    ObjectManager,
+    Result<(), mlua::Error>,
+) {
     let state = Arc::new(Mutex::new(KernelState {
+        session,
         vfs,
         ns_mgr,
         handle_mgr,
@@ -137,6 +172,25 @@ pub fn run_lua_script(
 
     let exec_res = (|| -> Result<(), mlua::Error> {
         let lua = Lua::new();
+        // Host filesystem/process APIs bypass Hyber permissions and sessions.
+        for name in [
+            "io", "os", "package", "debug", "require", "dofile", "loadfile",
+        ] {
+            lua.globals().set(name, LuaValue::Nil)?;
+        }
+        if let Some(session) = &lock(&state)?.session {
+            session.context().map_err(|e| lua_err(e.to_string()))?;
+            let session = session.clone();
+            lua.set_hook(
+                mlua::HookTriggers::new().every_nth_instruction(10_000),
+                move |_, _| {
+                    session
+                        .context()
+                        .map(|_| ())
+                        .map_err(|e| lua_err(e.to_string()))
+                },
+            );
+        }
         build_hyber_table(&lua, Arc::clone(&state))?;
         lua.load(script).exec()?;
         Ok(())
@@ -768,9 +822,13 @@ fn build_log(lua: &Lua) -> LuaResult<LuaTable<'_>> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn lock(state: &Arc<Mutex<KernelState>>) -> LuaResult<std::sync::MutexGuard<'_, KernelState>> {
-    state
+    let mut state = state
         .lock()
-        .map_err(|_| LuaError::RuntimeError("KernelState lock poisoned".into()))
+        .map_err(|_| LuaError::RuntimeError("KernelState lock poisoned".into()))?;
+    if let Some(session) = &state.session {
+        state.security_context = session.context().map_err(|e| lua_err(e.to_string()))?;
+    }
+    Ok(state)
 }
 
 fn lua_err(msg: String) -> LuaError {
@@ -829,6 +887,49 @@ fn metadata_to_lua<'lua>(lua: &'lua Lua, val: &MetadataValue) -> LuaResult<LuaVa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_lua_rechecks_revocation_and_blocks_host_libraries() {
+        use hyber_auth::{AuthService, SessionGuard, SessionKind, SystemClock};
+        let password = b"test root credential";
+        let mut auth = AuthService::provision(password, Arc::new(SystemClock)).unwrap();
+        let token = auth
+            .login("root", password, SessionKind::Interactive, 600)
+            .unwrap();
+        let guard = SessionGuard::new(Arc::new(Mutex::new(auth)), token).unwrap();
+        let mut objects = ObjectManager::new();
+        let namespaces = NamespaceManager::new(&mut objects);
+        let mut processes = ProcessManager::new();
+        let pid = processes
+            .create_process(&mut objects, None, guard.context().unwrap(), None)
+            .unwrap();
+        let processes = Arc::new(Mutex::new(processes));
+        let (vfs, namespaces, handles, objects, result) = run_lua_script_with_session(
+            "assert(io == nil and os == nil and require == nil and package == nil and loadfile == nil); assert(hyber.proc.uid() == 0)",
+            VFS::new(),
+            namespaces,
+            HandleManager::new(),
+            objects,
+            processes.clone(),
+            pid,
+            SecurityContext::root(),
+            Some(guard.clone()),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        guard.logout().unwrap();
+        let (_, _, _, _, result) = run_lua_script_with_session(
+            "hyber.input.pending()",
+            vfs,
+            namespaces,
+            handles,
+            objects,
+            processes,
+            pid,
+            SecurityContext::root(),
+            Some(guard),
+        );
+        assert!(result.is_err());
+    }
 
     #[test]
     fn input_queue_round_trip_is_available_to_lua() {

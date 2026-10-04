@@ -9,6 +9,7 @@ name = "hyber"
 path = "src/main.rs"
 
 [dependencies]
+hyber-auth = { path = "../../crates/hyber-auth" }
 hyber-core       = { path = "../../crates/hyber-core" }
 hyber-object     = { path = "../../crates/hyber-object" }
 hyber-namespace  = { path = "../../crates/hyber-namespace" }

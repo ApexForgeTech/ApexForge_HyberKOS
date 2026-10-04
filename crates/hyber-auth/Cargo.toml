@@ -1,0 +1,21 @@
+[package]
+name = "hyber-auth"
+version = "0.1.0"
+edition = "2021"
+description = "Special_2 authentication, credentials, and revocable sessions"
+
+[dependencies]
+hyber-core = { path = "../hyber-core" }
+hyber-identity = { path = "../hyber-identity" }
+hyber-fs = { path = "../hyber-fs" }
+argon2 = "0.5.3"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rpassword = "7.4"
+
+[dev-dependencies]
+hyber-object = { path = "../hyber-object" }
+hyber-process = { path = "../hyber-process" }

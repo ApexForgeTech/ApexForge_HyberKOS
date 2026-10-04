@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 /// 13 application ABI can replace this constructor without changing the CLI
 /// contract, and no Linux file descriptors escape into Lua.
 pub struct AppContext {
+    pub session: Option<hyber_auth::SessionGuard>,
     pub vfs: VFS,
     pub ns_mgr: NamespaceManager,
     pub handle_mgr: HandleManager,
@@ -37,6 +38,7 @@ impl AppContext {
         vfs.mount(Path::parse("/"), "app-memfs".into());
 
         let mut context = Self {
+            session: None,
             vfs,
             ns_mgr,
             handle_mgr: HandleManager::new(),
@@ -59,6 +61,37 @@ impl AppContext {
                 ObjectType::Directory,
             )?;
         }
+        Ok(context)
+    }
+
+    pub fn authenticated(session: hyber_auth::SessionGuard) -> Result<Self, String> {
+        let security = session.context().map_err(|e| e.to_string())?;
+        let mut context = Self::new()?;
+        // The private app namespace belongs to this session, including its root.
+        let mut ids = vec![context.ns_mgr.root()];
+        for path in ["/apps", "/data", "/runtime", "/temporary"] {
+            ids.push(
+                context
+                    .ns_mgr
+                    .resolve(&Path::parse(path), context.ns_mgr.root())?,
+            );
+        }
+        for id in ids {
+            if let Some(object) = context.obj_mgr.lookup_mut(id) {
+                object.owner = security.user_id;
+                object.group = security.group_id;
+                object.permissions = 0o700;
+            }
+        }
+        context
+            .proc_mgr
+            .lock()
+            .map_err(|_| "process lock poisoned")?
+            .get_process_mut(context.process_id)
+            .ok_or("process missing")?
+            .security_context = security.clone();
+        context.security_context = security;
+        context.session = Some(session);
         Ok(context)
     }
 }

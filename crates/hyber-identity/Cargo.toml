@@ -1,0 +1,8 @@
+[package]
+name = "hyber-identity"
+version = "0.1.0"
+edition = "2021"
+description = "Special_1 user, group, and account registry"
+
+[dependencies]
+hyber-core = { path = "../hyber-core" }

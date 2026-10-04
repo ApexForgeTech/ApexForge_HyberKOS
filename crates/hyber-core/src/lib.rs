@@ -175,7 +175,10 @@ impl Path {
             match component.0.as_str() {
                 "." => continue, // Skip current directory
                 ".." => {
-                    if !normalized_components.is_empty() {
+                    if normalized_components
+                        .last()
+                        .is_some_and(|c: &PathComponent| c.0 != "..")
+                    {
                         normalized_components.pop(); // Go up one directory
                     } else if !is_absolute {
                         // A relative path must retain leading parents.  Dropping
@@ -344,6 +347,7 @@ pub struct Capability {
 pub struct SecurityContext {
     pub user_id: UserId,
     pub group_id: GroupId,
+    pub supplementary_groups: Vec<GroupId>,
     pub capabilities: Vec<Capability>,
 }
 
@@ -352,6 +356,7 @@ impl SecurityContext {
         Self {
             user_id: UserId(0),
             group_id: GroupId(0),
+            supplementary_groups: Vec::new(),
             capabilities: vec![Capability {
                 name: "CAP_SYS_ADMIN".to_string(),
             }],
@@ -382,7 +387,7 @@ impl SecurityManager {
             allowed_read = (permissions & 0o400) != 0;
             allowed_write = (permissions & 0o200) != 0;
             allowed_execute = (permissions & 0o100) != 0;
-        } else if context.group_id == group {
+        } else if context.group_id == group || context.supplementary_groups.contains(&group) {
             allowed_read = (permissions & 0o040) != 0;
             allowed_write = (permissions & 0o020) != 0;
             allowed_execute = (permissions & 0o010) != 0;
@@ -429,7 +434,42 @@ impl SecurityManager {
 
 #[cfg(test)]
 mod tests {
-    use super::Path;
+    use super::*;
+
+    #[test]
+    fn supplementary_group_permissions_do_not_override_owner_class() {
+        let context = SecurityContext {
+            user_id: UserId(1000),
+            group_id: GroupId(1000),
+            supplementary_groups: vec![GroupId(2000)],
+            capabilities: vec![],
+        };
+        assert!(SecurityManager::check_access(
+            &context,
+            UserId(12),
+            GroupId(2000),
+            0o040,
+            Rights::read_only()
+        )
+        .is_ok());
+        assert!(SecurityManager::check_access(
+            &context,
+            UserId(1000),
+            GroupId(2000),
+            0o040,
+            Rights::read_only()
+        )
+        .is_err());
+        assert!(SecurityManager::check_access(
+            &context,
+            UserId(12),
+            GroupId(2001),
+            0o040,
+            Rights::read_only()
+        )
+        .is_err());
+        assert_eq!(Path::parse("../../a").normalize().to_string(), "../../a");
+    }
 
     #[test]
     fn relative_normalization_preserves_leading_parent() {

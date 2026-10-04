@@ -5,3 +5,4 @@ edition = "2021"
 description = "Phase 15 user-space HyberFS format and prototype"
 
 [dependencies]
+rand_core = { version = "0.6.4", features = ["getrandom"] }

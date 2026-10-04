@@ -2602,15 +2602,17 @@ operation is acknowledged.
 
 Implement a minimal metadata transaction boundary.
 
-The current prototype journals by writing a complete new state to the
-inactive copy-on-write slot, flushing it, and then updating the superblock.
-This is an atomic snapshot journal boundary, not yet a block-level record log.
+The version 2 prototype journals by invalidating and flushing the inactive
+slot header, writing/flushing its full payload, then publishing/flushing the
+checksummed generation header. The geometry superblock remains immutable.
+This is an atomic snapshot journal boundary, not a block-level record log.
 
 Each snapshot has a monotonic generation, bounded payload, checksum, and
 deterministic newest-valid-slot selection. Interrupted writes must leave either
 the previous or the new valid generation visible, never a partially decoded
-state. A block-level record journal, crash injection, and advanced repair
-remain Phase 16 responsibilities.
+state. Phase 16 validates this boundary with torn-write and flush-failure
+injection. A native block-level record journal requires a future format change;
+the current recovery engine reports invalid objects instead of destructive repair.
 
 ---
 
@@ -2789,6 +2791,14 @@ journal state
 
 # 17.5 — Phase 16 Exit Criteria
 
+The current Rust implementation includes a write/flush crash matrix, generation
+and metadata checksums, bounded iterative graph validation, deterministic
+reference-model/remount tests, and the read-only `hyberfsck` binary. Recovery
+diagnostics identify damaged slots; a recovered older snapshot is not reported
+as a clean image. Failed commits poison the mounted writer until remount.
+Physical power-cut testing and native-device qualification remain separate
+from these deterministic hosted tests.
+
 The filesystem survives intentionally simulated failures without silently
 corrupting its structure. The phase is complete only when:
 
@@ -2850,9 +2860,34 @@ Lua  → capability-checked administrative workflows
 Go   → not required for identity correctness
 ```
 
-The registry is persisted on HyberFS, uses atomic updates, rejects duplicate
-names and IDs, protects reserved identities, and records administrative
-mutations for audit.
+### Initial implementation boundary
+
+The first implementation is the Rust crate `crates/hyber-identity`. It owns
+the deterministic in-memory registry and its checksummed `HYBID01` snapshot:
+
+```text
+AccountRegistry
+  ├─ UserAccount (state, home, primary/supplementary groups, capabilities)
+  ├─ GroupAccount (deterministic member set)
+  ├─ create/delete/membership/state/home/capability operations
+  ├─ SecurityContext derivation
+  └─ encode/decode + structural corruption validation
+```
+
+The snapshot is deliberately a byte payload rather than a host `/etc/passwd`
+or `/etc/group` file. `hyber-auth` commits accounts, credential hashes, and
+administrative audit entries together through the Phase 15/16 `replace_file`
+and `sync` snapshot boundary. Raw registry methods are trusted internal APIs;
+application administration must pass through the authenticated authority.
+The identity crate does
+not parse host accounts, store passwords, authenticate users, or silently
+grant capabilities. Those are Special_2 responsibilities.
+
+The registry rejects duplicate names/IDs, invalid names or homes, inconsistent
+bidirectional memberships, invalid capability names, missing root invariants,
+and truncated/checksum-invalid snapshots. Root's administrative capability is
+explicitly stored and cannot be revoked; all other capabilities require an
+explicit grant.
 
 ## Exit Criteria
 
@@ -2864,6 +2899,22 @@ reserved IDs and duplicate names are rejected
 home and service ownership are validated
 account corruption is detected before session creation
 ```
+
+## Required files and verification
+
+```text
+crates/hyber-identity/Cargo.toml
+crates/hyber-identity/src/lib.rs
+```
+
+The crate must be included in the workspace and pass formatting, workspace
+tests, clippy with warnings denied, and a round-trip/corruption test suite.
+Special_1 is complete only when account mutations remain deterministic after
+encode/decode and deletion removes every reverse group membership safely.
+The implementation also validates unique home paths, reserved root state,
+monotonic allocation counters, duplicate encoded memberships, and primary-group
+transitions. Supplementary groups reach the common `SecurityContext` and its
+owner/group/other checks. Creating physical home trees remains Special_3.
 
 ---
 
@@ -2908,6 +2959,69 @@ supplementary groups/capabilities are tested
 credential data is protected and non-plaintext
 shell/services/apps consume the same session context
 ```
+
+## Implemented user-space boundary
+
+`crates/hyber-auth` owns the account registry, credential records, session
+digests, clock policy, and administrative audit. `AuthService::provision` is
+trusted first-boot enrollment with an explicit root password; persisted stores
+use `load`, never automatic reprovisioning. Passwords use salted Argon2id PHC
+records with bounded parameters. Credential snapshots have a version, size
+limit, SHA-256 damage checksum, and strict account/hash validation.
+
+Session tokens contain 256 random bits and are redacted in diagnostics. Only
+their digests are retained in the session table. Sessions are volatile and
+must be recreated after restart. Interactive, non-interactive, and service
+sessions have explicit account-state rules and bounded lifetimes. Account and
+password expiry use a trusted clock; backwards clock movement revokes sessions.
+Login failures use a common error and dummy password verification, with a
+bounded authority-wide retry cooldown. This hosted cooldown is not a distributed
+network rate limiter.
+
+Administrative account changes are staged on a clone, validated, and audited.
+Changes to an account revoke its active sessions; password changes revoke all
+sessions for that account. Logout is immediately effective for every clone of
+the same guard. `SessionGuard` derives current groups/capabilities for each
+operation. The Rust boundary is trusted; arbitrary application-supplied
+`SecurityContext` structs are not authentication proofs.
+
+`AuthService::save` writes identities, hashes, and audit records in one HyberFS
+snapshot with root-owned 0600 metadata. Mutations are in-memory until save
+succeeds; administrative CLI success is printed only after durable save.
+The dedicated hosted store is `/auth.store` inside an image kept outside the
+application namespace. Damaged-slot recovery is refused for credentials.
+
+## Consumers and tools
+
+```text
+hyber-auth-tool init <new-image> <blocks>
+hyber-auth-tool user-add <image> <blocks> <username> [service|guest]
+hyber-auth-tool passwd <image> <blocks> <username>
+hyber-auth-tool lock|disable <image> <blocks> <username>
+hyber-auth-tool unlock <image> <blocks> <username> <active|service|guest>
+hyber-auth-tool check <image> <blocks>
+hyber-shell --auth <image> <blocks> <username>
+hyber run --auth <image> <blocks> <username> <script-or-project>
+```
+
+Passwords are terminal prompts, never command arguments. The hosted login
+adapter detects persisted store changes and invalidates its old session.
+It is a single-process authority adapter, not the future IPC login daemon.
+Existing no-argument development shell/CLI modes remain trusted bootstrap
+environments and must not be deployed as a multi-user login boundary.
+
+Lua revalidates the session on Hyber operations and instruction hooks, removes
+host I/O/process/module-loader globals, and cannot manufacture session tokens.
+Authenticated shells reject numeric `su`; bootstrap numeric `su` requires an
+administrative capability. Services use their own service session and validate
+it at dispatch; closing a GUI or caller session does not stop that service.
+
+Tests cover generic failure responses, retry cooldown, group/capability access,
+expiry boundaries, clock rollback, password rotation, logout, locked accounts,
+service independence, snapshot corruption, private metadata, and restart
+invalidation. See `docs/security/identity-sessions.md` for the storage/trust
+contract and integration limitations. Special_3 owns physical home provisioning;
+the native login daemon and process termination policy remain later runtime work.
 
 ---
 

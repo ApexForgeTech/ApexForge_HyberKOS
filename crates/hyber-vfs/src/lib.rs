@@ -118,6 +118,48 @@ impl VFS {
         ns_mgr.resolve(&path.normalize(), ns_mgr.root())
     }
 
+    /// Check search permission on all ancestor directories. With include_target,
+    /// also check the directory being created in, enumerated, or renamed in.
+    pub fn check_traversal(
+        ns_mgr: &NamespaceManager,
+        obj_mgr: &ObjectManager,
+        context: &hyber_core::SecurityContext,
+        path: &Path,
+        include_target: bool,
+    ) -> Result<(), String> {
+        let path = path.normalize();
+        if !path.is_absolute {
+            return Err("absolute path required".into());
+        }
+        let end = if include_target {
+            path.components.len() + 1
+        } else {
+            path.components.len()
+        };
+        for count in 0..end {
+            let ancestor = Path {
+                is_absolute: true,
+                components: path.components[..count].to_vec(),
+            };
+            let id = ns_mgr.resolve(&ancestor, ns_mgr.root())?;
+            let object = obj_mgr.lookup(id).ok_or("ancestor missing")?;
+            if object.object_type != ObjectType::Directory {
+                return Err("ancestor is not a directory".into());
+            }
+            hyber_core::SecurityManager::check_access(
+                context,
+                object.owner,
+                object.group,
+                object.permissions,
+                Rights {
+                    execute: true,
+                    ..Rights::empty()
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // Manager ownership is explicit at this layer.
     pub fn open(
         &self,
@@ -129,6 +171,7 @@ impl VFS {
         path: &Path,
         rights: Rights,
     ) -> Result<HandleId, String> {
+        Self::check_traversal(ns_mgr, obj_mgr, security_context, path, false)?;
         let path = path.normalize();
         let provider_name = self
             .mount_table
@@ -236,6 +279,7 @@ impl VFS {
         name: &str,
         obj_type: ObjectType,
     ) -> Result<ObjectId, String> {
+        Self::check_traversal(ns_mgr, obj_mgr, security_context, parent_path, true)?;
         let parent_path = parent_path.normalize();
         let provider_name = self
             .mount_table
@@ -263,7 +307,18 @@ impl VFS {
             .get_mut(&provider_name)
             .ok_or_else(|| format!("Provider {} not found", provider_name))?;
 
-        provider.create(obj_mgr, ns_mgr, parent_id, name, obj_type)
+        let id = provider.create(obj_mgr, ns_mgr, parent_id, name, obj_type)?;
+        let object = obj_mgr
+            .lookup_mut(id)
+            .ok_or("provider did not create object")?;
+        object.owner = security_context.user_id;
+        object.group = security_context.group_id;
+        object.permissions = if obj_type == ObjectType::Directory {
+            0o700
+        } else {
+            0o600
+        };
+        Ok(id)
     }
 
     pub fn remove(
@@ -274,6 +329,7 @@ impl VFS {
         parent_path: &Path,
         name: &str,
     ) -> Result<(), String> {
+        Self::check_traversal(ns_mgr, obj_mgr, security_context, parent_path, true)?;
         let parent_path = parent_path.normalize();
         let provider_name = self
             .mount_table
@@ -315,6 +371,8 @@ impl VFS {
         new_parent_path: &Path,
         new_name: &str,
     ) -> Result<(), String> {
+        Self::check_traversal(ns_mgr, obj_mgr, security_context, old_parent_path, true)?;
+        Self::check_traversal(ns_mgr, obj_mgr, security_context, new_parent_path, true)?;
         let old_parent_path = old_parent_path.normalize();
         let new_parent_path = new_parent_path.normalize();
         let provider_name = self
@@ -416,6 +474,7 @@ impl VFS {
         security_context: &hyber_core::SecurityContext,
         path: &Path,
     ) -> Result<Vec<(String, ObjectId)>, String> {
+        Self::check_traversal(ns_mgr, obj_mgr, security_context, path, true)?;
         let normalized = path.normalize();
         let dir_id = ns_mgr.resolve(&normalized, ns_mgr.root())?;
         let object = obj_mgr.lookup(dir_id).ok_or("Directory object not found")?;
@@ -449,6 +508,37 @@ impl Default for VFS {
 mod tests {
     use super::MountTable;
     use hyber_core::Path;
+
+    #[test]
+    fn private_parent_cannot_be_bypassed_by_readable_child() {
+        use hyber_core::{GroupId, ObjectType, SecurityContext, UserId};
+        let mut objects = hyber_object::ObjectManager::new();
+        let mut namespace = hyber_namespace::NamespaceManager::new(&mut objects);
+        let parent = objects.create_object(ObjectType::Directory);
+        objects.lookup_mut(parent).unwrap().permissions = 0o700;
+        namespace
+            .create_node(&objects, namespace.root(), "private", parent)
+            .unwrap();
+        namespace.initialize_directory(parent).unwrap();
+        let child = objects.create_object(ObjectType::File);
+        objects.lookup_mut(child).unwrap().permissions = 0o644;
+        namespace
+            .create_node(&objects, parent, "public", child)
+            .unwrap();
+        let mut user = SecurityContext {
+            user_id: UserId(1000),
+            group_id: GroupId(1000),
+            supplementary_groups: vec![GroupId(2000)],
+            capabilities: vec![],
+        };
+        let path = Path::parse("/private/public");
+        assert!(super::VFS::check_traversal(&namespace, &objects, &user, &path, false).is_err());
+        objects.lookup_mut(parent).unwrap().group = GroupId(2000);
+        objects.lookup_mut(parent).unwrap().permissions = 0o710;
+        assert!(super::VFS::check_traversal(&namespace, &objects, &user, &path, false).is_ok());
+        user.supplementary_groups.clear();
+        assert!(super::VFS::check_traversal(&namespace, &objects, &user, &path, false).is_err());
+    }
 
     #[test]
     fn provider_selection_obeys_component_boundaries() {

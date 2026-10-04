@@ -13,6 +13,9 @@ use hyber_vfs::Provider;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[cfg(test)]
+mod session_tests;
+
 /// The lifecycle state of a service
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceState {
@@ -40,6 +43,7 @@ impl std::fmt::Display for ServiceState {
 /// A registered service entry
 #[derive(Debug, Clone)]
 pub struct ServiceEntry {
+    session: Option<hyber_auth::SessionGuard>,
     /// Unique numeric service ID
     pub id: u64,
     /// Human-readable service name (e.g. "logger", "netstack", "scheduler")
@@ -78,6 +82,7 @@ impl ServiceManager {
         self.next_id += 1;
         let object_id = obj_mgr.create_object(ObjectType::Service);
         let entry = ServiceEntry {
+            session: None,
             id,
             name: name.into(),
             state: ServiceState::Stopped,
@@ -97,6 +102,9 @@ impl ServiceManager {
         if svc.state == ServiceState::Disabled {
             return Err(format!("Service '{}' is disabled", svc.name));
         }
+        if svc.state == ServiceState::Running {
+            return Err("service already running".into());
+        }
         svc.state = ServiceState::Running;
         svc.process_id = process_id;
         Ok(())
@@ -107,7 +115,12 @@ impl ServiceManager {
             .services
             .get_mut(&id)
             .ok_or_else(|| format!("Service {} not found", id))?;
-        svc.state = ServiceState::Stopped;
+        if let Some(session) = svc.session.take() {
+            let _ = session.logout();
+        }
+        if svc.state != ServiceState::Disabled {
+            svc.state = ServiceState::Stopped;
+        }
         svc.process_id = None;
         Ok(())
     }
@@ -117,7 +130,13 @@ impl ServiceManager {
             .services
             .get_mut(&id)
             .ok_or_else(|| format!("Service {} not found", id))?;
-        svc.state = ServiceState::Failed;
+        if let Some(session) = svc.session.take() {
+            let _ = session.logout();
+        }
+        svc.process_id = None;
+        if svc.state != ServiceState::Disabled {
+            svc.state = ServiceState::Failed;
+        }
         Ok(())
     }
 
@@ -126,6 +145,9 @@ impl ServiceManager {
             .services
             .get_mut(&id)
             .ok_or_else(|| format!("Service {} not found", id))?;
+        if let Some(session) = svc.session.take() {
+            let _ = session.logout();
+        }
         svc.state = ServiceState::Disabled;
         svc.process_id = None;
         Ok(())
@@ -135,6 +157,52 @@ impl ServiceManager {
         let mut v: Vec<&ServiceEntry> = self.services.values().collect();
         v.sort_by_key(|s| s.id);
         v
+    }
+
+    /// A service has its own session, independent of any GUI/client session.
+    pub fn start_authenticated(
+        &mut self,
+        objects: &mut ObjectManager,
+        id: u64,
+        process_id: Option<ProcessId>,
+        session: hyber_auth::SessionGuard,
+    ) -> Result<(), String> {
+        if session.kind().map_err(|e| e.to_string())? != hyber_auth::SessionKind::Service {
+            return Err("service session required".into());
+        }
+        let context = session.context().map_err(|e| e.to_string())?;
+        let object_id = self.services.get(&id).ok_or("service not found")?.object_id;
+        if objects.lookup(object_id).is_none() {
+            return Err("service object missing".into());
+        }
+        if self
+            .services
+            .get(&id)
+            .is_some_and(|s| s.state == ServiceState::Running)
+        {
+            return Err("service already running".into());
+        }
+        self.start_service(id, process_id)?;
+        let object = objects.lookup_mut(object_id).unwrap();
+        object.owner = context.user_id;
+        object.group = context.group_id;
+        object.permissions = 0o400;
+        self.services.get_mut(&id).unwrap().session = Some(session);
+        Ok(())
+    }
+
+    /// Call at every authenticated service dispatch, never cache the result.
+    pub fn session_context(&self, id: u64) -> Result<hyber_core::SecurityContext, String> {
+        let service = self.services.get(&id).ok_or("service not found")?;
+        if service.state != ServiceState::Running {
+            return Err("service not running".into());
+        }
+        service
+            .session
+            .as_ref()
+            .ok_or("service has no authenticated session")?
+            .context()
+            .map_err(|e| e.to_string())
     }
 
     pub fn get_service_by_name(&self, name: &str) -> Option<&ServiceEntry> {

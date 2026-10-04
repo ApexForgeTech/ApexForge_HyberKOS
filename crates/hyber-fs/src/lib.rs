@@ -2,11 +2,12 @@
 //!
 //! The format deliberately uses explicit little-endian fields and never writes
 //! Rust layouts, pointers, host file descriptors, or host paths to disk.  A
-//! volume is committed copy-on-write into one of two fixed slots; the
-//! superblock selects the newest valid slot after a flush.  This gives the
-//! prototype a useful atomic metadata boundary while keeping full crash
-//! injection and repair tooling for Phase 16.
+//! volume is committed copy-on-write into one of two fixed slots. Immutable
+//! superblock geometry and checksummed generation headers support newest-valid
+//! recovery. Phase 16 tests model torn writes and failed flushes; damaged-slot
+//! fallback is observable and read-only.
 
+use rand_core::{OsRng, RngCore};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -15,10 +16,12 @@ use std::path::Path;
 
 pub const BLOCK_SIZE: usize = 4096;
 const MAGIC: &[u8; 8] = b"HYBFS15\0";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const SUPERBLOCK_BYTES: u64 = BLOCK_SIZE as u64;
 const SLOT_HEADER: usize = 40;
 const MIN_BLOCKS: u64 = 8;
+/// Snapshot prototype bound; a streaming/extent format is needed above this.
+const MAX_BLOCKS: u64 = 32769;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
@@ -43,6 +46,8 @@ pub struct Metadata {
     pub mode: u32,
     pub created: u64,
     pub modified: u64,
+    pub flags: u32,
+    pub extended: BTreeMap<String, Vec<u8>>,
 }
 
 impl Default for Metadata {
@@ -53,6 +58,8 @@ impl Default for Metadata {
             mode: 0o644,
             created: 0,
             modified: 0,
+            flags: 0,
+            extended: BTreeMap::new(),
         }
     }
 }
@@ -138,6 +145,9 @@ pub struct MemDevice {
 }
 impl MemDevice {
     pub fn new(blocks: u64) -> Result<Self, FsError> {
+        if blocks > MAX_BLOCKS {
+            return Err(FsError::NoSpace);
+        }
         let bytes = usize::try_from(
             blocks
                 .checked_mul(BLOCK_SIZE as u64)
@@ -236,18 +246,56 @@ pub struct FileDevice {
     size: u64,
 }
 impl FileDevice {
+    /// Open an existing image without creating, truncating, or resizing it.
     pub fn open(path: impl AsRef<Path>, blocks: u64) -> Result<Self, FsError> {
         let size = blocks
             .checked_mul(BLOCK_SIZE as u64)
             .ok_or(FsError::NoSpace)?;
-        let file = OpenOptions::new()
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        file.try_lock().map_err(|_| FsError::Busy)?;
+        if file.metadata()?.len() != size {
+            return Err(FsError::InvalidArgument("image size mismatch"));
+        }
+        Ok(Self { file, size })
+    }
+
+    /// Destructive formatting is explicit. Without force, creation is exclusive.
+    pub fn create(path: impl AsRef<Path>, blocks: u64, force: bool) -> Result<Self, FsError> {
+        if !(MIN_BLOCKS..=MAX_BLOCKS).contains(&blocks) {
+            return Err(FsError::InvalidArgument("image too small"));
+        }
+        let size = blocks
+            .checked_mul(BLOCK_SIZE as u64)
+            .ok_or(FsError::NoSpace)?;
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+            .create(force)
+            .create_new(!force)
+            .truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
+        file.try_lock().map_err(|_| FsError::Busy)?;
+        if force {
+            file.set_len(0)?;
+        }
+        file.set_len(size)?;
+        Ok(Self { file, size })
+    }
+
+    pub fn open_read_only(path: impl AsRef<Path>, blocks: u64) -> Result<Self, FsError> {
+        let size = blocks
+            .checked_mul(BLOCK_SIZE as u64)
+            .ok_or(FsError::NoSpace)?;
+        let file = File::open(path)?;
+        file.try_lock_shared().map_err(|_| FsError::Busy)?;
         if file.metadata()?.len() != size {
-            file.set_len(size)?;
+            return Err(FsError::InvalidArgument("image size mismatch"));
         }
         Ok(Self { file, size })
     }
@@ -257,11 +305,23 @@ impl BlockDevice for FileDevice {
         self.size
     }
     fn read_at(&mut self, offset: u64, out: &mut [u8]) -> Result<(), FsError> {
+        if offset
+            .checked_add(out.len() as u64)
+            .is_none_or(|end| end > self.size)
+        {
+            return Err(FsError::Io("read beyond device".into()));
+        }
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(out)?;
         Ok(())
     }
     fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), FsError> {
+        if offset
+            .checked_add(data.len() as u64)
+            .is_none_or(|end| end > self.size)
+        {
+            return Err(FsError::Io("write beyond device".into()));
+        }
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(data)?;
         Ok(())
@@ -279,21 +339,47 @@ pub struct Volume<D: BlockDevice> {
     generation: u64,
     active_slot: u8,
     dirty: bool,
+    failed: bool,
+    recovery_warnings: Vec<String>,
+    uuid: [u8; 16],
 }
 
 impl<D: BlockDevice> Volume<D> {
-    pub fn format(device: D) -> Result<Self, FsError> {
+    pub fn format(mut device: D) -> Result<Self, FsError> {
+        let timestamp = timestamp()?;
         let blocks = device.len() / BLOCK_SIZE as u64;
-        if blocks < MIN_BLOCKS || !device.len().is_multiple_of(BLOCK_SIZE as u64) {
+        if !(MIN_BLOCKS..=MAX_BLOCKS).contains(&blocks)
+            || !device.len().is_multiple_of(BLOCK_SIZE as u64)
+        {
             return Err(FsError::InvalidArgument(
                 "volume must contain aligned minimum blocks",
             ));
         }
+        // Clear both old headers: an older high generation must never survive reformat.
+        for slot in 0..2 {
+            device.write_at(slot_offset(blocks, slot), &[0; SLOT_HEADER])?;
+        }
+        device.flush()?;
+        let mut sb = vec![0; BLOCK_SIZE];
+        let mut uuid = [0; 16];
+        OsRng
+            .try_fill_bytes(&mut uuid)
+            .map_err(|e| FsError::Io(e.to_string()))?;
+        sb[..8].copy_from_slice(MAGIC);
+        put_u32(&mut sb, 8, VERSION);
+        put_u64(&mut sb, 12, blocks);
+        sb[40..56].copy_from_slice(&uuid);
+        let checksum = slot_hash(&sb[..32], &sb[40..56]);
+        put_u64(&mut sb, 32, checksum);
+        device.write_at(0, &sb)?;
+        device.flush()?;
         let root = Object {
             id: 1,
             kind: ObjectKind::Directory,
             metadata: Metadata {
                 mode: 0o755,
+                created: timestamp,
+                modified: timestamp,
                 ..Default::default()
             },
             data: Vec::new(),
@@ -311,6 +397,9 @@ impl<D: BlockDevice> Volume<D> {
             generation: 0,
             active_slot: 0,
             dirty: true,
+            failed: false,
+            recovery_warnings: Vec::new(),
+            uuid,
         };
         volume.commit()?;
         Ok(volume)
@@ -318,7 +407,9 @@ impl<D: BlockDevice> Volume<D> {
 
     pub fn mount(mut device: D) -> Result<Self, FsError> {
         let blocks = device.len() / BLOCK_SIZE as u64;
-        if blocks < MIN_BLOCKS || !device.len().is_multiple_of(BLOCK_SIZE as u64) {
+        if !(MIN_BLOCKS..=MAX_BLOCKS).contains(&blocks)
+            || !device.len().is_multiple_of(BLOCK_SIZE as u64)
+        {
             return Err(FsError::Corrupt("invalid volume size"));
         }
         let mut sb = vec![0; BLOCK_SIZE];
@@ -329,27 +420,40 @@ impl<D: BlockDevice> Volume<D> {
         if u32::from_le_bytes(sb[8..12].try_into().unwrap()) != VERSION {
             return Err(FsError::Unsupported("unsupported HyberFS version"));
         }
-        if hash(&sb[..32]) != u64::from_le_bytes(sb[32..40].try_into().unwrap()) {
+        if slot_hash(&sb[..32], &sb[40..56]) != u64::from_le_bytes(sb[32..40].try_into().unwrap()) {
             return Err(FsError::Corrupt("superblock checksum mismatch"));
+        }
+        if sb[20..32]
+            .iter()
+            .chain(sb[56..].iter())
+            .any(|byte| *byte != 0)
+        {
+            return Err(FsError::Corrupt("superblock reserved bytes are not zero"));
         }
         let stored_blocks = u64::from_le_bytes(sb[12..20].try_into().unwrap());
         if stored_blocks != blocks {
             return Err(FsError::Corrupt("superblock device size mismatch"));
         }
-        let active = sb[20];
         let mut candidates = Vec::new();
+        let mut recovery_warnings = Vec::new();
         for slot in 0..2u8 {
-            if let Ok((generation, state)) = read_slot(&mut device, blocks, slot) {
-                candidates.push((generation, slot, state));
+            match read_slot(&mut device, blocks, slot) {
+                Ok((generation, state)) => candidates.push((generation, slot, state)),
+                Err(FsError::NotFound) => (),
+                Err(error @ FsError::Io(_)) => return Err(error),
+                Err(error) => recovery_warnings.push(format!("slot {slot}: {error}")),
             }
+        }
+        if candidates.len() == 2
+            && candidates[0].0 == candidates[1].0
+            && candidates[0].2 != candidates[1].2
+        {
+            return Err(FsError::Corrupt("conflicting equal-generation snapshots"));
         }
         let (generation, active_slot, state) = candidates
             .into_iter()
             .max_by_key(|x| x.0)
             .ok_or(FsError::Corrupt("no valid committed slot"))?;
-        if active > 1 && active != active_slot {
-            return Err(FsError::Corrupt("invalid active slot"));
-        }
         validate_state(&state)?;
         Ok(Self {
             device,
@@ -358,11 +462,23 @@ impl<D: BlockDevice> Volume<D> {
             generation,
             active_slot,
             dirty: false,
+            failed: false,
+            recovery_warnings,
+            uuid: sb[40..56].try_into().unwrap(),
         })
     }
 
     pub fn root_id(&self) -> u64 {
         self.state.root
+    }
+    pub fn uuid(&self) -> [u8; 16] {
+        self.uuid
+    }
+
+    /// A recovered older generation is observable, never advertised as a
+    /// completely clean image. The checker reports these diagnostics.
+    pub fn recovery_warnings(&self) -> &[String] {
+        &self.recovery_warnings
     }
 
     /// Consume the volume and return its underlying block device. This is
@@ -371,12 +487,21 @@ impl<D: BlockDevice> Volume<D> {
         self.device
     }
     pub fn sync(&mut self) -> Result<(), FsError> {
+        self.writable()?;
         if self.dirty {
             self.commit()?;
         } else {
-            self.device.flush()?;
+            if let Err(error) = self.device.flush() {
+                self.failed = true;
+                return Err(error);
+            }
         }
         Ok(())
+    }
+
+    pub fn unmount(mut self) -> Result<D, FsError> {
+        self.sync()?;
+        Ok(self.device)
     }
     pub fn format_generation(&self) -> u64 {
         self.generation
@@ -389,6 +514,9 @@ impl<D: BlockDevice> Volume<D> {
         self.create(path, ObjectKind::File, mode)
     }
     fn create(&mut self, path: &str, kind: ObjectKind, mode: u32) -> Result<u64, FsError> {
+        self.writable()?;
+        validate_mode(mode)?;
+        let timestamp = timestamp()?;
         let (parent, name) = self.parent_and_name(path)?;
         let p = self.state.objects.get(&parent).ok_or(FsError::NotFound)?;
         if p.kind != ObjectKind::Directory {
@@ -406,6 +534,8 @@ impl<D: BlockDevice> Volume<D> {
                 kind,
                 metadata: Metadata {
                     mode,
+                    created: timestamp,
+                    modified: timestamp,
                     ..Default::default()
                 },
                 data: Vec::new(),
@@ -470,10 +600,19 @@ impl<D: BlockDevice> Volume<D> {
         Ok(n)
     }
     pub fn write_file(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        self.writable()?;
         let id = self.resolve(path)?;
+        if self.object(id)?.kind != ObjectKind::File {
+            return Err(FsError::IsDirectory);
+        }
+        if data.is_empty() {
+            return Ok(0);
+        }
         let start =
             usize::try_from(offset).map_err(|_| FsError::InvalidArgument("offset overflow"))?;
         let end = start.checked_add(data.len()).ok_or(FsError::NoSpace)?;
+        self.ensure_growth(id, end)?;
+        let timestamp = timestamp()?;
         let o = self.state.objects.get_mut(&id).ok_or(FsError::NotFound)?;
         if o.kind != ObjectKind::File {
             return Err(FsError::IsDirectory);
@@ -484,7 +623,7 @@ impl<D: BlockDevice> Volume<D> {
             o.data.resize(end, 0);
         }
         o.data[start..end].copy_from_slice(data);
-        o.metadata.modified = o.metadata.modified.saturating_add(1);
+        o.metadata.modified = o.metadata.modified.max(timestamp);
         if let Err(error) = self.ensure_capacity() {
             let o = self.state.objects.get_mut(&id).unwrap();
             o.data = old_data;
@@ -494,7 +633,36 @@ impl<D: BlockDevice> Volume<D> {
         self.dirty = true;
         Ok(data.len())
     }
+
+    pub fn truncate_file(&mut self, path: &str, length: u64) -> Result<(), FsError> {
+        self.writable()?;
+        let id = self.resolve(path)?;
+        let length = usize::try_from(length).map_err(|_| FsError::NoSpace)?;
+        self.ensure_growth(id, length)?;
+        let timestamp = timestamp()?;
+        let object = self.state.objects.get_mut(&id).ok_or(FsError::NotFound)?;
+        if object.kind != ObjectKind::File {
+            return Err(FsError::IsDirectory);
+        }
+        let old_data = object.data.clone();
+        let old_modified = object.metadata.modified;
+        object.data.resize(length, 0);
+        object.metadata.modified = object.metadata.modified.max(timestamp);
+        if let Err(error) = self.ensure_capacity() {
+            let object = self.state.objects.get_mut(&id).unwrap();
+            object.data = old_data;
+            object.metadata.modified = old_modified;
+            return Err(error);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+    pub fn append_file(&mut self, path: &str, data: &[u8]) -> Result<usize, FsError> {
+        let offset = self.stat(path)?.size;
+        self.write_file(path, offset, data)
+    }
     pub fn rename(&mut self, old: &str, new: &str) -> Result<(), FsError> {
+        self.writable()?;
         let (op, on) = self.parent_and_name(old)?;
         let (np, nn) = self.parent_and_name(new)?;
         let oid = self
@@ -506,6 +674,9 @@ impl<D: BlockDevice> Volume<D> {
             .get(&on)
             .copied()
             .ok_or(FsError::NotFound)?;
+        if op == np && on == nn {
+            return Ok(());
+        }
         let target = self.state.objects.get(&np).ok_or(FsError::NotFound)?;
         if target.kind != ObjectKind::Directory {
             return Err(FsError::NotDirectory);
@@ -529,11 +700,22 @@ impl<D: BlockDevice> Volume<D> {
             .get_mut(&np)
             .unwrap()
             .entries
-            .insert(nn, oid);
+            .insert(nn.clone(), oid);
+        if let Err(error) = self.ensure_capacity() {
+            self.state.objects.get_mut(&np).unwrap().entries.remove(&nn);
+            self.state
+                .objects
+                .get_mut(&op)
+                .unwrap()
+                .entries
+                .insert(on, oid);
+            return Err(error);
+        }
         self.dirty = true;
         Ok(())
     }
     pub fn unlink(&mut self, path: &str) -> Result<(), FsError> {
+        self.writable()?;
         let (parent, name) = self.parent_and_name(path)?;
         let id = self
             .state
@@ -593,6 +775,9 @@ impl<D: BlockDevice> Volume<D> {
             }
             id = *o.entries.get(*p).ok_or(FsError::NotFound)?;
         }
+        if self.object(id)?.kind != ObjectKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
         Ok((id, name))
     }
     fn is_descendant(&self, root: u64, candidate: u64) -> Result<bool, FsError> {
@@ -623,26 +808,99 @@ impl<D: BlockDevice> Volume<D> {
         }
     }
     fn commit(&mut self) -> Result<(), FsError> {
+        self.writable()?;
+        validate_state(&self.state)?;
         self.ensure_capacity()?;
         let payload = encode_state(&self.state);
         let slot = 1 - self.active_slot;
         let generation = self.generation.checked_add(1).ok_or(FsError::NoSpace)?;
-        write_slot(&mut self.device, self.blocks, slot, generation, &payload)?;
-        self.device.flush()?;
-        let mut sb = vec![0; BLOCK_SIZE];
-        sb[..8].copy_from_slice(MAGIC);
-        put_u32(&mut sb, 8, VERSION);
-        put_u64(&mut sb, 12, self.blocks);
-        sb[20] = slot;
-        put_u64(&mut sb, 24, generation);
-        let superblock_checksum = hash(&sb[..32]);
-        put_u64(&mut sb, 32, superblock_checksum);
-        self.device.write_at(0, &sb)?;
-        self.device.flush()?;
+        // Geometry never changes during a transaction. A torn slot cannot
+        // invalidate the superblock or the previous committed slot.
+        if let Err(error) = write_slot(&mut self.device, self.blocks, slot, generation, &payload) {
+            self.failed = true;
+            return Err(error);
+        }
         self.active_slot = slot;
         self.generation = generation;
         self.dirty = false;
         Ok(())
+    }
+
+    fn writable(&self) -> Result<(), FsError> {
+        if !self.recovery_warnings.is_empty() {
+            return Err(FsError::Corrupt(
+                "damaged-slot recovery is read-only; export to a new volume",
+            ));
+        }
+        if self.failed {
+            Err(FsError::Io(
+                "commit outcome uncertain; remount required".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_growth(&self, id: u64, size: usize) -> Result<(), FsError> {
+        let old = self.object(id)?;
+        if old.kind != ObjectKind::File {
+            return Err(FsError::IsDirectory);
+        }
+        let growth = size.saturating_sub(old.data.len());
+        if growth > slot_capacity(self.blocks).saturating_sub(encode_state(&self.state).len()) {
+            return Err(FsError::NoSpace);
+        }
+        Ok(())
+    }
+
+    pub fn set_metadata(&mut self, path: &str, metadata: Metadata) -> Result<(), FsError> {
+        self.writable()?;
+        validate_metadata(&metadata)?;
+        let id = self.resolve(path)?;
+        let old = std::mem::replace(
+            &mut self.state.objects.get_mut(&id).unwrap().metadata,
+            metadata,
+        );
+        if let Err(error) = self.ensure_capacity() {
+            self.state.objects.get_mut(&id).unwrap().metadata = old;
+            return Err(error);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Replace one file in memory atomically; sync commits it with all other pending changes.
+    pub fn replace_file(
+        &mut self,
+        path: &str,
+        data: &[u8],
+        metadata: Metadata,
+    ) -> Result<(), FsError> {
+        self.writable()?;
+        validate_mode(metadata.mode)?;
+        if data.len() > slot_capacity(self.blocks) {
+            return Err(FsError::NoSpace);
+        }
+        let before = self.state.clone();
+        let was_dirty = self.dirty;
+        let result = (|| {
+            match self.stat(path) {
+                Ok(info) if info.kind == ObjectKind::File => (),
+                Ok(_) => return Err(FsError::IsDirectory),
+                Err(FsError::NotFound) => {
+                    self.create_file(path, metadata.mode)?;
+                }
+                Err(error) => return Err(error),
+            }
+            self.truncate_file(path, 0)?;
+            self.write_file(path, 0, data)?;
+            self.set_metadata(path, metadata)
+        })();
+        if result.is_err() {
+            self.state = before;
+            self.dirty = was_dirty;
+        }
+        result
     }
 }
 
@@ -664,7 +922,17 @@ fn components(path: &str) -> Result<Vec<&str>, FsError> {
     {
         return Err(FsError::InvalidPath);
     }
+    for name in &v {
+        validate_name(name)?;
+    }
     Ok(v)
+}
+fn validate_mode(mode: u32) -> Result<(), FsError> {
+    if mode & !0o777 != 0 {
+        Err(FsError::InvalidArgument("unsupported permission bits"))
+    } else {
+        Ok(())
+    }
 }
 fn validate_name(n: &str) -> Result<(), FsError> {
     if n.is_empty() || n == "." || n == ".." || n.contains('/') || n.contains('\0') || n.len() > 255
@@ -674,9 +942,33 @@ fn validate_name(n: &str) -> Result<(), FsError> {
         Ok(())
     }
 }
+fn validate_metadata(metadata: &Metadata) -> Result<(), FsError> {
+    validate_mode(metadata.mode)?;
+    if metadata.modified < metadata.created {
+        return Err(FsError::InvalidArgument("modification precedes creation"));
+    }
+    if metadata.flags != 0 {
+        return Err(FsError::Unsupported("unknown metadata flags"));
+    }
+    if metadata.extended.len() > 64 {
+        return Err(FsError::InvalidArgument("too many metadata keys"));
+    }
+    for (key, value) in &metadata.extended {
+        if key.is_empty() || key.len() > 128 || key.contains('\0') || value.len() > 4096 {
+            return Err(FsError::InvalidArgument("invalid extended metadata"));
+        }
+    }
+    Ok(())
+}
+fn timestamp() -> Result<u64, FsError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| FsError::Io("clock precedes epoch".into()))
+}
 
 fn validate_state(s: &State) -> Result<(), FsError> {
-    if s.root == 0 || !s.objects.contains_key(&s.root) {
+    if s.root != 1 || !s.objects.contains_key(&s.root) {
         return Err(FsError::Corrupt("missing root"));
     }
     if s.objects.get(&s.root).unwrap().kind != ObjectKind::Directory {
@@ -687,6 +979,7 @@ fn validate_state(s: &State) -> Result<(), FsError> {
         return Err(FsError::Corrupt("next object id is not monotonic"));
     }
     for (id, o) in &s.objects {
+        validate_metadata(&o.metadata)?;
         if *id != o.id || o.id == 0 {
             return Err(FsError::Corrupt("invalid object id"));
         }
@@ -703,35 +996,17 @@ fn validate_state(s: &State) -> Result<(), FsError> {
                 .ok_or(FsError::Corrupt("dangling directory entry"))?;
         }
     }
-    let mut visiting = HashSet::new();
     let mut visited = HashSet::new();
-    walk_tree(s, s.root, &mut visiting, &mut visited)?;
+    let mut stack = vec![s.root];
+    while let Some(id) = stack.pop() {
+        if !visited.insert(id) {
+            return Err(FsError::Corrupt("cycle or multiple parent reference"));
+        }
+        stack.extend(s.objects[&id].entries.values().copied());
+    }
     if visited.len() != s.objects.len() {
         return Err(FsError::Corrupt("unreachable object"));
     }
-    Ok(())
-}
-
-fn walk_tree(
-    s: &State,
-    id: u64,
-    visiting: &mut HashSet<u64>,
-    visited: &mut HashSet<u64>,
-) -> Result<(), FsError> {
-    if !visiting.insert(id) {
-        return Err(FsError::Corrupt("directory cycle"));
-    }
-    let object = s
-        .objects
-        .get(&id)
-        .ok_or(FsError::Corrupt("dangling object"))?;
-    if object.kind == ObjectKind::Directory {
-        for child in object.entries.values() {
-            walk_tree(s, *child, visiting, visited)?;
-        }
-    }
-    visiting.remove(&id);
-    visited.insert(id);
     Ok(())
 }
 
@@ -757,18 +1032,29 @@ fn write_slot<D: BlockDevice>(
     put_u32(&mut h, 8, VERSION);
     put_u64(&mut h, 12, generation);
     put_u64(&mut h, 20, payload.len() as u64);
-    put_u64(&mut h, 28, hash(payload));
+    let checksum = slot_hash(&h[..28], payload);
+    put_u64(&mut h, 28, checksum);
     let off = slot_offset(blocks, slot);
-    d.write_at(off, &h)?;
+    d.write_at(off, &[0; SLOT_HEADER])?;
+    d.flush()?;
     d.write_at(off + SLOT_HEADER as u64, payload)?;
+    d.flush()?;
+    d.write_at(off, &h)?;
+    d.flush()?;
     Ok(())
 }
 fn read_slot<D: BlockDevice>(d: &mut D, blocks: u64, slot: u8) -> Result<(u64, State), FsError> {
     let off = slot_offset(blocks, slot);
     let mut h = vec![0; SLOT_HEADER];
     d.read_at(off, &mut h)?;
+    if h.iter().all(|byte| *byte == 0) {
+        return Err(FsError::NotFound);
+    }
     if &h[..8] != MAGIC || u32::from_le_bytes(h[8..12].try_into().unwrap()) != VERSION {
         return Err(FsError::Corrupt("invalid slot"));
+    }
+    if h[36..40].iter().any(|byte| *byte != 0) {
+        return Err(FsError::Corrupt("slot reserved bytes are not zero"));
     }
     let len = usize::try_from(u64::from_le_bytes(h[20..28].try_into().unwrap()))
         .map_err(|_| FsError::Corrupt("slot length overflow"))?;
@@ -777,21 +1063,24 @@ fn read_slot<D: BlockDevice>(d: &mut D, blocks: u64, slot: u8) -> Result<(u64, S
     }
     let mut payload = vec![0; len];
     d.read_at(off + SLOT_HEADER as u64, &mut payload)?;
-    if hash(&payload) != u64::from_le_bytes(h[28..36].try_into().unwrap()) {
+    if slot_hash(&h[..28], &payload) != u64::from_le_bytes(h[28..36].try_into().unwrap()) {
         return Err(FsError::Corrupt("slot checksum mismatch"));
     }
-    Ok((
-        u64::from_le_bytes(h[12..20].try_into().unwrap()),
-        decode_state(&payload)?,
-    ))
-}
-fn hash(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+    let generation = u64::from_le_bytes(h[12..20].try_into().unwrap());
+    if generation == 0 {
+        return Err(FsError::Corrupt("zero generation"));
     }
-    h
+    let state = decode_state(&payload)?;
+    validate_state(&state)?;
+    Ok((generation, state))
+}
+fn slot_hash(header: &[u8], payload: &[u8]) -> u64 {
+    header
+        .iter()
+        .chain(payload)
+        .fold(0xcbf29ce484222325u64, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+        })
 }
 fn put_u32(b: &mut [u8], o: usize, v: u32) {
     b[o..o + 4].copy_from_slice(&v.to_le_bytes());
@@ -812,6 +1101,14 @@ fn encode_state(s: &State) -> Vec<u8> {
         putv(&mut w, o.metadata.mode as u64);
         putv(&mut w, o.metadata.created);
         putv(&mut w, o.metadata.modified);
+        putv(&mut w, u64::from(o.metadata.flags));
+        putv(&mut w, o.metadata.extended.len() as u64);
+        for (key, value) in &o.metadata.extended {
+            putv(&mut w, key.len() as u64);
+            w.extend_from_slice(key.as_bytes());
+            putv(&mut w, value.len() as u64);
+            w.extend_from_slice(value);
+        }
         putv(&mut w, o.data.len() as u64);
         w.extend_from_slice(&o.data);
         putv(&mut w, o.entries.len() as u64);
@@ -832,13 +1129,27 @@ fn decode_state(b: &[u8]) -> Result<State, FsError> {
     for _ in 0..count {
         let id = r.u64()?;
         let kind = ObjectKind::from_byte(r.byte()?)?;
-        let metadata = Metadata {
+        let mut metadata = Metadata {
             owner: r.u32()?,
             group: r.u32()?,
             mode: r.u32()?,
             created: r.u64()?,
             modified: r.u64()?,
+            flags: r.u32()?,
+            extended: BTreeMap::new(),
         };
+        let mc = r.usize()?;
+        if mc > 64 {
+            return Err(FsError::Corrupt("too many metadata keys"));
+        }
+        for _ in 0..mc {
+            let key = String::from_utf8(r.raw()?)
+                .map_err(|_| FsError::Corrupt("invalid metadata utf8"))?;
+            let value = r.raw()?;
+            if metadata.extended.insert(key, value).is_some() {
+                return Err(FsError::Corrupt("duplicate metadata key"));
+            }
+        }
         let data = r.bytes()?;
         let ec = r.usize()?;
         let mut entries = BTreeMap::new();
@@ -921,6 +1232,31 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_roundtrip_uuid_and_invalid_updates() {
+        let mut fs = Volume::format(MemDevice::new(16).unwrap()).unwrap();
+        let uuid = fs.uuid();
+        fs.create_file("/a", 0o600).unwrap();
+        fs.append_file("/a", b"first").unwrap();
+        fs.append_file("/a", b"second").unwrap();
+        let mut metadata = fs.stat("/a").unwrap().metadata;
+        metadata.owner = 123;
+        metadata.group = 456;
+        metadata
+            .extended
+            .insert("content.type".into(), b"text/plain".to_vec());
+        fs.set_metadata("/a", metadata.clone()).unwrap();
+        let mut bad = metadata.clone();
+        bad.extended.insert("oversized".into(), vec![0; 4097]);
+        assert!(fs.set_metadata("/a", bad).is_err());
+        let fs = Volume::mount(fs.unmount().unwrap()).unwrap();
+        assert_eq!(fs.uuid(), uuid);
+        assert_eq!(fs.stat("/a").unwrap().metadata, metadata);
+        let mut bytes = [0; 11];
+        fs.read_file("/a", 0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"firstsecond");
+    }
     #[test]
     fn round_trip_and_operations() {
         let dev = MemDevice::new(64).unwrap();
@@ -936,6 +1272,9 @@ mod tests {
         let mut fs = Volume::mount(dev).unwrap();
         assert_eq!(&fs.list("/data").unwrap()[0].0, "a");
         fs.rename("/data/a", "/data/b").unwrap();
+        fs.truncate_file("/data/b", 2).unwrap();
+        let mut short = [0; 4];
+        assert_eq!(fs.read_file("/data/b", 0, &mut short).unwrap(), 2);
         fs.unlink("/data/b").unwrap();
         fs.check().unwrap();
     }
@@ -981,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_superblock_commit_recovers_previous_generation() {
+    fn interrupted_header_commit_recovers_previous_generation() {
         let dev = MemDevice::new(32).unwrap();
         let mut fs = Volume::format(dev).unwrap();
         fs.create_file("/stable", 0o644).unwrap();
@@ -993,6 +1332,190 @@ mod tests {
         let device = faulty.into_device().into_inner();
         let recovered = Volume::mount(device).unwrap();
         assert!(recovered.stat("/stable").is_ok());
-        assert!(recovered.stat("/interrupted").is_ok());
+        assert_eq!(recovered.stat("/interrupted"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn bounded_mutations_and_reformat() {
+        let mut fs = Volume::format(MemDevice::new(8).unwrap()).unwrap();
+        fs.create_file("/a", 0o600).unwrap();
+        assert_eq!(fs.write_file("/a", u64::MAX, b"x"), Err(FsError::NoSpace));
+        assert_eq!(fs.truncate_file("/a", u64::MAX), Err(FsError::NoSpace));
+        assert_eq!(fs.write_file("/a", u64::MAX, b""), Ok(0));
+        assert!(fs
+            .create_file(&format!("/{}", "x".repeat(256)), 0o600)
+            .is_err());
+        assert!(fs.create_file("/bad-mode", 0o1000).is_err());
+        let capacity = slot_capacity(fs.blocks) - encode_state(&fs.state).len();
+        fs.write_file("/a", 0, &vec![7; capacity]).unwrap();
+        assert_eq!(fs.rename("/a", "/longer"), Err(FsError::NoSpace));
+        assert!(fs.stat("/a").is_ok());
+        fs.rename("/a", "/a").unwrap();
+        fs.sync().unwrap();
+        for _ in 0..3 {
+            fs.write_file("/a", 0, b"z").unwrap();
+            fs.sync().unwrap();
+        }
+        let fs = Volume::format(fs.into_device()).unwrap();
+        let fs = Volume::mount(fs.unmount().unwrap()).unwrap();
+        assert!(fs.list("/").unwrap().is_empty());
+    }
+
+    #[test]
+    fn corruption_checks_include_generation_and_graph() {
+        let mut fs = Volume::format(MemDevice::new(16).unwrap()).unwrap();
+        fs.create_file("/old", 0o600).unwrap();
+        fs.sync().unwrap();
+        let slot = fs.active_slot;
+        let blocks = fs.blocks;
+        let mut dev = fs.into_device();
+        dev.bytes[slot_offset(blocks, slot) as usize + 12] ^= 0x40;
+        let fs = Volume::mount(dev).unwrap();
+        assert_eq!(fs.stat("/old"), Err(FsError::NotFound));
+        let mut state = fs.state.clone();
+        state
+            .objects
+            .get_mut(&1)
+            .unwrap()
+            .entries
+            .insert("loop".into(), 1);
+        assert!(validate_state(&state).is_err());
+    }
+
+    /// Power-loss device: writes affect volatile bytes; flush publishes them.
+    /// Every write/flush may fail after a prefix, modeling torn writes and
+    /// uncertain flush outcomes without relying on host cache behavior.
+    struct CrashDevice {
+        live: MemDevice,
+        stable: MemDevice,
+        left: usize,
+        prefix: usize,
+    }
+    impl BlockDevice for CrashDevice {
+        fn len(&self) -> u64 {
+            self.live.len()
+        }
+        fn read_at(&mut self, o: u64, b: &mut [u8]) -> Result<(), FsError> {
+            self.live.read_at(o, b)
+        }
+        fn write_at(&mut self, o: u64, b: &[u8]) -> Result<(), FsError> {
+            if self.left == 0 {
+                let n = self.prefix.min(b.len());
+                self.live.write_at(o, &b[..n])?;
+                self.stable.write_at(o, &b[..n])?;
+                return Err(FsError::Io("torn write".into()));
+            }
+            self.left -= 1;
+            self.live.write_at(o, b)
+        }
+        fn flush(&mut self) -> Result<(), FsError> {
+            if self.left == 0 {
+                if self.prefix > 0 {
+                    self.stable = self.live.clone();
+                }
+                return Err(FsError::Io("flush interrupted".into()));
+            }
+            self.left -= 1;
+            self.stable = self.live.clone();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn crash_matrix_preserves_entire_old_or_new_transaction() {
+        let mut fs = Volume::format(MemDevice::new(32).unwrap()).unwrap();
+        fs.create_file("/old", 0o600).unwrap();
+        fs.write_file("/old", 0, b"before").unwrap();
+        fs.sync().unwrap();
+        let base = fs.into_device();
+        for point in 0..7 {
+            for prefix in [0, 1, 12, 28, 39, 4096] {
+                let device = CrashDevice {
+                    live: base.clone(),
+                    stable: base.clone(),
+                    left: point,
+                    prefix,
+                };
+                let mut fs = Volume::mount(device).unwrap();
+                fs.rename("/old", "/new").unwrap();
+                fs.write_file("/new", 0, b"after!").unwrap();
+                fs.set_metadata(
+                    "/new",
+                    Metadata {
+                        owner: 123,
+                        mode: 0o400,
+                        ..Metadata::default()
+                    },
+                )
+                .unwrap();
+                let committed = fs.sync().is_ok();
+                if !committed {
+                    assert!(fs.create_file("/retry", 0o600).is_err());
+                }
+                let fs = Volume::mount(fs.into_device().stable).unwrap();
+                fs.check().unwrap();
+                let new = fs.stat("/new").is_ok();
+                if committed {
+                    assert!(new);
+                }
+                let path = if new { "/new" } else { "/old" };
+                let mut bytes = [0; 6];
+                fs.read_file(path, 0, &mut bytes).unwrap();
+                assert_eq!(&bytes, if new { b"after!" } else { b"before" });
+                assert_eq!(
+                    fs.stat(path).unwrap().metadata.owner,
+                    if new { 123 } else { 0 }
+                );
+                assert_eq!(fs.list("/").unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn operation_sequences_match_reference_after_every_remount() {
+        let mut fs = Volume::format(MemDevice::new(64).unwrap()).unwrap();
+        let mut reference: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut seed = 47u64;
+        for _ in 0..400 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let path = format!("/f{}", (seed >> 32) % 12);
+            match seed % 4 {
+                0 => {
+                    if let std::collections::btree_map::Entry::Vacant(e) =
+                        reference.entry(path.clone())
+                    {
+                        fs.create_file(&path, 0o600).unwrap();
+                        e.insert(Vec::new());
+                    }
+                }
+                1 => {
+                    if let Some(data) = reference.get_mut(&path) {
+                        let n = (seed >> 40) as usize % 100;
+                        fs.truncate_file(&path, n as u64).unwrap();
+                        data.resize(n, 0);
+                    }
+                }
+                2 => {
+                    if let Some(data) = reference.get_mut(&path) {
+                        let offset = (seed >> 40) as usize % 80;
+                        fs.write_file(&path, offset as u64, b"hello").unwrap();
+                        data.resize(data.len().max(offset + 5), 0);
+                        data[offset..offset + 5].copy_from_slice(b"hello");
+                    }
+                }
+                _ => {
+                    if reference.remove(&path).is_some() {
+                        fs.unlink(&path).unwrap();
+                    }
+                }
+            }
+            fs = Volume::mount(fs.unmount().unwrap()).unwrap();
+            assert_eq!(fs.list("/").unwrap().len(), reference.len());
+            for (path, data) in &reference {
+                let mut actual = vec![0; data.len()];
+                assert_eq!(fs.read_file(path, 0, &mut actual).unwrap(), data.len());
+                assert_eq!(&actual, data);
+            }
+        }
     }
 }

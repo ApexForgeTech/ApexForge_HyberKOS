@@ -85,6 +85,7 @@ fn print_help() {
     println!();
     println!("COMMANDS:");
     println!("  run <path>       Run a .lua script or a directory with hyber.toml");
+    println!("  run --auth <image> <blocks> <username> <path>  Run with an authenticated session");
     println!("  inspect <path>   Show object metadata for a HyberKOS namespace path");
     println!("  ns <path>        List namespace entries at a path");
     println!("  handles          Show all open handles");

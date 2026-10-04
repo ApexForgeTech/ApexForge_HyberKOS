@@ -4,12 +4,29 @@ use hyber_core::Path;
 use std::path::{Path as FsPath, PathBuf};
 
 pub fn run(args: &[String]) -> Result<(), String> {
-    let input = one_path(args, "run <path>")?;
+    let (args, session) = if args.len() == 5 && args[0] == "--auth" {
+        let blocks = args[2].parse().map_err(|_| "invalid block count")?;
+        let session = hyber_auth::hosted_login(
+            &args[1],
+            blocks,
+            &args[3],
+            hyber_auth::SessionKind::NonInteractive,
+        )
+        .map_err(|e| e.to_string())?;
+        (&args[4..], Some(session))
+    } else {
+        (args, None)
+    };
+    let input = one_path(args, "run [--auth <image> <blocks> <username>] <path>")?;
     let script_path = script_path(&input)?;
     let script = std::fs::read_to_string(&script_path)
         .map_err(|e| format!("cannot read {}: {e}", script_path.display()))?;
-    let context = AppContext::new()?;
-    let (vfs, ns_mgr, handles, objects, result) = hyber_lua::run_lua_script(
+    let context = match session {
+        Some(session) => AppContext::authenticated(session)?,
+        None => AppContext::new()?,
+    };
+    let guard = context.session.clone();
+    let (vfs, ns_mgr, handles, objects, result) = hyber_lua::run_lua_script_with_session(
         &script,
         context.vfs,
         context.ns_mgr,
@@ -18,10 +35,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
         context.proc_mgr,
         context.process_id,
         context.security_context,
+        context.session,
     );
     // Keep ownership explicit until the runtime returns; this ensures all Lua
     // mutations were retained and avoids silently discarding borrowed state.
     drop((vfs, ns_mgr, handles, objects));
+    if let Some(session) = guard {
+        let _ = session.logout();
+    }
     result.map_err(|e| format!("Lua error: {e}"))
 }
 

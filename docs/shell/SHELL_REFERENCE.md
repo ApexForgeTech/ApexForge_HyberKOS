@@ -453,18 +453,20 @@ PID   | PPID  | State      | UID   | GID
 su <uid> [gid]
 ```
 
-Changes the current process's `SecurityContext`.
+Trusted bootstrap-mode administrative command. It requires CAP_SYS_ADMIN;
+authenticated `--auth` sessions reject numeric `su`. Use a fresh authenticated
+login to change accounts. See [identity and sessions](../security/identity-sessions.md).
 
 If no GID is provided, the UID is used as the GID.
 
-When switching from root (UID 0) to a non-root user, capabilities are cleared.
+When switching to a non-root user, capabilities and supplementary groups are cleared.
 
 ```text
 hyber:/$ su 1000 1000
 Switched to UID: 1000, GID: 1000
 
 hyber:/$ su 0
-Switched to UID: 0, GID: 0
+Error: Access denied: Missing capability 'CAP_SYS_ADMIN'
 ```
 
 ---

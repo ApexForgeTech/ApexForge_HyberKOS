@@ -20,6 +20,7 @@ use hyber_vfs::{Provider, VFS};
 
 /// HyberKOS Shell state
 struct HyberShell {
+    session: Option<hyber_auth::SessionGuard>,
     obj_mgr: ObjectManager,
     ns_mgr: NamespaceManager,
     handle_mgr: HandleManager,
@@ -229,6 +230,7 @@ impl HyberShell {
         let current_dir = Path::parse("/");
 
         Ok(Self {
+            session: None,
             obj_mgr,
             ns_mgr,
             handle_mgr,
@@ -363,6 +365,25 @@ impl HyberShell {
 
     /// Execute a single command
     fn execute_single(&mut self, input: &str) {
+        if let Some(session) = &self.session {
+            match session.context() {
+                Ok(context) => {
+                    if let Some(process) = self
+                        .proc_mgr
+                        .lock()
+                        .unwrap()
+                        .get_process_mut(self.process_id)
+                    {
+                        process.security_context = context;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    self.running = false;
+                    return;
+                }
+            }
+        }
         let parts: Vec<&str> = input.split_whitespace().collect();
         if parts.is_empty() {
             return;
@@ -1314,6 +1335,21 @@ impl HyberShell {
     }
 
     fn cmd_su(&mut self, args: &[&str]) -> Result<(), String> {
+        if self.session.is_some() {
+            return Err(
+                "Authenticated sessions cannot use numeric su; log in as the target account."
+                    .into(),
+            );
+        }
+        let context = self
+            .proc_mgr
+            .lock()
+            .unwrap()
+            .get_process(self.process_id)
+            .ok_or("process missing")?
+            .security_context
+            .clone();
+        hyber_core::SecurityManager::check_capability(&context, "CAP_SYS_ADMIN")?;
         let (_flags, positional) = Self::parse_flags(args);
         if positional.is_empty() {
             return Err("Usage: su <uid> [gid]".to_string());
@@ -1334,6 +1370,7 @@ impl HyberShell {
         {
             proc.security_context.user_id = UserId(uid);
             proc.security_context.group_id = GroupId(gid);
+            proc.security_context.supplementary_groups.clear();
             // If changing to non-root, clear capabilities
             if uid != 0 {
                 proc.security_context.capabilities.clear();
@@ -1652,7 +1689,7 @@ impl HyberShell {
             .security_context
             .clone();
 
-        let (vfs, ns_mgr, handle_mgr, obj_mgr, exec_res) = hyber_lua::run_lua_script(
+        let (vfs, ns_mgr, handle_mgr, obj_mgr, exec_res) = hyber_lua::run_lua_script_with_session(
             script,
             vfs,
             ns_mgr,
@@ -1661,6 +1698,7 @@ impl HyberShell {
             self.proc_mgr.clone(),
             self.process_id,
             sec_ctx,
+            self.session.clone(),
         );
 
         // Always restore the state
@@ -1680,6 +1718,9 @@ impl HyberShell {
 
     /// Cleanup: release all open handles
     fn cleanup(&mut self) {
+        if let Some(session) = self.session.take() {
+            let _ = session.logout();
+        }
         let handle_ids = self.handle_mgr.list_handle_ids(self.process_id);
         for hid in handle_ids {
             let _ = self.vfs.close(
@@ -1693,12 +1734,40 @@ impl HyberShell {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let session = if args.len() == 5 && args[1] == "--auth" {
+        let result = args[3]
+            .parse::<u64>()
+            .map_err(|_| "invalid block count".to_string())
+            .and_then(|blocks| {
+                hyber_auth::hosted_login(
+                    &args[2],
+                    blocks,
+                    &args[4],
+                    hyber_auth::SessionKind::Interactive,
+                )
+                .map_err(|e| e.to_string())
+            });
+        match result {
+            Ok(session) => Some(session),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    } else if args.len() == 1 {
+        None
+    } else {
+        eprintln!("usage: hyber-shell [--auth <image> <blocks> <username>]");
+        std::process::exit(1);
+    };
     // Default host root: ~/hyber-host
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let host_root = PathBuf::from(home).join("hyber-host");
 
     match HyberShell::new(host_root.clone()) {
         Ok(mut shell) => {
+            shell.session = session;
             println!("HostFS mounted at: {:?}\n", host_root);
             shell.run();
         }
@@ -1706,5 +1775,36 @@ fn main() {
             eprintln!("Failed to start HyberKOS Shell: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use hyber_auth::{AuthService, SessionGuard, SessionKind, SystemClock};
+
+    #[test]
+    fn numeric_su_cannot_regain_root_and_authenticated_logout_stops_dispatch() {
+        let root = std::env::temp_dir().join(format!("hyber-shell-session-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let mut shell = HyberShell::new(root.clone()).unwrap();
+        shell.cmd_su(&["1000", "1000"]).unwrap();
+        assert!(shell.cmd_su(&["0"]).is_err());
+        let password = b"temporary shell test password";
+        let mut auth = AuthService::provision(password, Arc::new(SystemClock)).unwrap();
+        let token = auth
+            .login("root", password, SessionKind::Interactive, 600)
+            .unwrap();
+        let session = SessionGuard::new(Arc::new(Mutex::new(auth)), token).unwrap();
+        shell.session = Some(session.clone());
+        assert!(shell.cmd_su(&["0"]).is_err());
+        shell.execute_single("pwd");
+        assert!(shell.running);
+        session.logout().unwrap();
+        shell.execute_single("pwd");
+        assert!(!shell.running);
+        shell.cleanup();
+        drop(shell);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
