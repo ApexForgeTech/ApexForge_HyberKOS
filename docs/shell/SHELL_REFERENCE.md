@@ -447,6 +447,22 @@ PID   | PPID  | State      | UID   | GID
 
 ---
 
+### `whoami` — Current Hyber User
+
+```text
+whoami
+```
+
+Prints the authenticated Hyber account name, such as `alice`. The session is
+revalidated before resolving its name; expired or revoked sessions are rejected.
+The command takes no arguments and does not use the host Linux username.
+
+In unauthenticated bootstrap mode, UID 0 prints `root`. After numeric `su` to a
+non-root UID, it reports an error because bootstrap mode has no account registry
+from which to resolve that UID's name.
+
+---
+
 ### `su` — Switch User
 
 ```text

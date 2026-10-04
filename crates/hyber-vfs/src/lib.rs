@@ -227,6 +227,33 @@ impl VFS {
         Ok(bytes_read)
     }
 
+    /// Read through a handle while re-checking the caller against the current
+    /// object metadata.  User-facing runtimes must use this rather than the
+    /// legacy `read`, which exists for trusted kernel/provider internals.
+    pub fn read_secure(
+        &self,
+        handle_mgr: &mut HandleManager,
+        obj_mgr: &ObjectManager,
+        process_id: ProcessId,
+        security_context: &hyber_core::SecurityContext,
+        handle_id: HandleId,
+        buffer: &mut [u8],
+    ) -> Result<usize, String> {
+        let object_id = handle_mgr
+            .get_handle(process_id, handle_id)
+            .ok_or_else(|| format!("Handle {:?} not found", handle_id))?
+            .object_id;
+        let object = obj_mgr.lookup(object_id).ok_or("Object not found")?;
+        hyber_core::SecurityManager::check_access(
+            security_context,
+            object.owner,
+            object.group,
+            object.permissions,
+            Rights::read_only(),
+        )?;
+        self.read(handle_mgr, process_id, handle_id, buffer)
+    }
+
     pub fn write(
         &mut self,
         handle_mgr: &mut HandleManager,
@@ -268,6 +295,36 @@ impl VFS {
         }
 
         Ok(bytes_written)
+    }
+
+    /// Write through a handle while re-checking current object metadata.
+    /// This closes the stale-handle permission gap after a chmod/ownership
+    /// transition; handle rights alone are not a lasting authorization grant.
+    pub fn write_secure(
+        &mut self,
+        handle_mgr: &mut HandleManager,
+        obj_mgr: &mut ObjectManager,
+        process_id: ProcessId,
+        security_context: &hyber_core::SecurityContext,
+        handle_id: HandleId,
+        buffer: &[u8],
+    ) -> Result<usize, String> {
+        let object_id = handle_mgr
+            .get_handle(process_id, handle_id)
+            .ok_or_else(|| format!("Handle {:?} not found", handle_id))?
+            .object_id;
+        let object = obj_mgr.lookup(object_id).ok_or("Object not found")?;
+        hyber_core::SecurityManager::check_access(
+            security_context,
+            object.owner,
+            object.group,
+            object.permissions,
+            Rights {
+                write: true,
+                ..Rights::empty()
+            },
+        )?;
+        self.write(handle_mgr, obj_mgr, process_id, handle_id, buffer)
     }
 
     pub fn create(
@@ -506,8 +563,56 @@ impl Default for VFS {
 
 #[cfg(test)]
 mod tests {
-    use super::MountTable;
-    use hyber_core::Path;
+    use super::{MountTable, Provider, VFS};
+    use hyber_core::{ObjectId, ObjectType, Path, ProcessId, Rights};
+
+    struct ReadProvider;
+    impl Provider for ReadProvider {
+        fn create(
+            &mut self,
+            _: &mut hyber_object::ObjectManager,
+            _: &mut hyber_namespace::NamespaceManager,
+            _: ObjectId,
+            _: &str,
+            _: ObjectType,
+        ) -> Result<ObjectId, String> {
+            Err("unused".into())
+        }
+        fn remove(
+            &mut self,
+            _: &mut hyber_object::ObjectManager,
+            _: &mut hyber_namespace::NamespaceManager,
+            _: ObjectId,
+            _: &str,
+        ) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn rename(
+            &mut self,
+            _: &mut hyber_object::ObjectManager,
+            _: &mut hyber_namespace::NamespaceManager,
+            _: ObjectId,
+            _: &str,
+            _: ObjectId,
+            _: &str,
+        ) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn read(&self, _: ObjectId, _: u64, buffer: &mut [u8]) -> Result<usize, String> {
+            if let Some(byte) = buffer.first_mut() {
+                *byte = b'x';
+                Ok(1)
+            } else {
+                Ok(0)
+            }
+        }
+        fn write(&mut self, _: ObjectId, _: u64, _: &[u8]) -> Result<usize, String> {
+            Err("unused".into())
+        }
+        fn enumerate(&self, _: ObjectId) -> Result<Option<Vec<(String, ObjectId)>>, String> {
+            Ok(None)
+        }
+    }
 
     #[test]
     fn private_parent_cannot_be_bypassed_by_readable_child() {
@@ -568,5 +673,52 @@ mod tests {
             mounts.find_provider(&Path::parse("/temporary/../processes/1").normalize()),
             Some("proc".into())
         );
+    }
+
+    #[test]
+    fn secure_read_rechecks_current_object_metadata() {
+        use hyber_core::{GroupId, SecurityContext, UserId};
+        let mut objects = hyber_object::ObjectManager::new();
+        let mut namespace = hyber_namespace::NamespaceManager::new(&mut objects);
+        let file = objects.create_object(ObjectType::File);
+        objects.lookup_mut(file).unwrap().owner = UserId(1000);
+        objects.lookup_mut(file).unwrap().group = GroupId(1000);
+        objects.lookup_mut(file).unwrap().permissions = 0o600;
+        namespace
+            .create_node(&objects, namespace.root(), "owned", file)
+            .unwrap();
+        let context = SecurityContext {
+            user_id: UserId(1000),
+            group_id: GroupId(1000),
+            supplementary_groups: vec![],
+            capabilities: vec![],
+        };
+        let mut vfs = VFS::new();
+        vfs.register_provider("read".into(), Box::new(ReadProvider));
+        vfs.mount(Path::parse("/"), "read".into());
+        let mut handles = hyber_handle::HandleManager::new();
+        let handle = vfs
+            .open(
+                &namespace,
+                &mut handles,
+                &mut objects,
+                ProcessId(1),
+                &context,
+                &Path::parse("/owned"),
+                Rights::read_only(),
+            )
+            .unwrap();
+        objects.lookup_mut(file).unwrap().owner = UserId(2000);
+        let mut out = [0; 1];
+        assert!(vfs
+            .read_secure(
+                &mut handles,
+                &objects,
+                ProcessId(1),
+                &context,
+                handle,
+                &mut out,
+            )
+            .is_err());
     }
 }

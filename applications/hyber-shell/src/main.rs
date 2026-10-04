@@ -124,6 +124,7 @@ impl HyberShell {
         let mut hostfs = HostFSProvider::new(&host_root)
             .map_err(|e| format!("Failed to initialize HostFS at {:?}: {}", host_root, e))?;
         let root_id = ns_mgr.root();
+        hostfs.bind_root(root_id);
         Self::sync_host_directory(&host_root, &mut obj_mgr, &mut ns_mgr, &mut hostfs, root_id)
             .map_err(|e| format!("Failed to sync host directory: {}", e))?;
 
@@ -257,9 +258,20 @@ impl HyberShell {
         for entry in entries {
             let entry = entry.map_err(|e| format!("IO Error: {}", e))?;
             let path = entry.path();
-            let name = entry.file_name().into_string().unwrap_or_default();
+            let name = entry.file_name().into_string().map_err(|_| {
+                format!("HostFS cannot import non-Unicode name: {}", path.display())
+            })?;
+            let entry_type = entry
+                .file_type()
+                .map_err(|e| format!("Failed to inspect {}: {e}", path.display()))?;
 
-            if path.is_dir() {
+            // Links and special files have no safe HostFS object model yet.
+            // Refuse them instead of following a host-controlled redirection.
+            if entry_type.is_symlink() {
+                return Err(format!("HostFS refuses symbolic link: {}", path.display()));
+            }
+
+            if entry_type.is_dir() {
                 let obj_id = hostfs.register_existing(
                     obj_mgr,
                     ns_mgr,
@@ -268,7 +280,7 @@ impl HyberShell {
                     ObjectType::Directory,
                 )?;
                 Self::sync_host_directory(&path, obj_mgr, ns_mgr, hostfs, obj_id)?;
-            } else {
+            } else if entry_type.is_file() {
                 let obj_id = hostfs.register_existing(
                     obj_mgr,
                     ns_mgr,
@@ -282,9 +294,63 @@ impl HyberShell {
                         obj.size = metadata.len();
                     }
                 }
+            } else {
+                return Err(format!(
+                    "HostFS supports only regular files and directories: {}",
+                    path.display()
+                ));
             }
         }
         Ok(())
+    }
+
+    /// Materialize the authenticated identity's validated `/users/<name>`
+    /// directory before accepting commands.  Identity owns the path policy;
+    /// this shell only creates the missing namespace object with a privileged
+    /// bootstrap context, then assigns it to the session identity.
+    fn ensure_session_home(&mut self) -> Result<(), String> {
+        let session = self.session.as_ref().ok_or("no authenticated session")?;
+        let context = session.context().map_err(|e| e.to_string())?;
+        let home = session.home().map_err(|e| e.to_string())?;
+        let path = Path::parse(&home).normalize();
+        if !path.is_absolute || path.components.len() != 2 || path.components[0].0 != "users" {
+            return Err("identity supplied an invalid home path".into());
+        }
+
+        match self.ns_mgr.resolve(&path, self.ns_mgr.root()) {
+            Ok(id) => {
+                let object = self.obj_mgr.lookup(id).ok_or("home object missing")?;
+                if object.object_type != ObjectType::Directory
+                    || object.owner != context.user_id
+                    || object.group != context.group_id
+                {
+                    return Err("existing home directory belongs to another identity".into());
+                }
+                Ok(())
+            }
+            Err(_) => {
+                let (parent, name) = path.parent_and_name().ok_or("invalid home path")?;
+                let bootstrap = SecurityContext {
+                    user_id: UserId(0),
+                    group_id: GroupId(0),
+                    supplementary_groups: Vec::new(),
+                    capabilities: Vec::new(),
+                };
+                let id = self.vfs.create(
+                    &mut self.ns_mgr,
+                    &mut self.obj_mgr,
+                    &bootstrap,
+                    &parent,
+                    &name,
+                    ObjectType::Directory,
+                )?;
+                let object = self.obj_mgr.lookup_mut(id).ok_or("home object missing")?;
+                object.owner = context.user_id;
+                object.group = context.group_id;
+                object.permissions = 0o700;
+                Ok(())
+            }
+        }
     }
 
     /// Main REPL loop
@@ -395,6 +461,7 @@ impl HyberShell {
         let result = match command {
             // Standard Base Commands
             "pwd" => self.cmd_pwd(args),
+            "whoami" => self.cmd_whoami(args),
             "cd" => self.cmd_cd(args),
             "ls" => self.cmd_ls(args),
             "mkdir" => self.cmd_mkdir(args),
@@ -844,9 +911,11 @@ impl HyberShell {
         let mut data = Vec::new();
         let mut buffer = [0u8; 4096];
         loop {
-            let bytes = self.vfs.read(
+            let bytes = self.vfs.read_secure(
                 &mut self.handle_mgr,
+                &self.obj_mgr,
                 self.process_id,
+                &sec_ctx,
                 src_handle,
                 &mut buffer,
             )?;
@@ -900,10 +969,11 @@ impl HyberShell {
             Rights::read_write(),
         )?;
 
-        self.vfs.write(
+        self.vfs.write_secure(
             &mut self.handle_mgr,
             &mut self.obj_mgr,
             self.process_id,
+            &sec_ctx,
             dest_handle,
             &data,
         )?;
@@ -955,9 +1025,14 @@ impl HyberShell {
 
         let mut buffer = [0u8; 4096];
         loop {
-            let bytes =
-                self.vfs
-                    .read(&mut self.handle_mgr, self.process_id, handle, &mut buffer)?;
+            let bytes = self.vfs.read_secure(
+                &mut self.handle_mgr,
+                &self.obj_mgr,
+                self.process_id,
+                &sec_ctx,
+                handle,
+                &mut buffer,
+            )?;
             if bytes == 0 {
                 break;
             }
@@ -1334,6 +1409,39 @@ impl HyberShell {
         Ok(())
     }
 
+    fn whoami_name(&self) -> Result<String, String> {
+        if let Some(session) = &self.session {
+            return session.username().map_err(|error| error.to_string());
+        }
+        let processes = self
+            .proc_mgr
+            .lock()
+            .map_err(|_| "process manager unavailable")?;
+        let uid = processes
+            .get_process(self.process_id)
+            .ok_or("shell process missing")?
+            .security_context
+            .user_id;
+        // Bootstrap mode has no account registry. Only the reserved root
+        // identity has a known name; numeric su must not fabricate a username.
+        if uid == UserId(0) {
+            Ok("root".into())
+        } else {
+            Err(format!(
+                "No Hyber account name available for UID {} in bootstrap mode",
+                uid.0
+            ))
+        }
+    }
+
+    fn cmd_whoami(&self, args: &[&str]) -> Result<(), String> {
+        if !args.is_empty() {
+            return Err("Usage: whoami".into());
+        }
+        println!("{}", self.whoami_name()?);
+        Ok(())
+    }
+
     fn cmd_su(&mut self, args: &[&str]) -> Result<(), String> {
         if self.session.is_some() {
             return Err(
@@ -1531,6 +1639,7 @@ impl HyberShell {
         println!("=== HyberKOS Shell Commands (Phase 12.5) ===\n");
         println!("Standard Commands:");
         println!("  pwd                     Print working directory");
+        println!("  whoami                  Print current Hyber account name");
         println!("  cd <path>               Change directory");
         println!("  ls [-l] [-a] [path]     List directory contents");
         println!("  mkdir [-p] <path>       Create directory");
@@ -1650,9 +1759,14 @@ impl HyberShell {
         let mut script_bytes = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
-            let n = self
-                .vfs
-                .read(&mut self.handle_mgr, self.process_id, handle, &mut buf)?;
+            let n = self.vfs.read_secure(
+                &mut self.handle_mgr,
+                &self.obj_mgr,
+                self.process_id,
+                &sec_ctx,
+                handle,
+                &mut buf,
+            )?;
             if n == 0 {
                 break;
             }
@@ -1768,6 +1882,13 @@ fn main() {
     match HyberShell::new(host_root.clone()) {
         Ok(mut shell) => {
             shell.session = session;
+            if shell.session.is_some() {
+                if let Err(error) = shell.ensure_session_home() {
+                    eprintln!("Failed to prepare authenticated home: {error}");
+                    shell.cleanup();
+                    std::process::exit(1);
+                }
+            }
             println!("HostFS mounted at: {:?}\n", host_root);
             shell.run();
         }
@@ -1788,7 +1909,10 @@ mod session_tests {
         let root = std::env::temp_dir().join(format!("hyber-shell-session-{}", std::process::id()));
         std::fs::create_dir(&root).unwrap();
         let mut shell = HyberShell::new(root.clone()).unwrap();
+        assert_eq!(shell.whoami_name().unwrap(), "root");
+        assert!(shell.cmd_whoami(&["extra"]).is_err());
         shell.cmd_su(&["1000", "1000"]).unwrap();
+        assert!(shell.whoami_name().is_err());
         assert!(shell.cmd_su(&["0"]).is_err());
         let password = b"temporary shell test password";
         let mut auth = AuthService::provision(password, Arc::new(SystemClock)).unwrap();
@@ -1797,10 +1921,21 @@ mod session_tests {
             .unwrap();
         let session = SessionGuard::new(Arc::new(Mutex::new(auth)), token).unwrap();
         shell.session = Some(session.clone());
+        assert_eq!(shell.whoami_name().unwrap(), "root");
+        shell.ensure_session_home().unwrap();
+        let home = shell
+            .ns_mgr
+            .resolve(&Path::parse("/users/root"), shell.ns_mgr.root())
+            .unwrap();
+        let home_object = shell.obj_mgr.lookup(home).unwrap();
+        assert_eq!(home_object.owner, UserId(0));
+        assert_eq!(home_object.group, GroupId(0));
+        assert_eq!(home_object.permissions, 0o700);
         assert!(shell.cmd_su(&["0"]).is_err());
         shell.execute_single("pwd");
         assert!(shell.running);
         session.logout().unwrap();
+        assert!(shell.whoami_name().is_err());
         shell.execute_single("pwd");
         assert!(!shell.running);
         shell.cleanup();

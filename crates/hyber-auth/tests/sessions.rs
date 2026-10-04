@@ -68,7 +68,9 @@ fn login_context_matches_group_and_capability_permissions_and_logout_revokes() {
     let shared = Arc::new(Mutex::new(auth));
     let guard = SessionGuard::new(shared, token).unwrap();
     let second = guard.clone();
+    assert_eq!(guard.username().unwrap(), "alice");
     guard.logout().unwrap();
+    assert!(matches!(second.username(), Err(AuthError::InvalidSession)));
     assert!(matches!(second.context(), Err(AuthError::InvalidSession)));
 }
 

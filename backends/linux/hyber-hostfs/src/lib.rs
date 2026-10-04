@@ -30,11 +30,21 @@ pub struct HostFSProvider {
 impl HostFSProvider {
     /// Create a new HostFSProvider bound to a specific Linux directory
     pub fn new<P: AsRef<Path>>(host_root: P) -> std::io::Result<Self> {
-        let root_path = host_root.as_ref().to_path_buf();
+        let requested_root = host_root.as_ref();
 
         // Ensure the root directory exists on the Linux host
-        if !root_path.exists() {
-            fs::create_dir_all(&root_path)?;
+        if !requested_root.exists() {
+            fs::create_dir_all(requested_root)?;
+        }
+        // Keep a canonical root.  Every mapped object is checked against this
+        // directory before an operation, so a hostile or accidental symbolic
+        // link cannot redirect a Hyber object outside its configured host area.
+        let root_path = fs::canonicalize(requested_root)?;
+        if !root_path.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "HostFS root must be a directory",
+            ));
         }
 
         Ok(Self {
@@ -44,13 +54,48 @@ impl HostFSProvider {
         })
     }
 
+    /// Associate the already-created Hyber namespace root with the isolated
+    /// host root.  Call this once before importing or creating children.
+    pub fn bind_root(&mut self, root_id: ObjectId) {
+        self.object_paths.insert(root_id, PathBuf::new());
+    }
+
     /// Helper: Get the full Linux path for a specific ObjectId
-    fn get_linux_path(&self, obj_id: ObjectId) -> PathBuf {
-        self.root_path.join(
-            self.object_paths
-                .get(&obj_id)
-                .unwrap_or(&PathBuf::from(obj_id.0.to_string())),
-        )
+    fn get_linux_path(&self, obj_id: ObjectId) -> Result<PathBuf, String> {
+        let relative = self
+            .object_paths
+            .get(&obj_id)
+            .ok_or_else(|| format!("HostFS object {:?} has no path mapping", obj_id))?;
+        if relative.is_absolute()
+            || relative.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err("HostFS rejected an unsafe object path".to_string());
+        }
+
+        let path = self.root_path.join(relative);
+        // Do not follow any symlink in a mapped path.  This intentionally
+        // treats symlinks as unsupported HostFS objects until the provider has
+        // a separate, capability-checked link model.
+        let mut cursor = self.root_path.clone();
+        for component in relative.components() {
+            cursor.push(component);
+            if let Ok(metadata) = fs::symlink_metadata(&cursor) {
+                if metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "HostFS refused symbolic link: {}",
+                        cursor.display()
+                    ));
+                }
+            }
+        }
+        Ok(path)
     }
 
     /// Register an existing Linux file/directory into HyberKOS without truncating it.
@@ -62,6 +107,9 @@ impl HostFSProvider {
         name: &str,
         obj_type: ObjectType,
     ) -> Result<ObjectId, String> {
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+            return Err(format!("Invalid namespace node name '{name}'"));
+        }
         let obj_id = obj_mgr.create_object(obj_type);
         ns_mgr
             .create_node(obj_mgr, parent_id, name, obj_id)
@@ -77,7 +125,8 @@ impl HostFSProvider {
             .object_paths
             .get(&parent_id)
             .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| format!("HostFS parent {:?} has no path mapping", parent_id))?;
+        self.get_linux_path(parent_id)?;
         let new_relative_path = if parent_path.as_os_str().is_empty() {
             PathBuf::from(name)
         } else {
@@ -110,7 +159,7 @@ impl Provider for HostFSProvider {
             .object_paths
             .get(&parent_id)
             .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| format!("HostFS parent {:?} has no path mapping", parent_id))?;
         let new_relative_path = if parent_path.as_os_str().is_empty() {
             PathBuf::from(name)
         } else {
@@ -119,7 +168,7 @@ impl Provider for HostFSProvider {
 
         // 3. Create the host object before committing Hyber state. This avoids
         // dangling namespace entries when the OS operation fails.
-        let linux_path = self.root_path.join(&new_relative_path);
+        let linux_path = self.get_linux_path(parent_id)?.join(name);
 
         match obj_type {
             ObjectType::Directory => {
@@ -190,7 +239,7 @@ impl Provider for HostFSProvider {
 
         // 2. Get the Linux path and delete it.  A non-empty directory must not
         // be erased implicitly: the caller has to remove its children first.
-        let linux_path = self.get_linux_path(obj_id);
+        let linux_path = self.get_linux_path(obj_id)?;
         if linux_path.is_dir() {
             fs::remove_dir(&linux_path)
                 .map_err(|e| format!("Failed to remove empty dir: {}", e))?;
@@ -238,19 +287,37 @@ impl Provider for HostFSProvider {
         }
 
         // 3. Get old and new Linux paths
-        let old_linux_path = self.get_linux_path(obj_id);
+        let old_linux_path = self.get_linux_path(obj_id)?;
 
         let new_parent_path = self
             .object_paths
             .get(&new_parent_id)
             .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                format!(
+                    "HostFS destination parent {:?} has no path mapping",
+                    new_parent_id
+                )
+            })?;
+        let new_parent_linux_path = self.get_linux_path(new_parent_id)?;
         let new_relative_path = if new_parent_path.as_os_str().is_empty() {
             PathBuf::from(new_name)
         } else {
             new_parent_path.join(new_name)
         };
-        let new_linux_path = self.root_path.join(&new_relative_path);
+        let new_linux_path = new_parent_linux_path.join(new_name);
+        if new_relative_path.is_absolute()
+            || new_relative_path.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err("HostFS rejected unsafe rename destination".into());
+        }
 
         // Ensure new parent directory exists on Linux
         if let Some(parent) = new_linux_path.parent() {
@@ -263,9 +330,17 @@ impl Provider for HostFSProvider {
             .map_err(|e| format!("Failed to rename Linux file: {}", e))?;
 
         // 5. Update Hyber Namespace.
-        ns_mgr
-            .rename_node(old_parent_id, old_name, new_parent_id, new_name)
-            .map_err(|e| format!("Namespace rename failed: {}", e))?;
+        if let Err(error) = ns_mgr.rename_node(old_parent_id, old_name, new_parent_id, new_name) {
+            // The namespace is authoritative to Hyber callers.  Restore the
+            // host name if its commit fails, rather than silently splitting
+            // the two views.  A failed rollback is surfaced explicitly.
+            if let Err(rollback) = fs::rename(&new_linux_path, &old_linux_path) {
+                return Err(format!(
+                    "Namespace rename failed: {error}; HostFS rollback also failed: {rollback}"
+                ));
+            }
+            return Err(format!("Namespace rename failed: {error}"));
+        }
 
         // 6. Update the moved object and every descendant.  A directory move
         // changes the backing path of its whole subtree, not only its root.
@@ -295,7 +370,7 @@ impl Provider for HostFSProvider {
         // in this immutable context. The '_active' prefix prevents unused variable warnings.
         let _active = self.active_files.get(&object_id);
 
-        let mut file = File::open(self.get_linux_path(object_id))
+        let mut file = File::open(self.get_linux_path(object_id)?)
             .map_err(|e| format!("Failed to open Linux file for reading: {}", e))?;
 
         file.seek(SeekFrom::Start(offset))
@@ -306,12 +381,14 @@ impl Provider for HostFSProvider {
     }
 
     fn write(&mut self, object_id: ObjectId, offset: u64, buffer: &[u8]) -> Result<usize, String> {
-        let linux_path = self.get_linux_path(object_id);
+        let linux_path = self.get_linux_path(object_id)?;
 
         // 7.4 FD Isolation: Open or reuse file
         let mut file = OpenOptions::new()
             .write(true)
-            .create(true)
+            // A write through an existing Hyber handle must never materialize
+            // an untracked host file if the backing object disappeared.
+            .create(false)
             .truncate(false)
             .open(&linux_path)
             .map_err(|e| format!("Failed to open Linux file for writing: {}", e))?;
@@ -336,5 +413,69 @@ impl Provider for HostFSProvider {
         // HyberKOS source of truth is the NamespaceManager, not the Linux disk.
         // Returning None forces the VFS to fallback to NamespaceManager::list_directory.
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch_dir() -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("hyber-hostfs-test-{}-{stamp}", std::process::id()))
+    }
+
+    #[test]
+    fn mapped_paths_require_root_binding() {
+        let dir = scratch_dir();
+        let mut provider = HostFSProvider::new(&dir).unwrap();
+        let mut objects = ObjectManager::new();
+        let mut namespace = NamespaceManager::new(&mut objects);
+        let root = namespace.root();
+        assert!(provider
+            .create(
+                &mut objects,
+                &mut namespace,
+                root,
+                "unbound",
+                ObjectType::File,
+            )
+            .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_substitution_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch_dir();
+        let outside = scratch_dir().with_extension("outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        let mut provider = HostFSProvider::new(&dir).unwrap();
+        let mut objects = ObjectManager::new();
+        let mut namespace = NamespaceManager::new(&mut objects);
+        let root = namespace.root();
+        provider.bind_root(root);
+        let id = provider
+            .create(
+                &mut objects,
+                &mut namespace,
+                root,
+                "entry",
+                ObjectType::File,
+            )
+            .unwrap();
+        std::fs::remove_file(dir.join("entry")).unwrap();
+        symlink(&outside, dir.join("entry")).unwrap();
+        assert!(provider.read(id, 0, &mut [0; 8]).is_err());
+        std::fs::remove_file(dir.join("entry")).unwrap();
+        std::fs::remove_file(outside).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

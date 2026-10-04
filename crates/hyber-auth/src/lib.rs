@@ -359,6 +359,17 @@ impl AuthService {
             .map_err(|_| AuthError::InvalidSession)
     }
 
+    /// Return the authenticated account's validated Hyber home path.  The
+    /// value comes from the identity registry, never from a host account or
+    /// caller-provided path.
+    pub fn home(&mut self, token: &SessionToken) -> Result<String, AuthError> {
+        let user = self.context(token)?.user_id;
+        self.accounts
+            .user(user)
+            .map(|account| account.home.clone())
+            .ok_or(AuthError::InvalidSession)
+    }
+
     fn admin(&mut self, token: &SessionToken) -> Result<UserId, AuthError> {
         let context = self.context(token)?;
         SecurityManager::check_capability(&context, "CAP_SYS_ADMIN")
@@ -683,6 +694,27 @@ impl SessionGuard {
             .sessions
             .get(&self.token.digest())
             .map(|s| s.kind)
+            .ok_or(AuthError::InvalidSession)
+    }
+    pub fn home(&self) -> Result<String, AuthError> {
+        // Run the hosted-volume freshness validation before consulting the
+        // in-memory authority, just as `context` does.
+        self.context()?;
+        self.service
+            .lock()
+            .map_err(|_| AuthError::Unavailable)?
+            .home(&self.token)
+    }
+    /// Resolve the current Hyber account name after validating the session,
+    /// including hosted-store freshness. Never consult the host OS identity.
+    pub fn username(&self) -> Result<String, AuthError> {
+        self.context()?;
+        let mut service = self.service.lock().map_err(|_| AuthError::Unavailable)?;
+        let user = service.context(&self.token)?.user_id;
+        service
+            .accounts
+            .user(user)
+            .map(|account| account.username.clone())
             .ok_or(AuthError::InvalidSession)
     }
     pub fn logout(&self) -> Result<(), AuthError> {

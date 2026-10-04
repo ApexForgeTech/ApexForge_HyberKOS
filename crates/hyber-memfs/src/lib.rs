@@ -184,7 +184,7 @@ impl Provider for MemFSProvider {
             return Err("Cannot read a directory".to_string());
         }
 
-        let offset = offset as usize;
+        let offset = usize::try_from(offset).map_err(|_| "MemFS offset is too large")?;
         if offset >= entry.data.len() {
             return Ok(0); // EOF
         }
@@ -205,14 +205,17 @@ impl Provider for MemFSProvider {
             return Err("Cannot write to a directory".to_string());
         }
 
-        let offset = offset as usize;
+        let offset = usize::try_from(offset).map_err(|_| "MemFS offset is too large")?;
+        let end = offset
+            .checked_add(buffer.len())
+            .ok_or("MemFS write range overflows address space")?;
 
         // Grow the buffer if needed
-        if offset + buffer.len() > entry.data.len() {
-            entry.data.resize(offset + buffer.len(), 0);
+        if end > entry.data.len() {
+            entry.data.resize(end, 0);
         }
 
-        entry.data[offset..offset + buffer.len()].copy_from_slice(buffer);
+        entry.data[offset..end].copy_from_slice(buffer);
         Ok(buffer.len())
     }
 

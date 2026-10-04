@@ -320,11 +320,20 @@ fn build_fs(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>
                             let KernelState {
                                 vfs,
                                 handle_mgr,
+                                obj_mgr,
                                 process_id,
+                                security_context,
                                 ..
                             } = &mut *ks;
-                            vfs.read(handle_mgr, *process_id, hyber_core::HandleId(hid), &mut buf)
-                                .map_err(lua_err)?
+                            vfs.read_secure(
+                                handle_mgr,
+                                obj_mgr,
+                                *process_id,
+                                security_context,
+                                hyber_core::HandleId(hid),
+                                &mut buf,
+                            )
+                            .map_err(lua_err)?
                         };
                         if n == 0 {
                             Ok(LuaValue::Nil)
@@ -350,12 +359,14 @@ fn build_fs(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>
                             handle_mgr,
                             obj_mgr,
                             process_id,
+                            security_context,
                             ..
                         } = &mut *ks;
-                        vfs.write(
+                        vfs.write_secure(
                             handle_mgr,
                             obj_mgr,
                             *process_id,
+                            security_context,
                             hyber_core::HandleId(hid),
                             data.as_bytes(),
                         )
