@@ -1,0 +1,23 @@
+[package]
+name = "hyber-gate"
+version = "0.1.0"
+edition = "2021"
+description = "Special_8 integration and migration gate"
+
+[dependencies]
+
+[dev-dependencies]
+hyber-auth = { path = "../hyber-auth" }
+hyber-core = { path = "../hyber-core" }
+hyber-fs = { path = "../hyber-fs" }
+hyber-handle = { path = "../hyber-handle" }
+hyber-identity = { path = "../hyber-identity" }
+hyber-layout = { path = "../hyber-layout" }
+hyber-lua = { path = "../hyber-lua" }
+hyber-manifest = { path = "../hyber-manifest" }
+hyber-memfs = { path = "../hyber-memfs" }
+hyber-namespace = { path = "../hyber-namespace" }
+hyber-object = { path = "../hyber-object" }
+hyber-process = { path = "../hyber-process" }
+hyber-shell = { path = "../../applications/hyber-shell" }
+hyber-vfs = { path = "../hyber-vfs" }

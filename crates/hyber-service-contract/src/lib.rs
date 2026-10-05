@@ -5,6 +5,7 @@
 //! consume, so Lua and Go cannot become an alternate authority boundary.
 
 use hyber_core::{GroupId, UserId};
+use hyber_identity::{AccountRegistry, AccountState};
 use hyber_manifest::{ApplicationGrant, ApplicationId, CapabilityName, ExecutionMode, Runtime};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -101,6 +102,9 @@ pub struct LuaServiceTable {
     pub dependencies: BTreeSet<String>,
     pub entrypoint: String,
     pub requested_capabilities: BTreeSet<String>,
+    pub socket_outbound: bool,
+    pub socket_inbound: bool,
+    pub socket_domains: BTreeSet<String>,
     pub ipc_endpoints: BTreeSet<String>,
     pub max_message_bytes: u32,
 }
@@ -163,7 +167,11 @@ impl ServiceDefinition {
                 .into_iter()
                 .map(CapabilityName)
                 .collect(),
-            socket_policy: SocketPolicy::default(),
+            socket_policy: SocketPolicy {
+                outbound: table.socket_outbound,
+                inbound: table.socket_inbound,
+                domains: table.socket_domains,
+            },
             ipc: IpcContract {
                 endpoints: table.ipc_endpoints,
                 max_message_bytes: table.max_message_bytes,
@@ -191,6 +199,14 @@ impl ServiceDefinition {
                 "application is not an approved service",
             ));
         }
+        if !self
+            .requested_capabilities
+            .contains(&CapabilityName("service.background".into()))
+        {
+            return Err(ContractError::Denied(
+                "service must explicitly declare service.background",
+            ));
+        }
         if self.dependencies.len() > MAX_DEPENDENCIES {
             return Err(ContractError::Invalid("too many dependencies"));
         }
@@ -213,16 +229,49 @@ impl ServiceDefinition {
                     ));
                 }
                 validate_relative_entrypoint(entrypoint, ".lua")?;
+                if entrypoint != &grant.manifest.entrypoint {
+                    return Err(ContractError::Denied(
+                        "service payload differs from application entrypoint",
+                    ));
+                }
             }
             ServicePayload::Go(payload) => {
                 if grant.manifest.runtime != Runtime::Go {
                     return Err(ContractError::Denied("Go payload requires Go application"));
                 }
                 validate_go_payload(payload)?;
+                if payload.module != grant.manifest.entrypoint {
+                    return Err(ContractError::Denied(
+                        "service payload differs from application entrypoint",
+                    ));
+                }
             }
         }
         validate_ipc(&self.ipc)?;
         validate_socket_policy(&self.socket_policy, grant, &self.requested_capabilities)?;
+        Ok(())
+    }
+
+    /// Resolves the declared owner through the common Hyber identity registry.
+    /// A service must use an enabled service account that is a member of its
+    /// declared group; host identities and numeric look-alikes are rejected.
+    pub fn validate_identity(&self, accounts: &AccountRegistry) -> Result<(), ContractError> {
+        let user = accounts
+            .user(self.identity.user_id)
+            .ok_or(ContractError::Denied("service user does not exist"))?;
+        let group = accounts
+            .group(self.identity.group_id)
+            .ok_or(ContractError::Denied("service group does not exist"))?;
+        if user.state != AccountState::Service {
+            return Err(ContractError::Denied("service requires a service account"));
+        }
+        let member_by_user =
+            user.primary_group == group.id || user.supplementary_groups.contains(&group.id);
+        if !member_by_user || !group.members.contains(&user.id) {
+            return Err(ContractError::Denied(
+                "service account is not a member of its group",
+            ));
+        }
         Ok(())
     }
 }
@@ -236,10 +285,12 @@ pub struct ServiceCatalog {
 impl ServiceCatalog {
     pub fn register(
         &mut self,
+        accounts: &AccountRegistry,
         definition: ServiceDefinition,
         grant: &ApplicationGrant,
     ) -> Result<(), ContractError> {
         definition.validate_against(grant)?;
+        definition.validate_identity(accounts)?;
         if self.services.contains_key(&definition.service_id) {
             return Err(ContractError::DuplicateService);
         }
@@ -259,11 +310,13 @@ impl ServiceCatalog {
     /// the path that can distinguish a cycle from a merely missing dependency.
     pub fn register_batch(
         &mut self,
+        accounts: &AccountRegistry,
         entries: impl IntoIterator<Item = (ServiceDefinition, ApplicationGrant)>,
     ) -> Result<(), ContractError> {
         let entries: Vec<_> = entries.into_iter().collect();
         for (definition, grant) in &entries {
             definition.validate_against(grant)?;
+            definition.validate_identity(accounts)?;
             if self.services.contains_key(&definition.service_id) {
                 return Err(ContractError::DuplicateService);
             }
@@ -413,6 +466,21 @@ mod tests {
     use super::*;
     use hyber_manifest::{GrantPolicy, Manifest, NetworkPolicy, ResourceQuotas, StorageScopes};
 
+    fn accounts() -> (AccountRegistry, ServiceIdentity) {
+        let mut accounts = AccountRegistry::new();
+        let group = accounts.create_group("services").unwrap();
+        let user = accounts
+            .create_user("dns-service", group, AccountState::Service)
+            .unwrap();
+        (
+            accounts,
+            ServiceIdentity {
+                user_id: user,
+                group_id: group,
+            },
+        )
+    }
+
     fn grant(runtime: Runtime) -> ApplicationGrant {
         let capabilities: BTreeSet<CapabilityName> = ["service.background", "network.outbound"]
             .into_iter()
@@ -456,15 +524,12 @@ mod tests {
         .approve(manifest)
         .unwrap()
     }
-    fn definition(id: &str, dependencies: &[&str]) -> ServiceDefinition {
+    fn definition(id: &str, dependencies: &[&str], identity: ServiceIdentity) -> ServiceDefinition {
         ServiceDefinition {
             format_version: 1,
             service_id: ServiceId(id.into()),
             application_id: ApplicationId("dns-service".into()),
-            identity: ServiceIdentity {
-                user_id: UserId(42),
-                group_id: GroupId(42),
-            },
+            identity,
             startup: StartupPolicy::Automatic,
             restart: RestartPolicy::OnFailure,
             health_check: HealthCheck::IpcReadiness,
@@ -495,11 +560,12 @@ mod tests {
     #[test]
     fn approved_service_contract_has_deterministic_dependency_order() {
         let grant = grant(Runtime::Lua);
+        let (accounts, identity) = accounts();
         let mut catalog = ServiceCatalog::default();
-        let dependency = definition("network", &[]);
-        catalog.register(dependency, &grant).unwrap();
-        let service = definition("dns", &["network"]);
-        catalog.register(service, &grant).unwrap();
+        let dependency = definition("network", &[], identity);
+        catalog.register(&accounts, dependency, &grant).unwrap();
+        let service = definition("dns", &["network"], identity);
+        catalog.register(&accounts, service, &grant).unwrap();
         assert_eq!(
             catalog
                 .launch_order()
@@ -513,18 +579,20 @@ mod tests {
     #[test]
     fn rejects_missing_dependency_and_unapproved_socket_policy() {
         let grant = grant(Runtime::Lua);
+        let (accounts, identity) = accounts();
         let mut catalog = ServiceCatalog::default();
         assert!(matches!(
-            catalog.register(definition("dns", &["network"]), &grant),
+            catalog.register(&accounts, definition("dns", &["network"], identity), &grant),
             Err(ContractError::MissingDependency(_))
         ));
-        let mut invalid = definition("network", &[]);
+        let mut invalid = definition("network", &[], identity);
         invalid.socket_policy.inbound = true;
         assert!(invalid.validate_against(&grant).is_err());
     }
     #[test]
     fn go_contract_requires_cooperative_cancellation_and_go_runtime() {
-        let mut definition = definition("go-dns", &[]);
+        let (_, identity) = accounts();
+        let mut definition = definition("go-dns", &[], identity);
         definition.payload = ServicePayload::Go(GoPayloadContract {
             module: "dnsd".into(),
             arguments: vec![],
@@ -545,11 +613,12 @@ mod tests {
     #[test]
     fn batch_registration_rejects_dependency_cycles_atomically() {
         let grant = grant(Runtime::Lua);
+        let (accounts, identity) = accounts();
         let mut catalog = ServiceCatalog::default();
-        let first = definition("one", &["two"]);
-        let second = definition("two", &["one"]);
+        let first = definition("one", &["two"], identity);
+        let second = definition("two", &["one"], identity);
         assert!(matches!(
-            catalog.register_batch([(first, grant.clone()), (second, grant)]),
+            catalog.register_batch(&accounts, [(first, grant.clone()), (second, grant)]),
             Err(ContractError::DependencyCycle)
         ));
         assert!(catalog.get(&ServiceId("one".into())).is_none());

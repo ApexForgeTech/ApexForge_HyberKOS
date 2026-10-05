@@ -3389,6 +3389,15 @@ incompatible storage, identity, manifest, shell, or capability change requires
 an explicit migration/version decision. The gate is complete only when all
 special-phase, workspace, corruption, and security tests pass.
 
+## Current Gate Foundation
+
+`crates/hyber-gate` enforces explicit, monotonic, rollback-capable migration
+decisions for cross-layer changes and exercises persisted identity/application
+data across a HyberFS remount plus profile alias/history controller behavior.
+It complements the dedicated application-sandbox, input, layout,
+session-revocation, HyberFS corruption, and service-contract suites; it does
+not replace them. See `docs/design/special-8-gate.md`.
+
 ---
 
 # 18. Phase 17 — Package Manager

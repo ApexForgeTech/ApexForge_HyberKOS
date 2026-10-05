@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 hyber-core = { path = "../hyber-core" }
+hyber-identity = { path = "../hyber-identity" }
 hyber-manifest = { path = "../hyber-manifest" }

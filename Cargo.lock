@@ -240,6 +240,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyber-gate"
+version = "0.1.0"
+dependencies = [
+ "hyber-auth",
+ "hyber-core",
+ "hyber-fs",
+ "hyber-handle",
+ "hyber-identity",
+ "hyber-layout",
+ "hyber-lua",
+ "hyber-manifest",
+ "hyber-memfs",
+ "hyber-namespace",
+ "hyber-object",
+ "hyber-process",
+ "hyber-shell",
+ "hyber-vfs",
+]
+
+[[package]]
 name = "hyber-handle"
 version = "0.1.0"
 dependencies = [
@@ -357,6 +377,7 @@ name = "hyber-service-contract"
 version = "0.1.0"
 dependencies = [
  "hyber-core",
+ "hyber-identity",
  "hyber-manifest",
 ]
 

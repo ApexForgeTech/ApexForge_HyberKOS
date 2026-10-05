@@ -17,5 +17,6 @@ members = [
     "crates/hyber-identity",
     "crates/hyber-auth",
     "crates/hyber-layout", "crates/hyber-manifest", "crates/hyber-service-contract",
+    "crates/hyber-gate",
 ]
 resolver = "2"
