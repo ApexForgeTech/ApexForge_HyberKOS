@@ -511,19 +511,11 @@ fn build_obj(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
                 .ns_mgr
                 .resolve(&path, ks.ns_mgr.root())
                 .map_err(lua_err)?;
-            let obj = ks
+            match ks
                 .obj_mgr
-                .lookup(obj_id)
-                .ok_or_else(|| lua_err("Object not found".to_string()))?;
-            SecurityManager::check_access(
-                &ks.security_context,
-                obj.owner,
-                obj.group,
-                obj.permissions,
-                Rights::read_only(),
-            )
-            .map_err(lua_err)?;
-            match ks.obj_mgr.get_metadata(obj_id, &key) {
+                .get_metadata_secure(obj_id, &ks.security_context, &key)
+                .map_err(lua_err)?
+            {
                 Some(v) => metadata_to_lua(lua, v),
                 None => Ok(LuaValue::Nil),
             }
@@ -545,23 +537,9 @@ fn build_obj(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
                     .ns_mgr
                     .resolve(&path, ks.ns_mgr.root())
                     .map_err(lua_err)?;
-                let obj = ks
-                    .obj_mgr
-                    .lookup(obj_id)
-                    .ok_or_else(|| lua_err("Object not found".to_string()))?;
-                SecurityManager::check_access(
-                    &ks.security_context,
-                    obj.owner,
-                    obj.group,
-                    obj.permissions,
-                    Rights {
-                        write: true,
-                        ..Rights::empty()
-                    },
-                )
-                .map_err(lua_err)?;
+                let context = ks.security_context.clone();
                 ks.obj_mgr
-                    .set_metadata(obj_id, &key, meta_val)
+                    .set_metadata_secure(obj_id, &context, &key, meta_val)
                     .map_err(lua_err)?;
                 Ok(true)
             },

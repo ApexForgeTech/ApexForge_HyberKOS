@@ -467,23 +467,36 @@ For persistent account/group administration and password changes, use the
 hosted [authentication tool](../security/identity-sessions.md#hosted-commands).
 Account membership changes and file group ownership are separate operations.
 
-### `chmod` and `chgrp` — Runtime Object Permissions
+### `chmod`, `chgrp`, and `chown` — Runtime Object Permissions
 
 ```text
 chmod 640 /users/alice/example.txt
 chgrp editors /users/alice/example.txt
+chown bob /users/alice/example.txt
 ```
 
 `chmod` accepts octal rwx bits (000–777); only the object owner or a Hyber
 administrator can change them. Special mode bits and symbolic modes are not
 supported. `chgrp` resolves a Hyber group name through the authenticated
 registry; non-admin owners may select only their primary or supplementary
-groups. Bootstrap mode knows only the reserved `root` group. Both commands
-check directory traversal permissions before accessing the target.
+groups. `chown` always requires `CAP_SYS_ADMIN` and resolves its target through
+the authenticated Hyber account registry. Bootstrap mode knows only the
+reserved `root` user/group. All three commands check directory traversal
+permissions before accessing the target.
 
 These commands change **runtime Object metadata only**. HostFS does not yet
 persist Hyber ownership/modes across shell restarts. They do not alter host
 Unix permissions. Durable ownership provisioning remains Special_3 work.
+
+Extended metadata uses the same Object access policy: reads require `READ`,
+while setting or removing a value requires `WRITE`. Keys are limited to the
+`namespace.name` form and values have bounded size/depth. Shell and Lua use
+the checked ObjectManager metadata API; raw helpers are for trusted providers
+and internal state restoration only.
+
+`CONNECT`, `WAIT`, and `SIGNAL` are not Unix rwx bits. Requesting them requires
+the corresponding explicit capability (`CAP_OBJECT_CONNECT`,
+`CAP_OBJECT_WAIT`, or `CAP_OBJECT_SIGNAL`) in addition to a suitable handle.
 
 ### `su` — Switch User
 

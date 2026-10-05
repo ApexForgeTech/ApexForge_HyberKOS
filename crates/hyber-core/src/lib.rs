@@ -416,6 +416,19 @@ impl SecurityManager {
         if requested_rights.enumerate && !allowed_read {
             return Err("Access denied: READ permission missing".to_string());
         }
+        // These rights do not have a safe owner/group/other encoding.  They
+        // are object-capability operations and must never be granted merely
+        // because an object is readable or writable.
+        for (requested, capability, operation) in [
+            (requested_rights.connect, "CAP_OBJECT_CONNECT", "CONNECT"),
+            (requested_rights.wait, "CAP_OBJECT_WAIT", "WAIT"),
+            (requested_rights.signal, "CAP_OBJECT_SIGNAL", "SIGNAL"),
+        ] {
+            if requested {
+                Self::check_capability(context, capability)
+                    .map_err(|_| format!("Access denied: {operation} capability missing"))?;
+            }
+        }
 
         Ok(())
     }
@@ -469,6 +482,39 @@ mod tests {
         )
         .is_err());
         assert_eq!(Path::parse("../../a").normalize().to_string(), "../../a");
+    }
+
+    #[test]
+    fn object_specific_rights_require_explicit_capabilities() {
+        let mut context = SecurityContext {
+            user_id: UserId(1000),
+            group_id: GroupId(1000),
+            supplementary_groups: vec![],
+            capabilities: vec![],
+        };
+        let connect = Rights {
+            connect: true,
+            ..Rights::empty()
+        };
+        assert!(SecurityManager::check_access(
+            &context,
+            UserId(1000),
+            GroupId(1000),
+            0o777,
+            connect,
+        )
+        .is_err());
+        context.capabilities.push(Capability {
+            name: "CAP_OBJECT_CONNECT".into(),
+        });
+        assert!(SecurityManager::check_access(
+            &context,
+            UserId(1000),
+            GroupId(1000),
+            0o777,
+            connect,
+        )
+        .is_ok());
     }
 
     #[test]

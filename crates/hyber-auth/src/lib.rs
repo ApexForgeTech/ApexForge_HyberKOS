@@ -728,6 +728,19 @@ impl SessionGuard {
             .map(|group| group.id)
             .ok_or(AuthError::InvalidInput)
     }
+    /// Resolve a Hyber user name for an administrative ownership change.
+    /// This remains inside the authenticated registry boundary; host account
+    /// names and numeric, unverified IDs are never accepted by callers.
+    pub fn user_id(&self, name: &str) -> Result<hyber_core::UserId, AuthError> {
+        self.context()?;
+        let mut service = self.service.lock().map_err(|_| AuthError::Unavailable)?;
+        service.context(&self.token)?;
+        service
+            .accounts
+            .user_by_name(name)
+            .map(|user| user.id)
+            .ok_or(AuthError::InvalidInput)
+    }
     pub fn logout(&self) -> Result<(), AuthError> {
         self.service
             .lock()

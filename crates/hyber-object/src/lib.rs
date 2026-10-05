@@ -260,9 +260,31 @@ impl ObjectManager {
         Ok(())
     }
 
+    /// Transfer object ownership.  Unlike `chgrp`, ownership changes are
+    /// administrative operations: a normal owner must not be able to hand an
+    /// object to another account and thereby bypass quota/audit policy.
+    pub fn chown(
+        &mut self,
+        id: ObjectId,
+        context: &hyber_core::SecurityContext,
+        owner: UserId,
+    ) -> Result<(), String> {
+        let obj = self.objects.get_mut(&id).ok_or("Object not found")?;
+        if obj.state != ObjectState::Live {
+            return Err("Object is not live".into());
+        }
+        hyber_core::SecurityManager::check_capability(context, "CAP_SYS_ADMIN")?;
+        obj.owner = owner;
+        obj.modified_at = now_secs();
+        Ok(())
+    }
+
     /// Get a specific extended metadata value
     pub fn get_metadata(&self, id: ObjectId, key: &str) -> Option<&MetadataValue> {
-        self.objects.get(&id)?.extended_metadata.get(key)
+        let object = self.objects.get(&id)?;
+        (object.state == ObjectState::Live)
+            .then_some(object)
+            .and_then(|object| object.extended_metadata.get(key))
     }
 
     /// Set a specific extended metadata value
@@ -273,7 +295,11 @@ impl ObjectManager {
         value: MetadataValue,
     ) -> Result<(), String> {
         Self::validate_metadata_key(key)?;
+        Self::validate_metadata_value(&value, 0)?;
         let obj = self.objects.get_mut(&id).ok_or("Object not found")?;
+        if obj.state != ObjectState::Live {
+            return Err("Object is not live".into());
+        }
         obj.extended_metadata.insert(key.to_string(), value);
         // Update modified_at timestamp when metadata changes
         obj.modified_at = SystemTime::now()
@@ -287,6 +313,9 @@ impl ObjectManager {
     pub fn remove_metadata(&mut self, id: ObjectId, key: &str) -> Result<bool, String> {
         Self::validate_metadata_key(key)?;
         let obj = self.objects.get_mut(&id).ok_or("Object not found")?;
+        if obj.state != ObjectState::Live {
+            return Err("Object is not live".into());
+        }
         let removed = obj.extended_metadata.remove(key).is_some();
         if removed {
             obj.modified_at = SystemTime::now()
@@ -299,12 +328,91 @@ impl ObjectManager {
 
     /// List all extended metadata keys and values
     pub fn list_metadata(&self, id: ObjectId) -> Option<Vec<(String, MetadataValue)>> {
-        self.objects.get(&id).map(|obj| {
-            obj.extended_metadata
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        })
+        self.objects
+            .get(&id)
+            .filter(|object| object.state == ObjectState::Live)
+            .map(|obj| {
+                obj.extended_metadata
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+    }
+
+    /// Read metadata through the common Hyber access policy.  The unguarded
+    /// metadata helpers above remain for trusted manager/provider internals;
+    /// shells and language runtimes must use these checked entry points.
+    pub fn get_metadata_secure(
+        &self,
+        id: ObjectId,
+        context: &hyber_core::SecurityContext,
+        key: &str,
+    ) -> Result<Option<&MetadataValue>, String> {
+        self.check_metadata_access(id, context, hyber_core::Rights::read_only())?;
+        Ok(self.get_metadata(id, key))
+    }
+
+    pub fn list_metadata_secure(
+        &self,
+        id: ObjectId,
+        context: &hyber_core::SecurityContext,
+    ) -> Result<Vec<(String, MetadataValue)>, String> {
+        self.check_metadata_access(id, context, hyber_core::Rights::read_only())?;
+        Ok(self.list_metadata(id).unwrap_or_default())
+    }
+
+    pub fn set_metadata_secure(
+        &mut self,
+        id: ObjectId,
+        context: &hyber_core::SecurityContext,
+        key: &str,
+        value: MetadataValue,
+    ) -> Result<(), String> {
+        self.check_metadata_access(
+            id,
+            context,
+            hyber_core::Rights {
+                write: true,
+                ..hyber_core::Rights::empty()
+            },
+        )?;
+        self.set_metadata(id, key, value)
+    }
+
+    pub fn remove_metadata_secure(
+        &mut self,
+        id: ObjectId,
+        context: &hyber_core::SecurityContext,
+        key: &str,
+    ) -> Result<bool, String> {
+        self.check_metadata_access(
+            id,
+            context,
+            hyber_core::Rights {
+                write: true,
+                ..hyber_core::Rights::empty()
+            },
+        )?;
+        self.remove_metadata(id, key)
+    }
+
+    fn check_metadata_access(
+        &self,
+        id: ObjectId,
+        context: &hyber_core::SecurityContext,
+        rights: hyber_core::Rights,
+    ) -> Result<(), String> {
+        let object = self.objects.get(&id).ok_or("Object not found")?;
+        if object.state != ObjectState::Live {
+            return Err("Object is not live".into());
+        }
+        hyber_core::SecurityManager::check_access(
+            context,
+            object.owner,
+            object.group,
+            object.permissions,
+            rights,
+        )
     }
 
     fn validate_metadata_key(key: &str) -> Result<(), String> {
@@ -323,6 +431,41 @@ impl ObjectManager {
         }
         Ok(())
     }
+
+    fn validate_metadata_value(value: &MetadataValue, depth: usize) -> Result<(), String> {
+        const MAX_VALUE_BYTES: usize = 64 * 1024;
+        const MAX_LIST_DEPTH: usize = 16;
+        const MAX_LIST_ITEMS: usize = 1024;
+
+        match value {
+            MetadataValue::String(value) if value.len() > MAX_VALUE_BYTES => {
+                Err("Metadata string value is too large".into())
+            }
+            MetadataValue::Bytes(value) if value.len() > MAX_VALUE_BYTES => {
+                Err("Metadata byte value is too large".into())
+            }
+            MetadataValue::List(values) => {
+                if depth >= MAX_LIST_DEPTH {
+                    return Err("Metadata list nesting is too deep".into());
+                }
+                if values.len() > MAX_LIST_ITEMS {
+                    return Err("Metadata list has too many items".into());
+                }
+                for value in values {
+                    Self::validate_metadata_value(value, depth + 1)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 impl Default for ObjectManager {
@@ -373,11 +516,68 @@ mod tests {
         mgr.chgrp(id, &user, GroupId(2000)).unwrap();
         assert_eq!(mgr.lookup(id).unwrap().permissions, 0o640);
         assert_eq!(mgr.lookup(id).unwrap().group, GroupId(2000));
+        assert!(mgr.chown(id, &user, UserId(2001)).is_err());
+        let mut admin = user.clone();
+        admin.capabilities.push(hyber_core::Capability {
+            name: "CAP_SYS_ADMIN".into(),
+        });
+        mgr.chown(id, &admin, UserId(2001)).unwrap();
+        assert_eq!(mgr.lookup(id).unwrap().owner, UserId(2001));
         for key in [".name", "user.", "user..name"] {
             assert!(mgr
                 .set_metadata(id, key, MetadataValue::Boolean(true))
                 .is_err());
         }
+    }
+
+    #[test]
+    fn metadata_is_bounded_and_checked_against_object_permissions() {
+        let mut mgr = ObjectManager::new();
+        let id = mgr.create_object(ObjectType::File);
+        {
+            let object = mgr.lookup_mut(id).unwrap();
+            object.owner = UserId(1000);
+            object.group = GroupId(1000);
+            object.permissions = 0o600;
+        }
+        let owner = hyber_core::SecurityContext {
+            user_id: UserId(1000),
+            group_id: GroupId(1000),
+            supplementary_groups: vec![],
+            capabilities: vec![],
+        };
+        let other = hyber_core::SecurityContext {
+            user_id: UserId(1001),
+            group_id: GroupId(1001),
+            supplementary_groups: vec![],
+            capabilities: vec![],
+        };
+        assert!(mgr
+            .set_metadata_secure(
+                id,
+                &other,
+                "user.label",
+                MetadataValue::String("denied".into()),
+            )
+            .is_err());
+        mgr.set_metadata_secure(
+            id,
+            &owner,
+            "user.label",
+            MetadataValue::String("allowed".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            mgr.get_metadata_secure(id, &owner, "user.label").unwrap(),
+            Some(&MetadataValue::String("allowed".into()))
+        );
+        assert!(mgr
+            .set_metadata(
+                id,
+                "user.large",
+                MetadataValue::Bytes(vec![0; 64 * 1024 + 1]),
+            )
+            .is_err());
     }
 
     #[test]

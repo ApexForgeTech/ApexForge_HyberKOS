@@ -464,6 +464,7 @@ impl HyberShell {
             "whoami" => self.cmd_whoami(args),
             "chmod" => self.cmd_chmod(args),
             "chgrp" => self.cmd_chgrp(args),
+            "chown" => self.cmd_chown(args),
             "cd" => self.cmd_cd(args),
             "ls" => self.cmd_ls(args),
             "mkdir" => self.cmd_mkdir(args),
@@ -1327,40 +1328,14 @@ impl HyberShell {
         let context = self.current_security_context()?;
         VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
         let obj_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
-        let context = self
-            .proc_mgr
-            .lock()
-            .map_err(|_| "Process manager lock poisoned")?
-            .get_process(self.process_id)
-            .ok_or("Shell process not found")?
-            .security_context
-            .clone();
-        let object = self.obj_mgr.lookup(obj_id).ok_or("Object not found")?;
-        let metadata_rights = if matches!(action, "set" | "rm") {
-            Rights {
-                write: true,
-                ..Rights::empty()
-            }
-        } else {
-            Rights::read_only()
-        };
-        hyber_core::SecurityManager::check_access(
-            &context,
-            object.owner,
-            object.group,
-            object.permissions,
-            metadata_rights,
-        )?;
-
         match action {
             "ls" => {
-                if let Some(meta_list) = self.obj_mgr.list_metadata(obj_id) {
-                    if meta_list.is_empty() {
-                        println!("No extended metadata.");
-                    } else {
-                        for (k, v) in meta_list {
-                            println!("{} = {}", k, v);
-                        }
+                let meta_list = self.obj_mgr.list_metadata_secure(obj_id, &context)?;
+                if meta_list.is_empty() {
+                    println!("No extended metadata.");
+                } else {
+                    for (k, v) in meta_list {
+                        println!("{} = {}", k, v);
                     }
                 }
             }
@@ -1369,7 +1344,7 @@ impl HyberShell {
                     return Err("Missing key argument".to_string());
                 }
                 let key = positional[2];
-                if let Some(val) = self.obj_mgr.get_metadata(obj_id, key) {
+                if let Some(val) = self.obj_mgr.get_metadata_secure(obj_id, &context, key)? {
                     println!("{}", val);
                 } else {
                     println!("Key not found.");
@@ -1380,7 +1355,7 @@ impl HyberShell {
                     return Err("Missing key argument".to_string());
                 }
                 let key = positional[2];
-                if self.obj_mgr.remove_metadata(obj_id, key)? {
+                if self.obj_mgr.remove_metadata_secure(obj_id, &context, key)? {
                     println!("Metadata removed.");
                 } else {
                     println!("Key not found.");
@@ -1413,7 +1388,8 @@ impl HyberShell {
                     _ => return Err("Unsupported type. Use: string, int, bool".to_string()),
                 };
 
-                self.obj_mgr.set_metadata(obj_id, key, meta_val)?;
+                self.obj_mgr
+                    .set_metadata_secure(obj_id, &context, key, meta_val)?;
                 println!("Metadata set.");
             }
             _ => return Err("Unknown meta action. Use: ls, get, set, rm".to_string()),
@@ -1498,6 +1474,24 @@ impl HyberShell {
         VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
         let id = self.vfs.lookup(&self.ns_mgr, &path)?;
         self.obj_mgr.chgrp(id, &context, group)
+    }
+
+    fn cmd_chown(&mut self, args: &[&str]) -> Result<(), String> {
+        if args.len() != 2 {
+            return Err("Usage: chown <user-name> <path>".into());
+        }
+        let context = self.current_security_context()?;
+        let owner = match &self.session {
+            Some(session) => session
+                .user_id(args[0])
+                .map_err(|error| error.to_string())?,
+            None if args[0] == "root" => UserId(0),
+            None => return Err("Named users require an authenticated account registry".into()),
+        };
+        let path = self.resolve_path(args[1]);
+        VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
+        let id = self.vfs.lookup(&self.ns_mgr, &path)?;
+        self.obj_mgr.chown(id, &context, owner)
     }
 
     fn cmd_su(&mut self, args: &[&str]) -> Result<(), String> {
@@ -1700,6 +1694,7 @@ impl HyberShell {
         println!("  whoami                  Print current Hyber account name");
         println!("  chmod <mode> <path>      Set runtime Hyber rwx permissions (octal)");
         println!("  chgrp <group> <path>     Set runtime Hyber object group");
+        println!("  chown <user> <path>      Transfer runtime Hyber object ownership (admin)");
         println!("  cd <path>               Change directory");
         println!("  ls [-l] [-a] [path]     List directory contents");
         println!("  mkdir [-p] <path>       Create directory");
