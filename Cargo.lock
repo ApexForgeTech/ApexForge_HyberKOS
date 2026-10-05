@@ -204,6 +204,7 @@ dependencies = [
  "hyber-identity",
  "hyber-layout",
  "hyber-lua",
+ "hyber-manifest",
  "hyber-memfs",
  "hyber-namespace",
  "hyber-object",
@@ -286,11 +287,21 @@ dependencies = [
  "hyber-core",
  "hyber-handle",
  "hyber-layout",
+ "hyber-manifest",
  "hyber-namespace",
  "hyber-object",
  "hyber-process",
  "hyber-vfs",
  "mlua",
+]
+
+[[package]]
+name = "hyber-manifest"
+version = "0.1.0"
+dependencies = [
+ "hyber-core",
+ "serde",
+ "toml",
 ]
 
 [[package]]

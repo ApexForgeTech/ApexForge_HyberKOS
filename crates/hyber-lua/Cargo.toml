@@ -12,5 +12,6 @@ hyber-namespace = { path = "../hyber-namespace" }
 hyber-vfs = { path = "../hyber-vfs" }
 hyber-process = { path = "../hyber-process" }
 hyber-layout = { path = "../hyber-layout" }
+hyber-manifest = { path = "../hyber-manifest" }
 
 mlua = { version = "0.9", features = ["lua54", "vendored"] }

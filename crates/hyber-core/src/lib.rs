@@ -338,7 +338,7 @@ impl fmt::Display for MetadataValue {
 
 // 2.10 Security Foundation (Phase 9)
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Capability {
     pub name: String,
 }

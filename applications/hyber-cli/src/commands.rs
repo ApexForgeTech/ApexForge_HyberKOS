@@ -18,26 +18,49 @@ pub fn run(args: &[String]) -> Result<(), String> {
         (args, None)
     };
     let input = one_path(args, "run [--auth <image> <blocks> <username>] <path>")?;
-    let (script_path, app_id) = script_path(&input)?;
+    let (script_path, manifest) = script_path(&input)?;
     let script = std::fs::read_to_string(&script_path)
         .map_err(|e| format!("cannot read {}: {e}", script_path.display()))?;
-    let context = match session {
-        Some(session) => AppContext::authenticated_for_app(session, &app_id)?,
-        None => AppContext::new_for_app(&app_id)?,
+    let grant = manifest
+        .map(|manifest| hyber_manifest::GrantPolicy::deny_all().approve(manifest))
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let context = match (session, grant) {
+        (Some(session), Some(grant)) => AppContext::authenticated_for_grant(session, grant)?,
+        (None, Some(grant)) => AppContext::developer_for_grant(grant)?,
+        (Some(session), None) => AppContext::authenticated_for_app(session, "script")?,
+        (None, None) => AppContext::new_for_app("script")?,
     };
     let guard = context.session.clone();
-    let (vfs, ns_mgr, handles, objects, result) = hyber_lua::run_lua_script_with_session_and_layout(
-        &script,
-        context.vfs,
-        context.ns_mgr,
-        context.handle_mgr,
-        context.obj_mgr,
-        context.proc_mgr,
-        context.process_id,
-        context.security_context,
-        context.session,
-        Some(context.app_layout),
-    );
+    let sandbox = context.sandbox.clone();
+    let (vfs, ns_mgr, handles, objects, result) = if let Some(sandbox) = sandbox {
+        hyber_lua::run_lua_script_with_application_sandbox(
+            &script,
+            context.vfs,
+            context.ns_mgr,
+            context.handle_mgr,
+            context.obj_mgr,
+            context.proc_mgr,
+            context.process_id,
+            context.security_context,
+            context.session,
+            context.app_layout,
+            sandbox,
+        )
+    } else {
+        hyber_lua::run_lua_script_with_session_and_layout(
+            &script,
+            context.vfs,
+            context.ns_mgr,
+            context.handle_mgr,
+            context.obj_mgr,
+            context.proc_mgr,
+            context.process_id,
+            context.security_context,
+            context.session,
+            Some(context.app_layout),
+        )
+    };
     // Keep ownership explicit until the runtime returns; this ensures all Lua
     // mutations were retained and avoids silently discarding borrowed state.
     drop((vfs, ns_mgr, handles, objects));
@@ -135,7 +158,7 @@ pub fn new_app(args: &[String]) -> Result<(), String> {
         return Err(format!("{} already exists", dir.display()));
     }
     std::fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let manifest = format!("name = \"{name}\"\nversion = \"0.1.0\"\nentrypoint = \"main.lua\"\n");
+    let manifest = format!("format_version = 1\napp_id = \"{name}\"\nversion = \"0.1.0\"\npublisher = \"local\"\ndisplay_name = \"{name}\"\nentrypoint = \"main.lua\"\nruntime = \"lua\"\nexecution = \"background\"\n\n[storage]\nconfig = \"read-write\"\ndata = \"read-write\"\nstate = \"read-write\"\ncache = \"read-write\"\ntemporary = \"read-write\"\nruntime = \"read-write\"\n\n[resources]\nmemory_bytes = 67108864\ncpu_shares = 100\nhandles = 64\nstorage_bytes = 67108864\n");
     if let Err(error) = std::fs::write(dir.join("hyber.toml"), manifest).and_then(|_| {
         std::fs::write(
             dir.join("main.lua"),
@@ -162,13 +185,13 @@ fn one_path(args: &[String], usage: &str) -> Result<String, String> {
     Ok(args[0].clone())
 }
 
-fn script_path(input: &str) -> Result<(PathBuf, String), String> {
+fn script_path(input: &str) -> Result<(PathBuf, Option<manifest::Manifest>), String> {
     let input_path = FsPath::new(input);
     if input_path.is_file() {
         if input_path.extension().and_then(|e| e.to_str()) != Some("lua") {
             return Err("only .lua scripts are supported in Phase 14".into());
         }
-        return Ok((input_path.to_path_buf(), "script".into()));
+        return Ok((input_path.to_path_buf(), None));
     }
     if !input_path.is_dir() {
         return Err(format!(
@@ -180,7 +203,6 @@ fn script_path(input: &str) -> Result<(PathBuf, String), String> {
         .canonicalize()
         .map_err(|e| format!("cannot resolve {input}: {e}"))?;
     let manifest = manifest::load(&app_dir)?;
-    let _author = &manifest.author;
     let entry = app_dir.join(&manifest.entrypoint);
     let canonical_entry = entry
         .canonicalize()
@@ -192,10 +214,7 @@ fn script_path(input: &str) -> Result<(PathBuf, String), String> {
             "manifest entrypoint must stay inside the app directory and end in .lua".into(),
         );
     }
-    if let Some(permissions) = manifest.permissions {
-        let _ = (permissions.read, permissions.write); // parsed now; Phase 13 enforces portable manifests.
-    }
-    Ok((canonical_entry, manifest.name))
+    Ok((canonical_entry, Some(manifest)))
 }
 
 #[cfg(test)]

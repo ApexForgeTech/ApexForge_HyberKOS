@@ -15,6 +15,12 @@ pub trait Provider {
     fn persist_metadata(&mut self, _object: &hyber_object::Object) -> Result<(), String> {
         Ok(())
     }
+
+    /// Lookup an object by path within the provider
+    fn lookup(&self, _path: &Path) -> Result<Option<ObjectId>, String> {
+        Ok(None)
+    }
+
     fn create(
         &mut self,
         obj_mgr: &mut ObjectManager,
@@ -697,6 +703,73 @@ impl VFS {
     pub fn list_mounts(&self) -> &[Mount] {
         &self.mount_table.mounts
     }
+
+    /// mkdir: Create a directory (convenience wrapper around create)
+    pub fn mkdir(
+        &mut self,
+        ns_mgr: &mut NamespaceManager,
+        obj_mgr: &mut ObjectManager,
+        security_context: &hyber_core::SecurityContext,
+        parent_path: &Path,
+        name: &str,
+    ) -> Result<ObjectId, String> {
+        self.create(
+            ns_mgr,
+            obj_mgr,
+            security_context,
+            parent_path,
+            name,
+            ObjectType::Directory,
+        )
+    }
+
+    /// stat: Get metadata for an object at a path
+    pub fn stat(
+        &self,
+        ns_mgr: &NamespaceManager,
+        obj_mgr: &ObjectManager,
+        security_context: &hyber_core::SecurityContext,
+        path: &Path,
+    ) -> Result<ObjectMetadata, String> {
+        Self::check_traversal(ns_mgr, obj_mgr, security_context, path, false)?;
+        let path = path.normalize();
+        let object_id = ns_mgr.resolve(&path, ns_mgr.root())?;
+        let obj = obj_mgr.lookup(object_id).ok_or("Object not found")?;
+        hyber_core::SecurityManager::check_access(
+            security_context,
+            obj.owner,
+            obj.group,
+            obj.permissions,
+            Rights::read_only(),
+        )?;
+        Ok(ObjectMetadata {
+            object_id,
+            object_type: obj.object_type,
+            state: obj.state,
+            size: obj.size,
+            owner: obj.owner,
+            group: obj.group,
+            permissions: obj.permissions,
+            created_at: obj.created_at,
+            modified_at: obj.modified_at,
+            references: obj.references,
+        })
+    }
+}
+
+/// Metadata returned by stat operation
+#[derive(Debug, Clone)]
+pub struct ObjectMetadata {
+    pub object_id: ObjectId,
+    pub object_type: ObjectType,
+    pub state: hyber_core::ObjectState,
+    pub size: u64,
+    pub owner: hyber_core::UserId,
+    pub group: hyber_core::GroupId,
+    pub permissions: u32,
+    pub created_at: u64,
+    pub modified_at: u64,
+    pub references: u64,
 }
 
 impl Default for VFS {
@@ -712,6 +785,9 @@ mod tests {
 
     struct ReadProvider;
     impl Provider for ReadProvider {
+        fn lookup(&self, _path: &Path) -> Result<Option<ObjectId>, String> {
+            Ok(None)
+        }
         fn create(
             &mut self,
             _: &mut hyber_object::ObjectManager,

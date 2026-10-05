@@ -79,6 +79,7 @@
 use hyber_core::{MetadataValue, Path, ProcessId, Rights, SecurityContext, SecurityManager};
 use hyber_handle::HandleManager;
 use hyber_layout::AppLayout;
+use hyber_manifest::{ApplicationSandbox, StorageClass};
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
 use hyber_process::ProcessManager;
@@ -99,6 +100,7 @@ struct KernelState {
     process_id: ProcessId,
     security_context: SecurityContext,
     app_layout: Option<AppLayout>,
+    sandbox: Option<ApplicationSandbox>,
     input_queue: VecDeque<InputEvent>,
 }
 
@@ -183,6 +185,44 @@ pub fn run_lua_script_with_session_and_layout(
         security_context,
         session,
         app_layout,
+        None,
+    )
+}
+
+/// Run a manifest-approved application. The sandbox is checked before every
+/// Lua filesystem operation, independently of owner/group permissions.
+#[allow(clippy::too_many_arguments, clippy::arc_with_non_send_sync)]
+pub fn run_lua_script_with_application_sandbox(
+    script: &str,
+    vfs: VFS,
+    ns_mgr: NamespaceManager,
+    handle_mgr: HandleManager,
+    obj_mgr: ObjectManager,
+    proc_mgr: Arc<Mutex<ProcessManager>>,
+    process_id: ProcessId,
+    security_context: SecurityContext,
+    session: Option<hyber_auth::SessionGuard>,
+    app_layout: AppLayout,
+    sandbox: ApplicationSandbox,
+) -> (
+    VFS,
+    NamespaceManager,
+    HandleManager,
+    ObjectManager,
+    Result<(), mlua::Error>,
+) {
+    run_lua_script_with_session_and_layout_impl(
+        script,
+        vfs,
+        ns_mgr,
+        handle_mgr,
+        obj_mgr,
+        proc_mgr,
+        process_id,
+        security_context,
+        session,
+        Some(app_layout),
+        Some(sandbox),
     )
 }
 
@@ -232,6 +272,7 @@ fn run_lua_script_with_session_and_layout_impl(
     security_context: SecurityContext,
     session: Option<hyber_auth::SessionGuard>,
     app_layout: Option<AppLayout>,
+    sandbox: Option<ApplicationSandbox>,
 ) -> (
     VFS,
     NamespaceManager,
@@ -249,6 +290,7 @@ fn run_lua_script_with_session_and_layout_impl(
         process_id,
         security_context,
         app_layout,
+        sandbox,
         input_queue: VecDeque::new(),
     }));
 
@@ -340,6 +382,7 @@ fn build_fs(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>
 
             let handle_id = {
                 let mut ks = lock(&state)?;
+                authorize_application_path(&ks, &path, rights.write)?;
                 // Destructure to give borrow-checker independent field borrows
                 let KernelState {
                     vfs,
@@ -398,6 +441,7 @@ fn build_fs(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>
             // Build Lua file object
             let file = lua.create_table()?;
             file.set("_hid", handle_id.0)?;
+            file.set("_path", path.to_string())?;
 
             // file:read([size]) -> string | nil
             {
@@ -448,6 +492,7 @@ fn build_fs(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>
                             return Err(lua_err("Handle already closed".to_string()));
                         }
                         let mut ks = lock(&state)?;
+                        preflight_application_write(&ks, hyber_core::HandleId(hid), data.len())?;
                         let KernelState {
                             vfs,
                             handle_mgr,
@@ -514,11 +559,16 @@ fn build_ns(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>
         let exists_fn = lua.create_function(move |_lua, path_str: String| {
             let path = Path::parse(&path_str);
             let ks = lock(&state)?;
-            Ok(
-                VFS::check_traversal(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path, false)
-                    .is_ok()
-                    && ks.ns_mgr.resolve(&path, ks.ns_mgr.root()).is_ok(),
-            )
+            Ok(authorize_application_path(&ks, &path, false).is_ok()
+                && VFS::check_traversal(
+                    &ks.ns_mgr,
+                    &ks.obj_mgr,
+                    &ks.security_context,
+                    &path,
+                    false,
+                )
+                .is_ok()
+                && ks.ns_mgr.resolve(&path, ks.ns_mgr.root()).is_ok())
         })?;
         t.set("exists", exists_fn)?;
     }
@@ -529,6 +579,7 @@ fn build_ns(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>
         let list_fn = lua.create_function(move |lua, path_str: String| {
             let path = Path::parse(&path_str);
             let ks = lock(&state)?;
+            authorize_application_path(&ks, &path, false)?;
             let nodes = ks
                 .vfs
                 .enumerate_secure(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path)
@@ -559,6 +610,7 @@ fn build_obj(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
         let info_fn = lua.create_function(move |lua, path_str: String| {
             let path = Path::parse(&path_str);
             let ks = lock(&state)?;
+            authorize_application_path(&ks, &path, false)?;
             VFS::check_traversal(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path, false)
                 .map_err(lua_err)?;
             let obj_id = ks
@@ -599,6 +651,7 @@ fn build_obj(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
         let meta_get = lua.create_function(move |lua, (path_str, key): (String, String)| {
             let path = Path::parse(&path_str);
             let ks = lock(&state)?;
+            authorize_application_path(&ks, &path, false)?;
             VFS::check_traversal(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path, false)
                 .map_err(lua_err)?;
             let obj_id = ks
@@ -625,6 +678,7 @@ fn build_obj(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
                 let path = Path::parse(&path_str);
                 let meta_val = parse_metadata_value(&val_type, val_str)?;
                 let mut ks = lock(&state)?;
+                authorize_application_path(&ks, &path, true)?;
                 VFS::check_traversal(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path, false)
                     .map_err(lua_err)?;
                 let context = ks.security_context.clone();
@@ -672,6 +726,11 @@ fn build_proc(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'
             "spawn",
             lua.create_function(move |_lua, target: String| {
                 let mut ks = lock(&state)?;
+                if let Some(sandbox) = &ks.sandbox
+                    && !sandbox.capability("process.spawn")
+                {
+                    return Err(lua_err("application lacks process.spawn capability".into()));
+                }
                 let target_path = Path::parse(&target).normalize();
                 let target_id = ks
                     .ns_mgr
@@ -770,6 +829,9 @@ fn build_sec(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
                 let path = Path::parse(&path_str);
                 let requested_rights = parse_mode(&rights_str)?;
                 let ks = lock(&state)?;
+                if authorize_application_path(&ks, &path, requested_rights.write).is_err() {
+                    return Ok(false);
+                }
                 if VFS::check_traversal(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path, false)
                     .is_err()
                 {
@@ -829,6 +891,21 @@ fn build_app(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
                 $name,
                 lua.create_function(move |_lua, ()| {
                     let state = lock(&state)?;
+                    if let Some(sandbox) = &state.sandbox {
+                        let class = match $name {
+                            "config_dir" => StorageClass::Config,
+                            "data_dir" => StorageClass::Data,
+                            "state_dir" => StorageClass::State,
+                            "cache_dir" => StorageClass::Cache,
+                            "temp_dir" => StorageClass::Temporary,
+                            "runtime_dir" => StorageClass::Runtime,
+                            _ => unreachable!(),
+                        };
+                        return sandbox
+                            .root(class)
+                            .map(|path| path.to_string())
+                            .map_err(|e| lua_err(e.to_string()));
+                    }
                     state
                         .app_layout
                         .as_ref()
@@ -964,6 +1041,74 @@ fn lock(state: &Arc<Mutex<KernelState>>) -> LuaResult<std::sync::MutexGuard<'_, 
     Ok(state)
 }
 
+fn authorize_application_path(state: &KernelState, path: &Path, write: bool) -> LuaResult<()> {
+    if let Some(sandbox) = &state.sandbox {
+        sandbox
+            .authorize(path, write)
+            .map_err(|e| lua_err(e.to_string()))?;
+    }
+    Ok(())
+}
+
+fn preflight_application_write(
+    state: &KernelState,
+    handle_id: hyber_core::HandleId,
+    bytes: usize,
+) -> LuaResult<()> {
+    let Some(sandbox) = &state.sandbox else {
+        return Ok(());
+    };
+    let handle = state
+        .handle_mgr
+        .get_handle(state.process_id, handle_id)
+        .ok_or_else(|| lua_err("Handle not found".into()))?;
+    let object = state
+        .obj_mgr
+        .lookup(handle.object_id)
+        .ok_or_else(|| lua_err("Object not found".into()))?;
+    let end = handle
+        .offset
+        .checked_add(bytes as u64)
+        .ok_or_else(|| lua_err("write offset overflow".into()))?;
+    let growth = end.saturating_sub(object.size);
+    if growth == 0 {
+        return Ok(());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = Vec::new();
+    for root in sandbox.roots() {
+        pending.push(
+            state
+                .ns_mgr
+                .resolve(root, state.ns_mgr.root())
+                .map_err(lua_err)?,
+        );
+    }
+    let mut used = 0u64;
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let entry = state
+            .obj_mgr
+            .lookup(id)
+            .ok_or_else(|| lua_err("sandbox object missing".into()))?;
+        used = used
+            .checked_add(entry.size)
+            .ok_or_else(|| lua_err("sandbox usage overflow".into()))?;
+        if let Some(nodes) = state.ns_mgr.list_directory(id) {
+            pending.extend(nodes.into_iter().map(|node| node.object_id));
+        }
+    }
+    if used
+        .checked_add(growth)
+        .is_none_or(|total| total > sandbox.storage_limit())
+    {
+        return Err(lua_err("application storage quota exceeded".into()));
+    }
+    Ok(())
+}
+
 fn lua_err(msg: String) -> LuaError {
     LuaError::RuntimeError(msg)
 }
@@ -1022,6 +1167,70 @@ mod tests {
     use super::*;
     use hyber_core::ObjectType;
     use hyber_layout::{AppLayout, UserLayout};
+    use hyber_manifest::{
+        ApplicationId, ApplicationSandbox, ExecutionMode, GrantPolicy, Manifest, NetworkPolicy,
+        ResourceQuotas, Runtime, ScopeAccess, StorageRoots, StorageScopes,
+    };
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn manifest_sandbox_blocks_sibling_paths_before_vfs_access() {
+        let mut objects = ObjectManager::new();
+        let namespace = NamespaceManager::new(&mut objects);
+        let mut processes = ProcessManager::new();
+        let pid = processes
+            .create_process(&mut objects, None, SecurityContext::root(), None)
+            .unwrap();
+        let layout = AppLayout::new(UserLayout::root(), "editor").unwrap();
+        let manifest = Manifest {
+            format_version: 1,
+            app_id: ApplicationId("editor".into()),
+            version: "1.0.0".into(),
+            publisher: "local".into(),
+            display_name: "Editor".into(),
+            entrypoint: "main.lua".into(),
+            runtime: Runtime::Lua,
+            requested_capabilities: BTreeSet::new(),
+            storage: StorageScopes {
+                data: ScopeAccess::ReadWrite,
+                ..StorageScopes::default()
+            },
+            execution: ExecutionMode::Background,
+            network: NetworkPolicy::default(),
+            resources: ResourceQuotas {
+                memory_bytes: 1024,
+                cpu_shares: 1,
+                handles: 1,
+                storage_bytes: 1024,
+            },
+        };
+        let sandbox = ApplicationSandbox::new(
+            GrantPolicy::deny_all().approve(manifest).unwrap(),
+            StorageRoots {
+                config: layout.config.clone(),
+                data: layout.data.clone(),
+                state: layout.state.clone(),
+                cache: layout.cache.clone(),
+                temporary: layout.temporary.clone(),
+                runtime: layout.runtime.clone(),
+            },
+        )
+        .unwrap();
+        let (_, _, _, _, result) = run_lua_script_with_application_sandbox(
+            "assert(hyber.app.data_dir() == '/users/root/.local/share/editor'); assert(not pcall(hyber.fs.open, '/users/root/.local/share/other/secret', 'r')); assert(not hyber.ns.exists('/users/root/.local/share/other/secret'))",
+            VFS::new(),
+            namespace,
+            HandleManager::new(),
+            objects,
+            Arc::new(Mutex::new(processes)),
+            pid,
+            SecurityContext::root(),
+            None,
+            layout,
+            sandbox,
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
 
     #[test]
     fn metadata_cannot_bypass_private_parent_directory() {

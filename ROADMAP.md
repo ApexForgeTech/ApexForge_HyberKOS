@@ -3291,6 +3291,30 @@ GUI/background/service policy is explicit
 package installation can consume this contract unchanged
 ```
 
+## Current Hosted Implementation
+
+`crates/hyber-manifest` defines a strict version-1 TOML model, semantic
+validation, a deny-by-default `GrantPolicy`, approved `ApplicationGrant`,
+logical-root `ApplicationSandbox`, and an ordered upgrade/rollback registry.
+Manifest declarations are requests: no capability, GUI/service mode, network
+policy, or resource amount becomes effective without policy approval. Unknown
+capabilities and malformed/escaping fields fail before launch.
+
+The hosted `hyber run <application-directory>` path parses and validates the
+manifest, derives canonical per-user roots through `AppLayout`, and supplies
+the grant/sandbox to Lua. Lua filesystem, namespace, object metadata,
+access-check, logical directory, and process-spawn APIs consult the sandbox;
+same-user applications cannot cross into sibling application roots. Aggregate
+logical storage is checked at Lua write time against the granted storage quota.
+The current launcher has a deny-by-default policy, so requests for non-empty
+capabilities are rejected pending a trusted package/administrative grant path.
+
+Memory, CPU, and handle requests are validated and policy-bounded but cannot
+yet be enforced by the hosted single-process scheduler/allocator. Direct
+`hyber run file.lua` remains an explicitly trusted Phase-14 developer mode,
+not a manifest application. Phase 17 must persist/sign the registry and add an
+authenticated grant workflow without changing this manifest meaning.
+
 ---
 
 # Special_7 — Service and Network Boundary Preparation

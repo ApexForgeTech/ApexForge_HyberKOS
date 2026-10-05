@@ -1,6 +1,7 @@
 use hyber_core::{Path, ProcessId, SecurityContext};
 use hyber_handle::HandleManager;
 use hyber_layout::{AppLayout, LayoutManager, UserLayout};
+use hyber_manifest::{ApplicationGrant, ApplicationSandbox, StorageRoots};
 use hyber_memfs::MemFSProvider;
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
@@ -23,6 +24,7 @@ pub struct AppContext {
     pub process_id: ProcessId,
     pub security_context: SecurityContext,
     pub app_layout: AppLayout,
+    pub sandbox: Option<ApplicationSandbox>,
 }
 
 impl AppContext {
@@ -31,13 +33,14 @@ impl AppContext {
     }
 
     pub fn new_for_app(app_id: &str) -> Result<Self, String> {
-        Self::for_identity(SecurityContext::root(), UserLayout::root(), app_id)
+        Self::for_identity(SecurityContext::root(), UserLayout::root(), app_id, None)
     }
 
     fn for_identity(
         security_context: SecurityContext,
         user_layout: UserLayout,
         app_id: &str,
+        grant: Option<ApplicationGrant>,
     ) -> Result<Self, String> {
         let mut obj_mgr = ObjectManager::new();
         let mut ns_mgr = NamespaceManager::new(&mut obj_mgr);
@@ -62,6 +65,22 @@ impl AppContext {
             &app_layout,
         )?;
 
+        let sandbox = grant
+            .map(|grant| {
+                ApplicationSandbox::new(
+                    grant,
+                    StorageRoots {
+                        config: app_layout.config.clone(),
+                        data: app_layout.data.clone(),
+                        state: app_layout.state.clone(),
+                        cache: app_layout.cache.clone(),
+                        temporary: app_layout.temporary.clone(),
+                        runtime: app_layout.runtime.clone(),
+                    },
+                )
+            })
+            .transpose()
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             session: None,
             vfs,
@@ -72,6 +91,7 @@ impl AppContext {
             process_id,
             security_context,
             app_layout,
+            sandbox,
         })
     }
 
@@ -83,7 +103,7 @@ impl AppContext {
         let username = session.username().map_err(|e| e.to_string())?;
         let home = session.home().map_err(|e| e.to_string())?;
         let user = UserLayout::new(security.user_id, security.group_id, username, home)?;
-        let mut context = Self::for_identity(security.clone(), user, app_id)?;
+        let mut context = Self::for_identity(security.clone(), user, app_id, None)?;
         context
             .proc_mgr
             .lock()
@@ -94,6 +114,38 @@ impl AppContext {
         context.security_context = security;
         context.session = Some(session);
         Ok(context)
+    }
+
+    pub fn authenticated_for_grant(
+        session: hyber_auth::SessionGuard,
+        grant: ApplicationGrant,
+    ) -> Result<Self, String> {
+        let security = session.context().map_err(|e| e.to_string())?;
+        let username = session.username().map_err(|e| e.to_string())?;
+        let home = session.home().map_err(|e| e.to_string())?;
+        let user = UserLayout::new(security.user_id, security.group_id, username, home)?;
+        let app_id = grant.manifest.app_id.0.clone();
+        let mut context = Self::for_identity(security.clone(), user, &app_id, Some(grant))?;
+        context
+            .proc_mgr
+            .lock()
+            .map_err(|_| "process lock poisoned")?
+            .get_process_mut(context.process_id)
+            .ok_or("process missing")?
+            .security_context = security.clone();
+        context.security_context = security;
+        context.session = Some(session);
+        Ok(context)
+    }
+
+    pub fn developer_for_grant(grant: ApplicationGrant) -> Result<Self, String> {
+        let app_id = grant.manifest.app_id.0.clone();
+        Self::for_identity(
+            SecurityContext::root(),
+            UserLayout::root(),
+            &app_id,
+            Some(grant),
+        )
     }
 }
 
