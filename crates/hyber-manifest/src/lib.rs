@@ -301,6 +301,26 @@ pub struct ApplicationGrant {
     granted_capabilities: BTreeSet<CapabilityName>,
 }
 impl ApplicationGrant {
+    /// Reconstruct a previously approved grant from a durable registry record.
+    /// The caller must already be a trusted registry loader; this method still
+    /// validates that no capability outside the application's original request
+    /// can be resurrected from storage.
+    pub fn from_approved_capabilities(
+        manifest: Manifest,
+        granted_capabilities: BTreeSet<CapabilityName>,
+    ) -> Result<Self, ManifestError> {
+        manifest.validate()?;
+        if !granted_capabilities.is_subset(&manifest.requested_capabilities) {
+            return Err(ManifestError::Denied(
+                "persisted grant contains an unrequested capability".into(),
+            ));
+        }
+        Ok(Self {
+            manifest,
+            granted_capabilities,
+        })
+    }
+
     pub fn capability_granted(&self, capability: &str) -> bool {
         let cap = CapabilityName(capability.into());
         self.manifest.requested_capabilities.contains(&cap)
@@ -315,6 +335,10 @@ impl ApplicationGrant {
             .requested_capabilities
             .iter()
             .filter(|capability| self.granted_capabilities.contains(*capability))
+    }
+
+    pub fn granted_capability_set(&self) -> BTreeSet<CapabilityName> {
+        self.granted_capabilities().cloned().collect()
     }
 }
 
@@ -678,5 +702,23 @@ mod tests {
                 .version,
             "1.0.0"
         );
+    }
+
+    #[test]
+    fn persisted_grant_cannot_gain_a_capability_not_requested_by_manifest() {
+        let mut m = manifest();
+        m.requested_capabilities
+            .insert(CapabilityName("process.spawn".into()));
+        let restored = ApplicationGrant::from_approved_capabilities(
+            m.clone(),
+            BTreeSet::from([CapabilityName("process.spawn".into())]),
+        )
+        .unwrap();
+        assert!(restored.capability_granted("process.spawn"));
+        assert!(ApplicationGrant::from_approved_capabilities(
+            m,
+            BTreeSet::from([CapabilityName("network.outbound".into())]),
+        )
+        .is_err());
     }
 }

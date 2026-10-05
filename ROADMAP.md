@@ -3412,90 +3412,378 @@ redefine them or freeze the future multi-language ABI.
 
 ---
 
-# 18.1 — Package Format
+# 18.1 — Scope, Authority, and Non-Goals
 
-Define:
+Phase 17 is a signed local-package implementation, not a network package
+ecosystem and not a replacement for the future application ABI. Its authority
+boundary is explicit:
 
 ```text
-package metadata
-application ID and runtime/language
-files
-permissions
-capabilities and data scopes
-dependencies
-entrypoint
-service/background policy
-signature
+untrusted package bytes
+        ↓ parse + size/path validation
+signed package identity and immutable payload digest
+        ↓ trusted repository/key policy
+dependency solution
+        ↓ authenticated administrator authorization
+transactional installer and durable registry
+        ↓
+/apps/<app-id>/<version>/ and registered ApplicationGrant
 ```
+
+The package manager owns package identity, archive validation, signatures,
+repository indexes, dependency resolution, installation transactions,
+activation, rollback, removal, and package ownership. It consumes, but must
+not redefine:
+
+```text
+Special_1 / 2  → Hyber identities, authenticated administrator context
+Special_3      → /apps and per-user/service data layout
+Special_6      → Manifest, GrantPolicy, ApplicationGrant, sandbox meaning
+Special_7      → service payload contract validation
+Special_8      → migration decisions and cross-layer gate evidence
+```
+
+Phase 17 does **not** implement a remote downloader, transparent update
+agent, service supervisor, process launcher, native executable loader,
+network transport, package repository federation, GUI store, or public ABI.
+Go and native package payloads may be represented and verified, but their
+execution remains owned by later runtime/service phases.
 
 ---
 
-# 18.2 — Package Object
+# 18.2 — Package Identity and Canonical Format
 
-Introduce:
+Create `crates/hyber-package-format` as a pure, I/O-free format crate and
+`crates/hyber-package` as the trusted repository/installer/registry crate.
+Create `applications/hyber-pkg` only after those libraries have tested APIs.
+
+A package identity is never a host filename:
 
 ```text
-Package Object
+PackageId      → validated publisher-qualified logical package name
+PackageVersion → strict major.minor.patch version
+PackageKey     → (PackageId, PackageVersion)
+PayloadDigest  → SHA-256 of the canonical payload
 ```
+
+The initial `.hybp` container must be deterministic and bounded. It contains:
+
+```text
+fixed header                 magic, format version, lengths, payload digest
+canonical package manifest   UTF-8, deterministic field/order encoding
+application manifest         exact validated `hyber.toml` bytes
+file table                   normalized relative destination + size + digest
+file payloads                byte-exact application assets
+signature envelope           algorithm, key id, signature over canonical bytes
+```
+
+The format specifies little-endian integer widths, maximum package/manifest/
+file/count/path sizes, exact signed byte sequence, and forward compatibility.
+Rust structs, `HashMap` iteration, pointers, host permissions, inode numbers,
+host paths, archive extraction behavior, and timestamps must not define bytes
+on disk.
+
+There is exactly one application manifest per application package in the
+initial format. Its `app_id`, version, runtime, entrypoint, storage requests,
+execution mode, capabilities, network intent, and resource requests remain
+the Special_6 meaning; package metadata cannot override or silently augment
+them. Package version must equal application manifest version for v1.
+
+File destinations are relative to the package root and must reject absolute
+paths, empty components, `.`, `..`, separators from another platform, control
+characters, duplicates after normalization, reserved installer paths, and
+entrypoints that are absent or not regular payload files. All package-owned
+files are immutable installation content below:
+
+```text
+/apps/<app-id>/<version>/
+```
+
+Activation is a registry selection, not mutable overwriting of an old active
+directory. `/apps/<app-id>/current` remains a resolver concept until the VFS
+has a safe link/indirection abstraction; it must not be implemented as a host
+symlink.
 
 ---
 
-# 18.3 — Repository
+# 18.3 — Publisher Keys, Signatures, and Trust Policy
 
-Create a local repository first.
+Use a current, well-reviewed asymmetric signature scheme (Ed25519 for v1).
+The signature covers the exact canonical header/manifest/file-table/payload
+bytes and includes an algorithm identifier and stable key fingerprint. A raw
+hash, MAC, filename, self-declared publisher, or host file ownership is not a
+signature.
 
-Example:
+Define a trusted key store with:
+
+```text
+PublisherId / KeyId
+public key
+key state: trusted | revoked | disabled
+authorization scope: publisher and optional package-id prefix
+introduced/revoked metadata and audit reason
+```
+
+Package-provided keys are untrusted hints only. Key import/revocation and any
+policy that grants requested application capabilities require an authenticated
+administrator capability. Verification fails closed for unknown, disabled,
+revoked, wrong-publisher, wrong-scope, malformed, or algorithm-unsupported
+keys. Private signing keys never enter a repository, package registry, app
+namespace, trace output, or error message.
+
+The local development workflow may use an explicitly named development trust
+root. It must be visibly distinct from production trust and cannot be enabled
+implicitly by an unsigned-package fallback.
+
+---
+
+# 18.4 — Builder and Verification Pipeline
+
+Provide a deterministic builder that consumes a staging directory and creates
+a `.hybp` artifact. The builder must:
+
+```text
+read + validate hyber.toml
+validate declared package manifest
+walk only regular files under the staging root
+sort normalized paths bytewise
+reject links, special files, duplicate/colliding paths, and size overflow
+verify entrypoint presence and runtime-specific extension rules
+compute every file digest and canonical payload digest
+sign only the defined canonical byte sequence
+write output atomically; never overwrite without explicit force
+```
+
+`verify` must be read-only and perform the same parsing, bounds, path, digest,
+manifest, signature, trust-scope, and cross-record checks before reporting a
+package valid. It must not extract files, modify the registry, activate an
+application, call Lua, or contact a network service.
+
+---
+
+# 18.5 — Local Repository
+
+The initial repository is a local, administrator-owned collection:
 
 ```text
 repository/
-├── packages/
-└── metadata/
+├── packages/                 immutable <digest>.hybp artifacts
+├── index/                    signed/canonical package availability metadata
+├── keys/                     trusted public-key policy (not private keys)
+└── staging/                  transaction-private, cleaned on recovery
 ```
+
+Repository paths are configuration values validated by the trusted manager;
+package identifiers cannot select arbitrary host paths. Import copies or
+atomically places a verified immutable artifact addressed by digest. A bad
+artifact never becomes index-visible. Re-importing identical bytes is
+idempotent; attempting to associate one `(PackageId, version)` with a
+different digest fails until an explicit administrative migration decision is
+recorded.
+
+Repository index records contain package key, digest, publisher/key identity,
+dependency declarations, application identity/version, and format version.
+Indexes are deterministic and validated against their artifact on load. The
+repository does not trust filename ordering or host directory iteration.
 
 ---
 
-# 18.4 — Installation
+# 18.6 — Dependencies and Resolution
 
-Implement:
-
-```text
-hyber install package
-```
-
-Flow:
+Dependencies are explicit package-ID constraints, initially limited to strict
+semantic-version ranges with no optional features. Resolve before installation
+or extraction:
 
 ```text
-download
- ↓
-verify
- ↓
-resolve dependencies
- ↓
-install
- ↓
-register package
- ↓
-register application
+requested root packages
+        ↓ candidate filtering by trusted repository/key policy
+        ↓ deterministic version selection
+        ↓ complete directed dependency graph
+        ↓ reject missing/conflicting/cyclic dependency sets
+        ↓ immutable installation plan (keys + digests + order)
 ```
 
-Installation must be atomic or recoverable: failed verification, dependency
-resolution, or extraction must not leave a partially registered application.
-Updates need rollback metadata, and removal must refuse to delete files still
-owned by another installed package.
+The resolver must be deterministic for the same repository snapshot and input,
+must detect integer/version overflow, and must bound package count, graph
+depth, candidate count, and total planned bytes. It may not silently choose an
+unsigned alternative, downgrade an already active package, replace a package
+owned by another publisher, or solve against repository data that changed
+during planning. Dependency packages are installed before dependents; removal
+is refused while reverse dependencies exist unless an explicit, fully resolved
+replacement transaction covers them.
 
 ---
 
-# 18.5 — Phase 17 Exit Criteria
+# 18.7 — Authorization, Grants, and Ownership
 
-A package can be:
+Installing a cryptographically valid package does not automatically grant its
+requested permissions. The installer derives `ApplicationGrant` through the
+existing `GrantPolicy`; only the requested-and-approved capability intersection
+is stored. The registry records:
 
 ```text
-built
-verified
-installed
-updated
-removed
+package key + digest + publisher/key identity
+application id/version + approved ApplicationGrant digest
+installation owner/administrator audit identity
+installed files and their package owner
+dependency and reverse-dependency edges
+active version and retained rollback candidates
+transaction generation/state
 ```
+
+The installer must verify that one application ID has one active package
+owner. A package cannot claim another package's files, application identity,
+service identity, or user/service data tree. Installation writes only `/apps`
+and registry-controlled metadata; it never deletes or adopts user config,
+data, state, cache, runtime, temporary, service data, shared data, accounts,
+or credentials. Those are owned by Special_1–3 policies.
+
+If the package declares a service mode, Phase 17 validates it against the
+Special_7 contract and records it for Phase 18. It does not start it.
+
+---
+
+# 18.8 — Transactional Installation and Recovery
+
+Installation is an explicit durable state machine:
+
+```text
+planned → verified → staged → files-written → registry-prepared
+       → activated → committed
+                         ↓ failure/crash
+                    rollback or recover
+```
+
+Every acknowledged install/update/remove writes enough journal/registry state
+to recover after interruption. Validate artifact/trust/dependencies/grants and
+reserve ownership before writing package files. Extract into a private,
+bounded staging destination, re-check digests, write the inactive registry
+generation, atomically publish the active generation, then clean superseded
+staging data. No partially extracted tree or half-registered application may
+be dispatchable.
+
+At startup/reopen, recovery deterministically finishes cleanup or restores the
+last committed registry generation. It must never invent a package, activate
+unverified bytes, discard a committed installation, or use host filesystem
+rename/link semantics as the only correctness mechanism. HyberFS snapshot
+transactions are used when present; the hosted backend must provide an
+equivalent validated recovery boundary before Phase 17 claims durability.
+
+---
+
+# 18.9 — Update, Rollback, and Removal
+
+Updates are new immutable versions, never in-place file mutation. The
+candidate must verify, resolve with all dependents, satisfy a monotonic version
+policy, receive a fresh grant decision, and create a rollback record before
+activation. Rollback selects a retained verified version and its recorded
+grant; it does not re-evaluate historical policy silently or revive a revoked
+artifact without explicit administrator approval.
+
+Removal verifies administrator authority, package ownership, active/reverse
+dependency constraints, and absence of a replacement requirement. It removes
+only files exclusively owned by that package and its registry records in a
+transaction. Shared files are prohibited in v1 rather than reference-counted
+implicitly. Removal never erases application/user/service data; a separately
+audited data-cleanup policy belongs to a later lifecycle phase.
+
+---
+
+# 18.10 — Package Object and Public Internal API
+
+Introduce a `Package Object` in the Hyber object model only when it has a
+defined owner, lifecycle, namespace exposure, and access checks. The hosted
+Phase 17 registry may represent package records as validated persistent data
+first; it must not add a placeholder ObjectType with no semantics.
+
+The internal Rust API exposes typed requests/results for:
+
+```text
+build, inspect, verify, import
+list repository candidates, resolve
+install, update, rollback, remove
+list/inspect installed packages and transaction recovery
+```
+
+Errors distinguish invalid format, size/path violation, digest mismatch,
+unknown/revoked key, bad signature, trust denial, manifest/grant denial,
+dependency conflict/cycle/missing node, ownership conflict, insufficient
+space, busy transaction, corruption, unsupported version, and I/O failure.
+Diagnostics never reveal private key material or bypass security boundaries.
+
+---
+
+# 18.11 — CLI and Operator Workflow
+
+After library tests establish the contract, provide a narrow local CLI:
+
+```text
+hyber-pkg build <staging-dir> <artifact>
+hyber-pkg verify <artifact> --trust <store>
+hyber-pkg repo import <artifact>
+hyber-pkg resolve <package[@version]>
+hyber-pkg install <package[@version]>
+hyber-pkg update <package>
+hyber-pkg rollback <package>
+hyber-pkg remove <package>
+hyber-pkg list | inspect <package>
+hyber-pkg recover | check
+```
+
+Administrative operations authenticate through the existing Special_2 boundary
+and report success only after the transaction commits. Developer-mode package
+commands must name their development trust configuration explicitly. The
+existing `hyber` developer CLI remains Phase 14A tooling; it must not become
+an unreviewed package authority by accident.
+
+---
+
+# 18.12 — Testing, Fuzzing, and Acceptance
+
+Test the format separately from I/O and test the manager against an in-memory
+reference repository plus HyberFS reopen/fault-injection scenarios. Required
+coverage includes:
+
+```text
+deterministic build and parse round trips
+malformed/truncated/oversized headers, manifests, tables, and payloads
+path traversal, duplicate normalization, link/special-file rejection
+per-file and full-payload digest mismatch
+unknown, wrong-scope, revoked, disabled, and malformed signature keys
+dependency ordering, missing/conflicting/cyclic graph rejection
+grant denial and application/service identity mismatch
+install/update/rollback/remove ownership and reverse-dependency rules
+crash injection at every transaction boundary and deterministic recovery
+registry corruption, stale staging cleanup, and remount persistence
+property/fuzz tests with bounded resource consumption
+```
+
+No test may rely on host directory enumeration order, host UID/GID, host
+inodes, host paths as Hyber paths, or a live network service.
+
+---
+
+# 18.13 — Phase 17 Exit Criteria
+
+Phase 17 is complete only when a trusted local operator can:
+
+```text
+build a deterministic signed package
+verify it independently against a scoped trusted key
+import it into a local repository
+resolve a complete deterministic dependency plan
+install it transactionally with an explicit ApplicationGrant
+activate an approved version without mutable in-place replacement
+update and rollback without losing the previous committed version
+refuse unsafe removal and remove an unreferenced package safely
+recover deterministically after injected interruption
+inspect package ownership, grants, dependencies, and transaction state
+```
+
+All format, repository, resolver, installer, rollback, corruption, security,
+Special_1–8 integration, workspace, and lint tests must pass. Phase 17 does
+not claim remote distribution, automatic updates, package ecosystem
+federation, service execution, or a final public ABI.
 
 ---
 

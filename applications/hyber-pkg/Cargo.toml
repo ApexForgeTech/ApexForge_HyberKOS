@@ -1,0 +1,16 @@
+[package]
+name = "hyber-pkg"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 17 local Hyber package artifact tool"
+
+[[bin]]
+name = "hyber-pkg"
+path = "src/main.rs"
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+hyber-core = { path = "../../crates/hyber-core" }
+hyber-package = { path = "../../crates/hyber-package" }
+hyber-package-format = { path = "../../crates/hyber-package-format" }
+

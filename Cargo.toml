@@ -18,5 +18,8 @@ members = [
     "crates/hyber-auth",
     "crates/hyber-layout", "crates/hyber-manifest", "crates/hyber-service-contract",
     "crates/hyber-gate",
+    "crates/hyber-package-format",
+    "crates/hyber-package",
+    "applications/hyber-pkg",
 ]
 resolver = "2"

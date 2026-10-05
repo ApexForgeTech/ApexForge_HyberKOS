@@ -1,0 +1,12 @@
+[package]
+name = "hyber-package"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 17 trusted local package repository, resolver, and registry"
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+hyber-core = { path = "../hyber-core" }
+hyber-manifest = { path = "../hyber-manifest" }
+hyber-package-format = { path = "../hyber-package-format" }
+sha2 = "0.10"
