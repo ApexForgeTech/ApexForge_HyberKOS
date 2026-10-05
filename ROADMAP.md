@@ -3349,6 +3349,18 @@ service/socket ownership maps to users/groups
 Phase 18/20 can begin without redefining identity or data paths
 ```
 
+## Current Foundation
+
+`crates/hyber-service-contract` now supplies the versioned, Rust-owned
+pre-supervisor boundary. It validates service/application identity matching,
+Hyber user/group ownership, capability and exact network-policy grants,
+bounded Lua-table definitions, Go payload lifecycle requirements, IPC bounds,
+and deterministic dependency ordering with missing-dependency/cycle rejection.
+It does not start processes or open sockets: those remain Phase 18 and Phase
+20 work. Lua supplies restricted declarative data only; Go payload contracts
+are not host command lines or host socket permissions. See
+`docs/design/service-network-boundary.md`.
+
 ---
 
 # Special_8 — Cross-Layer Integration, Migration, and Gate Review

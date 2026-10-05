@@ -726,10 +726,17 @@ fn build_proc(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'
             "spawn",
             lua.create_function(move |_lua, target: String| {
                 let mut ks = lock(&state)?;
-                if let Some(sandbox) = &ks.sandbox
-                    && !sandbox.capability("process.spawn")
-                {
-                    return Err(lua_err("application lacks process.spawn capability".into()));
+                if let Some(sandbox) = &ks.sandbox {
+                    if !sandbox.capability("process.spawn") {
+                        return Err(lua_err("application lacks process.spawn capability".into()));
+                    }
+                    // A manifest capability is a request, not a host process
+                    // escape hatch.  Until the package/application registry
+                    // can resolve and launch another approved grant, there is
+                    // no safe target identity to inherit here.
+                    return Err(lua_err(
+                        "manifest application process spawning is unavailable before the application registry".into(),
+                    ));
                 }
                 let target_path = Path::parse(&target).normalize();
                 let target_id = ks
@@ -866,6 +873,9 @@ fn build_sec(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
         let state = Arc::clone(&state);
         let cap_fn = lua.create_function(move |_lua, cap: String| {
             let ks = lock(&state)?;
+            if let Some(sandbox) = &ks.sandbox {
+                return Ok(sandbox.capability(&cap));
+            }
             match SecurityManager::check_capability(&ks.security_context, &cap) {
                 Ok(_) => Ok(true),
                 Err(_) => Ok(false),
@@ -978,6 +988,11 @@ fn build_input(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<
             "emit",
             lua.create_function(move |_lua, (kind, code, value): (String, String, i64)| {
                 let mut ks = lock(&state)?;
+                if ks.sandbox.is_some() {
+                    return Err(lua_err(
+                        "manifest applications cannot inject input events".into(),
+                    ));
+                }
                 SecurityManager::check_capability(&ks.security_context, "CAP_INPUT_INJECT")
                     .map_err(lua_err)?;
                 if kind.is_empty() || kind.len() > 32 || code.is_empty() || code.len() > 64 {
@@ -1218,6 +1233,62 @@ mod tests {
         .unwrap();
         let (_, _, _, _, result) = run_lua_script_with_application_sandbox(
             "assert(hyber.app.data_dir() == '/users/root/.local/share/editor'); assert(not pcall(hyber.fs.open, '/users/root/.local/share/other/secret', 'r')); assert(not hyber.ns.exists('/users/root/.local/share/other/secret'))",
+            VFS::new(),
+            namespace,
+            HandleManager::new(),
+            objects,
+            Arc::new(Mutex::new(processes)),
+            pid,
+            SecurityContext::root(),
+            None,
+            layout,
+            sandbox,
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn manifest_sandbox_does_not_inherit_root_capabilities_or_input_injection() {
+        let mut objects = ObjectManager::new();
+        let namespace = NamespaceManager::new(&mut objects);
+        let mut processes = ProcessManager::new();
+        let pid = processes
+            .create_process(&mut objects, None, SecurityContext::root(), None)
+            .unwrap();
+        let layout = AppLayout::new(UserLayout::root(), "editor").unwrap();
+        let manifest = Manifest {
+            format_version: 1,
+            app_id: ApplicationId("editor".into()),
+            version: "1.0.0".into(),
+            publisher: "local".into(),
+            display_name: "Editor".into(),
+            entrypoint: "main.lua".into(),
+            runtime: Runtime::Lua,
+            requested_capabilities: BTreeSet::new(),
+            storage: StorageScopes::default(),
+            execution: ExecutionMode::Background,
+            network: NetworkPolicy::default(),
+            resources: ResourceQuotas {
+                memory_bytes: 1024,
+                cpu_shares: 1,
+                handles: 1,
+                storage_bytes: 1024,
+            },
+        };
+        let sandbox = ApplicationSandbox::new(
+            GrantPolicy::deny_all().approve(manifest).unwrap(),
+            StorageRoots {
+                config: layout.config.clone(),
+                data: layout.data.clone(),
+                state: layout.state.clone(),
+                cache: layout.cache.clone(),
+                temporary: layout.temporary.clone(),
+                runtime: layout.runtime.clone(),
+            },
+        )
+        .unwrap();
+        let (_, _, _, _, result) = run_lua_script_with_application_sandbox(
+            "assert(not hyber.sec.check_capability('CAP_SYS_ADMIN')); assert(not pcall(hyber.input.emit, 'keyboard', 'KEY_A', 1)); assert(not pcall(hyber.proc.spawn, '/apps/other/main.lua'))",
             VFS::new(),
             namespace,
             HandleManager::new(),

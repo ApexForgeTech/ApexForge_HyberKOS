@@ -279,6 +279,16 @@ impl ApplicationGrant {
         self.manifest.requested_capabilities.contains(&cap)
             && self.granted_capabilities.contains(&cap)
     }
+
+    /// Capabilities actually granted to this application.  This is deliberately
+    /// the intersection of the request and trusted policy, never the policy's
+    /// complete capability set.
+    pub fn granted_capabilities(&self) -> impl Iterator<Item = &CapabilityName> {
+        self.manifest
+            .requested_capabilities
+            .iter()
+            .filter(|capability| self.granted_capabilities.contains(*capability))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,18 +316,32 @@ pub struct ApplicationSandbox {
 }
 impl ApplicationSandbox {
     pub fn new(grant: ApplicationGrant, roots: StorageRoots) -> Result<Self, ManifestError> {
-        for root in [
+        let roots_to_validate = [
             &roots.config,
             &roots.data,
             &roots.state,
             &roots.cache,
             &roots.temporary,
             &roots.runtime,
-        ] {
-            if !root.is_absolute || root.components.is_empty() {
+        ];
+        for root in roots_to_validate {
+            if !root.is_absolute || root.components.is_empty() || *root != root.normalize() {
                 return Err(ManifestError::Invalid(
-                    "storage root must be absolute and non-root",
+                    "storage root must be absolute, normalized, and non-root",
                 ));
+            }
+        }
+        for (index, root) in roots_to_validate.iter().enumerate() {
+            for other in roots_to_validate.iter().skip(index + 1) {
+                let root = root.normalize();
+                let other = other.normalize();
+                if root.components.starts_with(&other.components)
+                    || other.components.starts_with(&root.components)
+                {
+                    return Err(ManifestError::Invalid(
+                        "application storage roots must be disjoint",
+                    ));
+                }
             }
         }
         Ok(Self { grant, roots })
@@ -334,6 +358,11 @@ impl ApplicationSandbox {
         }
     }
     pub fn authorize(&self, path: &Path, write: bool) -> Result<StorageClass, ManifestError> {
+        if !path.is_absolute {
+            return Err(ManifestError::Denied(
+                "application paths must be absolute Hyber paths".into(),
+            ));
+        }
         let path = path.normalize();
         for class in [
             StorageClass::Config,
@@ -574,6 +603,16 @@ mod tests {
         assert!(sandbox
             .authorize(&Path::parse("/users/a/.config/editor/a"), false)
             .is_err());
+        assert!(sandbox
+            .authorize(&Path::parse("users/a/.local/share/editor/a"), true)
+            .is_err());
+    }
+    #[test]
+    fn sandbox_rejects_overlapping_storage_roots() {
+        let grant = GrantPolicy::deny_all().approve(manifest()).unwrap();
+        let mut invalid_roots = roots();
+        invalid_roots.cache = Path::parse("/users/a/.local/share/editor/cache");
+        assert!(ApplicationSandbox::new(grant, invalid_roots).is_err());
     }
     #[test]
     fn registry_requires_increasing_versions_and_rolls_back() {

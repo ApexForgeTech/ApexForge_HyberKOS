@@ -353,6 +353,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyber-service-contract"
+version = "0.1.0"
+dependencies = [
+ "hyber-core",
+ "hyber-manifest",
+]
+
+[[package]]
 name = "hyber-shell"
 version = "0.1.0"
 dependencies = [

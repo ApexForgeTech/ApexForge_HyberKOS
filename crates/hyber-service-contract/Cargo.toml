@@ -1,0 +1,8 @@
+[package]
+name = "hyber-service-contract"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyber-core = { path = "../hyber-core" }
+hyber-manifest = { path = "../hyber-manifest" }

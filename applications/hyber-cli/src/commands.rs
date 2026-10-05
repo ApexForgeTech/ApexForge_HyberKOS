@@ -203,6 +203,9 @@ fn script_path(input: &str) -> Result<(PathBuf, Option<manifest::Manifest>), Str
         .canonicalize()
         .map_err(|e| format!("cannot resolve {input}: {e}"))?;
     let manifest = manifest::load(&app_dir)?;
+    if manifest.runtime != hyber_manifest::Runtime::Lua {
+        return Err("this launcher can run only Lua application manifests".into());
+    }
     let entry = app_dir.join(&manifest.entrypoint);
     let canonical_entry = entry
         .canonicalize()
