@@ -160,6 +160,15 @@ impl Manifest {
                 "inbound network policy requires network.inbound capability",
             ));
         }
+        if !self.network.inbound
+            && self
+                .requested_capabilities
+                .contains(&CapabilityName("network.inbound".into()))
+        {
+            return Err(ManifestError::Invalid(
+                "network.inbound capability requires inbound network policy",
+            ));
+        }
         for domain in &self.network.domains {
             validate_domain(domain)?;
         }
@@ -172,6 +181,15 @@ impl Manifest {
                 "service execution requires service.background capability",
             ));
         }
+        if !matches!(self.execution, ExecutionMode::Service)
+            && self
+                .requested_capabilities
+                .contains(&CapabilityName("service.background".into()))
+        {
+            return Err(ManifestError::Invalid(
+                "service.background capability requires service execution",
+            ));
+        }
         if matches!(self.execution, ExecutionMode::Gui)
             && !self
                 .requested_capabilities
@@ -179,6 +197,15 @@ impl Manifest {
         {
             return Err(ManifestError::Invalid(
                 "GUI execution requires gui.window capability",
+            ));
+        }
+        if !matches!(self.execution, ExecutionMode::Gui)
+            && self
+                .requested_capabilities
+                .contains(&CapabilityName("gui.window".into()))
+        {
+            return Err(ManifestError::Invalid(
+                "gui.window capability requires GUI execution",
             ));
         }
         Ok(())
@@ -493,6 +520,8 @@ fn validate_domain(value: &str) -> Result<(), ManifestError> {
         || value.split('.').any(|label| {
             label.is_empty()
                 || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
                 || !label
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -589,6 +618,23 @@ mod tests {
         m.requested_capabilities
             .insert(CapabilityName("process.spawn".into()));
         assert!(GrantPolicy::deny_all().approve(m).is_err());
+    }
+    #[test]
+    fn rejects_capabilities_without_their_declared_policy() {
+        let mut m = manifest();
+        m.requested_capabilities
+            .insert(CapabilityName("network.inbound".into()));
+        assert!(m.validate().is_err());
+        let mut m = manifest();
+        m.requested_capabilities
+            .insert(CapabilityName("service.background".into()));
+        assert!(m.validate().is_err());
+        let mut m = manifest();
+        m.network.outbound = true;
+        m.network.domains.insert("-invalid.example".into());
+        m.requested_capabilities
+            .insert(CapabilityName("network.outbound".into()));
+        assert!(m.validate().is_err());
     }
     #[test]
     fn sandbox_cannot_escape_or_cross_scope() {

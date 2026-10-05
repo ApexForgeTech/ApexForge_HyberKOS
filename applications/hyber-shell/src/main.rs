@@ -423,14 +423,26 @@ impl HyberShell {
                 self.profiles.load(&name, &source)?;
             }
         }
+        let path = self.history_path.as_ref().ok_or("history unavailable")?;
+        VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, path, false)?;
+        let id = self.vfs.lookup(&self.ns_mgr, path)?;
+        let object = self.obj_mgr.lookup(id).ok_or("history directory missing")?;
+        if object.owner != context.user_id || object.permissions != 0o700 {
+            return Err("history directory is not private".into());
+        }
+        // `history save on` is a user request, not merely an in-memory switch.
+        // Read its persisted marker before deciding whether the serialized
+        // history should be restored. Profiles can still turn history on; an
+        // empty state directory remains history-free by default.
+        let saved_enabled = matches!(
+            self.obj_mgr
+                .get_metadata_secure(id, &context, "shell.history.enabled")?,
+            Some(MetadataValue::Boolean(true))
+        );
+        // History navigation belongs to an interactive shell. Batch/script
+        // contexts must not silently consume a user's saved command history.
+        self.profiles.persistent_history |= interactive && saved_enabled;
         if self.profiles.persistent_history {
-            let path = self.history_path.as_ref().ok_or("history unavailable")?;
-            VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, path, false)?;
-            let id = self.vfs.lookup(&self.ns_mgr, path)?;
-            let object = self.obj_mgr.lookup(id).ok_or("history directory missing")?;
-            if object.owner != context.user_id || object.permissions != 0o700 {
-                return Err("history directory is not private".into());
-            }
             if let Some(MetadataValue::String(text)) =
                 self.obj_mgr
                     .get_metadata_secure(id, &context, "shell.history")?
@@ -515,6 +527,12 @@ impl HyberShell {
                     &context,
                     "shell.history",
                     MetadataValue::String(text),
+                )?;
+                objects.set_metadata_secure(
+                    id,
+                    &context,
+                    "shell.history.enabled",
+                    MetadataValue::Boolean(true),
                 )
             },
         )
@@ -602,7 +620,25 @@ impl HyberShell {
             }
             ["save", "off"] => {
                 self.profiles.persistent_history = false;
-                Ok(())
+                let context = self.current_security_context()?;
+                let path = self
+                    .history_path
+                    .as_ref()
+                    .ok_or("history unavailable for this identity")?;
+                self.vfs.mutate_metadata(
+                    &self.ns_mgr,
+                    &mut self.obj_mgr,
+                    &context,
+                    path,
+                    |objects, id| {
+                        objects.set_metadata_secure(
+                            id,
+                            &context,
+                            "shell.history.enabled",
+                            MetadataValue::Boolean(false),
+                        )
+                    },
+                )
             }
             ["exclude", pattern] => self.input.exclude(pattern),
             ["search", query] => {

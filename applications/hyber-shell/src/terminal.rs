@@ -3,7 +3,7 @@ use hyber_shell::{
     input::{Controller, Event, Outcome},
     profiles::Profiles,
 };
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 struct Raw(libc::termios);
 impl Raw {
@@ -34,32 +34,79 @@ impl Drop for Raw {
         let _ = io::stdout().flush();
     }
 }
-fn byte(input: &mut impl Read) -> io::Result<Option<u8>> {
+/// Read directly from the terminal fd. `std::io::Stdin` may buffer several
+/// keys, while `poll(2)` only sees bytes still in the kernel queue; mixing the
+/// two makes adjacent CSI sequences such as Up/Up/Down unreliable.
+fn byte() -> io::Result<Option<u8>> {
     let mut b = [0];
-    match input.read(&mut b)? {
+    // SAFETY: fd 0 is the shell's stdin and `b` is a valid one-byte output
+    // buffer for the duration of this syscall.
+    match unsafe { libc::read(0, b.as_mut_ptr().cast(), b.len()) } {
         0 => Ok(None),
-        _ => Ok(Some(b[0])),
+        1 => Ok(Some(b[0])),
+        _ if std::io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => byte(),
+        _ => Err(io::Error::last_os_error()),
     }
 }
-fn ready() -> bool {
+/// Escape sequences can be fragmented by a terminal multiplexer, remote PTY,
+/// or scheduler. A short probe turns a delayed `ESC [ A` into literal
+/// `[A` input.  Keep the wait bounded so a literal Escape still cannot stall
+/// the shell indefinitely, but long enough for a normal fragmented sequence.
+const ESCAPE_SEQUENCE_WAIT_MS: i32 = 300;
+const ESCAPE_SEQUENCE_CONTINUATION_WAIT_MS: i32 = 1_000;
+
+fn ready(timeout_ms: i32) -> bool {
     let mut fd = libc::pollfd {
         fd: 0,
         events: libc::POLLIN,
         revents: 0,
     };
     // SAFETY: a single valid pollfd entry, short bounded timeout.
-    unsafe { libc::poll(&mut fd, 1, 40) > 0 }
+    unsafe { libc::poll(&mut fd, 1, timeout_ms) > 0 }
 }
+
+const KEY_RIGHT: u8 = 0x80;
+const KEY_LEFT: u8 = 0x81;
+const KEY_HOME: u8 = 0x82;
+const KEY_END: u8 = 0x83;
+const KEY_DELETE: u8 = 0x84;
+const KEY_BRACKETED_PASTE: u8 = 0x85;
+
+fn escape_sequence_complete(sequence: &[u8]) -> bool {
+    sequence.len() > 1
+        && matches!(
+            sequence.last(),
+            Some(byte) if byte.is_ascii_alphabetic() || *byte == b'~'
+        )
+}
+
+fn escape_key(sequence: &[u8]) -> Option<u8> {
+    match sequence {
+        b"[A" => Some(16),
+        b"[B" => Some(14),
+        b"[C" => Some(KEY_RIGHT),
+        b"[D" => Some(KEY_LEFT),
+        b"[H" | b"[1~" => Some(KEY_HOME),
+        b"[F" | b"[4~" => Some(KEY_END),
+        b"[3~" => Some(KEY_DELETE),
+        b"[200~" => Some(KEY_BRACKETED_PASTE),
+        _ => None,
+    }
+}
+
 pub fn read(
     controller: &mut Controller,
     profiles: &mut Profiles,
     prompt: &str,
 ) -> Result<Option<String>, String> {
     let _raw = Raw::enter().map_err(|e| e.to_string())?;
-    let mut input = io::stdin();
     let mut out = io::stdout();
     out.write_all(b"\x1b[?2004h").map_err(|e| e.to_string())?;
     let mut search = None;
+    // Retain a partially-read CSI sequence across reads. Some PTYs expose
+    // `ESC`, `[`, and `A` in separate readiness notifications; discarding the
+    // partial `[` was the source of literal `[A` commands.
+    let mut pending_escape = Vec::new();
     loop {
         // Position by printing the prefix again, avoiding incorrect byte-based
         // cursor movement for UTF-8/wide glyphs.
@@ -71,9 +118,51 @@ pub fn read(
         )
         .map_err(|e| e.to_string())?;
         out.flush().map_err(|e| e.to_string())?;
-        let Some(b) = byte(&mut input).map_err(|e| e.to_string())? else {
+        let Some(mut b) = byte().map_err(|e| e.to_string())? else {
             return Ok(None);
         };
+        if !pending_escape.is_empty() {
+            pending_escape.push(b);
+            if !escape_sequence_complete(&pending_escape) {
+                if pending_escape.len() >= 8 {
+                    pending_escape.clear();
+                }
+                continue;
+            }
+            let sequence = std::mem::take(&mut pending_escape);
+            let Some(key) = escape_key(&sequence) else {
+                continue;
+            };
+            b = key;
+        } else if b == 27 {
+            let mut sequence = Vec::new();
+            while sequence.len() < 8
+                && ready(if sequence.first() == Some(&b'[') {
+                    ESCAPE_SEQUENCE_CONTINUATION_WAIT_MS
+                } else {
+                    ESCAPE_SEQUENCE_WAIT_MS
+                })
+            {
+                let Some(byte) = byte().map_err(|e| e.to_string())? else {
+                    break;
+                };
+                sequence.push(byte);
+                if escape_sequence_complete(&sequence) {
+                    break;
+                }
+            }
+            if sequence.is_empty() {
+                continue;
+            }
+            if !escape_sequence_complete(&sequence) {
+                pending_escape = sequence;
+                continue;
+            }
+            let Some(key) = escape_key(&sequence) else {
+                continue;
+            };
+            b = key;
+        }
         let (key, mut event) = match b {
             b'\r' | b'\n' => ("Enter", Event::Submit),
             3 => ("CtrlC", Event::Cancel),
@@ -121,61 +210,43 @@ pub fn read(
                 }
                 continue;
             }
-            27 => {
-                let mut seq = Vec::new();
-                while seq.len() < 8 && ready() {
-                    if let Some(c) = byte(&mut input).map_err(|e| e.to_string())? {
-                        seq.push(c);
-                        if seq.len() > 1 && (c.is_ascii_alphabetic() || c == b'~') {
-                            break;
+            KEY_RIGHT => ("Right", Event::Right),
+            KEY_LEFT => ("Left", Event::Left),
+            KEY_HOME => ("Home", Event::Home),
+            KEY_END => ("End", Event::End),
+            KEY_DELETE => ("Delete", Event::Delete),
+            KEY_BRACKETED_PASTE => {
+                let mut paste = Vec::new();
+                let mut oversized = false;
+                let mut tail = Vec::new();
+                loop {
+                    let Some(c) = byte().map_err(|e| e.to_string())? else {
+                        return Ok(None);
+                    };
+                    tail.push(c);
+                    if tail.len() > 6 {
+                        tail.remove(0);
+                    }
+                    if !oversized {
+                        paste.push(c);
+                        oversized = paste.len() > 4096 + 6;
+                    }
+                    if tail == b"\x1b[201~" {
+                        if !oversized {
+                            paste.truncate(paste.len() - 6);
                         }
-                    } else {
                         break;
                     }
                 }
-                match seq.as_slice() {
-                    b"[A" => ("Up", Event::Previous),
-                    b"[B" => ("Down", Event::Next),
-                    b"[C" => ("Right", Event::Right),
-                    b"[D" => ("Left", Event::Left),
-                    b"[H" | b"[1~" => ("Home", Event::Home),
-                    b"[F" | b"[4~" => ("End", Event::End),
-                    b"[3~" => ("Delete", Event::Delete),
-                    b"[200~" => {
-                        let mut paste = Vec::new();
-                        let mut oversized = false;
-                        let mut tail = Vec::new();
-                        loop {
-                            let Some(c) = byte(&mut input).map_err(|e| e.to_string())? else {
-                                return Ok(None);
-                            };
-                            tail.push(c);
-                            if tail.len() > 6 {
-                                tail.remove(0);
-                            }
-                            if !oversized {
-                                paste.push(c);
-                                oversized = paste.len() > 4096 + 6;
-                            }
-                            if tail == b"\x1b[201~" {
-                                if !oversized {
-                                    paste.truncate(paste.len() - 6);
-                                }
-                                break;
-                            }
-                        }
-                        // Drain the entire paste before rejecting it: its remaining
-                        // newlines must never become subsequent command submissions.
-                        if oversized {
-                            return Err("paste too large".into());
-                        }
-                        let text = String::from_utf8(paste).map_err(|_| "invalid UTF-8 paste")?;
-                        // Multiline paste is rejected, never submitted automatically.
-                        let _ = controller.dispatch(Event::Insert(text));
-                        continue;
-                    }
-                    _ => continue,
+                // Drain the entire paste before rejecting it: its remaining
+                // newlines must never become subsequent command submissions.
+                if oversized {
+                    return Err("paste too large".into());
                 }
+                let text = String::from_utf8(paste).map_err(|_| "invalid UTF-8 paste")?;
+                // Multiline paste is rejected, never submitted automatically.
+                let _ = controller.dispatch(Event::Insert(text));
+                continue;
             }
             b if b >= 32 => {
                 let count = if b < 128 {
@@ -189,7 +260,7 @@ pub fn read(
                 };
                 let mut bytes = vec![b];
                 for _ in 1..count {
-                    if let Some(c) = byte(&mut input).map_err(|e| e.to_string())? {
+                    if let Some(c) = byte().map_err(|e| e.to_string())? {
                         bytes.push(c);
                     }
                 }
