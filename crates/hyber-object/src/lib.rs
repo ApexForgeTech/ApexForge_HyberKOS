@@ -51,7 +51,7 @@ impl Object {
     pub fn new(id: ObjectId, object_type: ObjectType) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .unwrap_or_default()
             .as_secs();
 
         let permissions = if object_type == ObjectType::Directory {
@@ -95,7 +95,10 @@ impl ObjectManager {
     // Create a new object and return its ID
     pub fn create_object(&mut self, object_type: ObjectType) -> ObjectId {
         let id = ObjectId(self.next_id);
-        self.next_id += 1;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("ObjectId space exhausted");
 
         let object = Object::new(id, object_type);
         self.objects.insert(id, object);
@@ -119,8 +122,11 @@ impl ObjectManager {
     /// Returns false if the object is already destroyed / does not exist.
     pub fn retain(&mut self, id: ObjectId) -> bool {
         if let Some(obj) = self.objects.get_mut(&id) {
-            if obj.state == ObjectState::Live {
-                obj.references += 1;
+            if obj.state == ObjectState::Live && obj.references > 0 {
+                let Some(next) = obj.references.checked_add(1) else {
+                    return false;
+                };
+                obj.references = next;
                 return true;
             }
         }
@@ -133,9 +139,10 @@ impl ObjectManager {
     /// Returns true when the object transitions to Destroyed.
     pub fn release(&mut self, id: ObjectId) -> bool {
         if let Some(obj) = self.objects.get_mut(&id) {
-            if obj.references > 0 {
-                obj.references -= 1;
+            if obj.references == 0 {
+                return false;
             }
+            obj.references -= 1;
 
             if obj.references == 0 {
                 obj.state = ObjectState::Destroyed;
@@ -151,7 +158,10 @@ impl ObjectManager {
     /// Returns false if the object does not exist.
     pub fn retain_weak(&mut self, id: ObjectId) -> bool {
         if let Some(obj) = self.objects.get_mut(&id) {
-            obj.weak_references += 1;
+            let Some(next) = obj.weak_references.checked_add(1) else {
+                return false;
+            };
+            obj.weak_references = next;
             return true;
         }
         false
@@ -173,7 +183,7 @@ impl ObjectManager {
     pub fn upgrade_weak(&mut self, id: ObjectId) -> Option<ObjectId> {
         if let Some(obj) = self.objects.get_mut(&id) {
             if obj.state == ObjectState::Live && obj.references > 0 {
-                obj.references += 1;
+                obj.references = obj.references.checked_add(1)?;
                 return Some(id);
             }
         }
@@ -187,7 +197,7 @@ impl ObjectManager {
     /// Weak references are tolerated — they simply become dangling observations.
     pub fn destroy(&mut self, id: ObjectId) -> bool {
         if let Some(obj) = self.objects.get(&id) {
-            if obj.state == ObjectState::Destroyed || obj.references == 0 {
+            if obj.state == ObjectState::Destroyed && obj.references == 0 {
                 self.objects.remove(&id);
                 return true;
             }
@@ -196,6 +206,59 @@ impl ObjectManager {
     }
 
     // ── 9.3 Metadata API ─────────────────────────────────────────────────────
+
+    /// Change basic mode bits. Write access to content does not grant the
+    /// ability to change its access policy: only the owner or an admin may.
+    pub fn chmod(
+        &mut self,
+        id: ObjectId,
+        context: &hyber_core::SecurityContext,
+        mode: u32,
+    ) -> Result<(), String> {
+        if mode & !0o777 != 0 {
+            return Err("Only owner/group/other rwx bits are supported".into());
+        }
+        let obj = self.objects.get_mut(&id).ok_or("Object not found")?;
+        if obj.state != ObjectState::Live {
+            return Err("Object is not live".into());
+        }
+        if context.user_id != obj.owner {
+            hyber_core::SecurityManager::check_capability(context, "CAP_SYS_ADMIN")?;
+        }
+        obj.permissions = mode;
+        obj.modified_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Ok(())
+    }
+
+    /// A non-admin owner may assign only one of their own Hyber groups.
+    /// Administrative callers must resolve the target against the registry.
+    pub fn chgrp(
+        &mut self,
+        id: ObjectId,
+        context: &hyber_core::SecurityContext,
+        group: GroupId,
+    ) -> Result<(), String> {
+        let obj = self.objects.get_mut(&id).ok_or("Object not found")?;
+        if obj.state != ObjectState::Live {
+            return Err("Object is not live".into());
+        }
+        let admin = hyber_core::SecurityManager::check_capability(context, "CAP_SYS_ADMIN").is_ok();
+        if !admin
+            && (context.user_id != obj.owner
+                || (group != context.group_id && !context.supplementary_groups.contains(&group)))
+        {
+            return Err("Only the owner may select one of their groups".into());
+        }
+        obj.group = group;
+        obj.modified_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Ok(())
+    }
 
     /// Get a specific extended metadata value
     pub fn get_metadata(&self, id: ObjectId, key: &str) -> Option<&MetadataValue> {
@@ -245,10 +308,12 @@ impl ObjectManager {
     }
 
     fn validate_metadata_key(key: &str) -> Result<(), String> {
-        let (_namespace, name) = key
+        let (namespace, name) = key
             .split_once('.')
             .ok_or("Metadata keys must use the 'namespace.name' form")?;
-        if name.is_empty()
+        if namespace.is_empty()
+            || name.is_empty()
+            || key.split('.').any(str::is_empty)
             || key.len() > 255
             || !key
                 .bytes()
@@ -271,6 +336,49 @@ impl Default for ObjectManager {
 mod tests {
     use super::*;
     use hyber_core::ObjectType;
+
+    #[test]
+    fn reference_overflow_and_inconsistent_destruction_are_rejected() {
+        let mut mgr = ObjectManager::new();
+        let id = mgr.create_object(ObjectType::File);
+        mgr.lookup_mut(id).unwrap().references = u64::MAX;
+        assert!(!mgr.retain(id));
+        assert!(mgr.upgrade_weak(id).is_none());
+        assert_eq!(mgr.lookup(id).unwrap().references, u64::MAX);
+        mgr.lookup_mut(id).unwrap().state = ObjectState::Destroyed;
+        assert!(!mgr.destroy(id));
+        mgr.lookup_mut(id).unwrap().references = 1;
+        assert!(mgr.release(id));
+        assert!(!mgr.release(id));
+        assert!(mgr.destroy(id));
+    }
+
+    #[test]
+    fn permission_changes_require_ownership_and_group_membership() {
+        let mut mgr = ObjectManager::new();
+        let id = mgr.create_object(ObjectType::File);
+        mgr.lookup_mut(id).unwrap().owner = UserId(1000);
+        let mut user = hyber_core::SecurityContext {
+            user_id: UserId(1001),
+            group_id: GroupId(1001),
+            supplementary_groups: vec![GroupId(2000)],
+            capabilities: vec![],
+        };
+        assert!(mgr.chmod(id, &user, 0o777).is_err());
+        assert!(mgr.chgrp(id, &user, GroupId(2000)).is_err());
+        user.user_id = UserId(1000);
+        assert!(mgr.chmod(id, &user, 0o4755).is_err());
+        mgr.chmod(id, &user, 0o640).unwrap();
+        assert!(mgr.chgrp(id, &user, GroupId(0)).is_err());
+        mgr.chgrp(id, &user, GroupId(2000)).unwrap();
+        assert_eq!(mgr.lookup(id).unwrap().permissions, 0o640);
+        assert_eq!(mgr.lookup(id).unwrap().group, GroupId(2000));
+        for key in [".name", "user.", "user..name"] {
+            assert!(mgr
+                .set_metadata(id, key, MetadataValue::Boolean(true))
+                .is_err());
+        }
+    }
 
     #[test]
     fn strong_ref_lifecycle() {

@@ -717,6 +717,17 @@ impl SessionGuard {
             .map(|account| account.username.clone())
             .ok_or(AuthError::InvalidSession)
     }
+    /// Resolve a Hyber group name for authenticated ownership operations.
+    pub fn group_id(&self, name: &str) -> Result<hyber_core::GroupId, AuthError> {
+        self.context()?;
+        let mut service = self.service.lock().map_err(|_| AuthError::Unavailable)?;
+        service.context(&self.token)?;
+        service
+            .accounts
+            .group_by_name(name)
+            .map(|group| group.id)
+            .ok_or(AuthError::InvalidInput)
+    }
     pub fn logout(&self) -> Result<(), AuthError> {
         self.service
             .lock()

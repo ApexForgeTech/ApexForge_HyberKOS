@@ -462,6 +462,8 @@ impl HyberShell {
             // Standard Base Commands
             "pwd" => self.cmd_pwd(args),
             "whoami" => self.cmd_whoami(args),
+            "chmod" => self.cmd_chmod(args),
+            "chgrp" => self.cmd_chgrp(args),
             "cd" => self.cmd_cd(args),
             "ls" => self.cmd_ls(args),
             "mkdir" => self.cmd_mkdir(args),
@@ -1442,6 +1444,52 @@ impl HyberShell {
         Ok(())
     }
 
+    fn current_security_context(&self) -> Result<SecurityContext, String> {
+        if let Some(session) = &self.session {
+            return session.context().map_err(|error| error.to_string());
+        }
+        self.proc_mgr
+            .lock()
+            .map_err(|_| "process manager unavailable")?
+            .get_process(self.process_id)
+            .map(|process| process.security_context.clone())
+            .ok_or_else(|| "shell process missing".into())
+    }
+
+    fn cmd_chmod(&mut self, args: &[&str]) -> Result<(), String> {
+        if args.len() != 2
+            || args[0].is_empty()
+            || args[0].len() > 4
+            || !args[0].bytes().all(|b| matches!(b, b'0'..=b'7'))
+        {
+            return Err("Usage: chmod <octal-mode: 000..777> <path>".into());
+        }
+        let mode = u32::from_str_radix(args[0], 8).map_err(|_| "invalid mode")?;
+        let context = self.current_security_context()?;
+        let path = self.resolve_path(args[1]);
+        VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
+        let id = self.vfs.lookup(&self.ns_mgr, &path)?;
+        self.obj_mgr.chmod(id, &context, mode)
+    }
+
+    fn cmd_chgrp(&mut self, args: &[&str]) -> Result<(), String> {
+        if args.len() != 2 {
+            return Err("Usage: chgrp <group-name> <path>".into());
+        }
+        let context = self.current_security_context()?;
+        let group = match &self.session {
+            Some(session) => session
+                .group_id(args[0])
+                .map_err(|error| error.to_string())?,
+            None if args[0] == "root" => GroupId(0),
+            None => return Err("Named groups require an authenticated account registry".into()),
+        };
+        let path = self.resolve_path(args[1]);
+        VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
+        let id = self.vfs.lookup(&self.ns_mgr, &path)?;
+        self.obj_mgr.chgrp(id, &context, group)
+    }
+
     fn cmd_su(&mut self, args: &[&str]) -> Result<(), String> {
         if self.session.is_some() {
             return Err(
@@ -1640,6 +1688,8 @@ impl HyberShell {
         println!("Standard Commands:");
         println!("  pwd                     Print working directory");
         println!("  whoami                  Print current Hyber account name");
+        println!("  chmod <mode> <path>      Set runtime Hyber rwx permissions (octal)");
+        println!("  chgrp <group> <path>     Set runtime Hyber object group");
         println!("  cd <path>               Change directory");
         println!("  ls [-l] [-a] [path]     List directory contents");
         println!("  mkdir [-p] <path>       Create directory");
@@ -1911,7 +1961,23 @@ mod session_tests {
         let mut shell = HyberShell::new(root.clone()).unwrap();
         assert_eq!(shell.whoami_name().unwrap(), "root");
         assert!(shell.cmd_whoami(&["extra"]).is_err());
+        shell.cmd_touch(&["/temporary/permission-test"]).unwrap();
+        shell
+            .cmd_chmod(&["640", "/temporary/permission-test"])
+            .unwrap();
+        shell
+            .cmd_chgrp(&["root", "/temporary/permission-test"])
+            .unwrap();
+        assert!(shell
+            .cmd_chmod(&["4755", "/temporary/permission-test"])
+            .is_err());
         shell.cmd_su(&["1000", "1000"]).unwrap();
+        assert!(shell
+            .cmd_chmod(&["777", "/temporary/permission-test"])
+            .is_err());
+        assert!(shell
+            .cmd_chgrp(&["root", "/temporary/permission-test"])
+            .is_err());
         assert!(shell.whoami_name().is_err());
         assert!(shell.cmd_su(&["0"]).is_err());
         let password = b"temporary shell test password";

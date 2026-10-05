@@ -81,6 +81,40 @@ audit rotation/export is future service infrastructure, not silent truncation.
 
 ## Hosted commands
 
+Run account management from the host terminal using `hyber-auth-tool`; these
+are not shell built-ins. All commands take `<image> <blocks>` immediately after
+the command name. Administrative commands prompt for the Hyber root password.
+
+```text
+users <image> <blocks>                     list accounts, groups, capabilities
+groups <image> <blocks>                    list groups and memberships
+passwd <image> <blocks> <user>              admin password reset
+passwd-self <image> <blocks> <user>         change own password using current password
+group-add <image> <blocks> <group>
+group-delete <image> <blocks> <group>       empty, non-reserved groups only
+group-join <image> <blocks> <user> <group>   add supplementary membership
+group-leave <image> <blocks> <user> <group> remove supplementary membership
+primary-group <image> <blocks> <user> <group>
+capability-grant <image> <blocks> <user> <capability>
+capability-revoke <image> <blocks> <user> <capability>
+user-delete <image> <blocks> <user>
+```
+
+`users` and `groups` also require `<image> <blocks>`. New passwords require
+confirmation. `passwd-self` authenticates the named user and verifies their
+current password; it does not require the root password. The hosted tool still
+requires host permission to open the protected image: it is a trusted adapter,
+not a setuid program or multi-user daemon. Do not relax image permissions to
+expose it to untrusted host users.
+
+Changing the primary group removes the old primary membership and preserves
+unrelated supplementary memberships. User deletion removes credentials and
+group memberships, but never deletes or transfers owned files. IDs are not
+reused. Every mutation is authenticated, validated, and saved before success
+is printed. Failed commands do not save their staged changes. Account edits
+invalidate affected in-memory sessions; a saved store change also invalidates
+hosted guards. List commands do not rewrite the store.
+
 ```sh
 cargo run -p hyber-auth --bin hyber-auth-tool -- init ./identity.img 256
 cargo run -p hyber-auth --bin hyber-auth-tool -- user-add ./identity.img 256 alice

@@ -9,6 +9,40 @@ use std::sync::{
 
 const ROOT_PASSWORD: &[u8] = b"root test password only";
 const USER_PASSWORD: &[u8] = b"alice test password only";
+
+#[test]
+fn group_and_capability_edits_revoke_sessions_and_survive_storage() {
+    let (mut auth, admin, user, clock) = fixture();
+    let token = auth
+        .login("alice", USER_PASSWORD, SessionKind::Interactive, 600)
+        .unwrap();
+    assert!(matches!(
+        auth.edit_accounts(&token, |a| a.grant_capability(user, "CAP_SYS_ADMIN")),
+        Err(AuthError::PermissionDenied)
+    ));
+    let group = auth
+        .edit_accounts(&admin, |a| {
+            let group = a.create_group("editors")?;
+            a.add_to_group(user, group)?;
+            a.set_primary_group(user, group)?;
+            a.revoke_capability(user, "CAP_INPUT_INJECT")?;
+            Ok(group)
+        })
+        .unwrap();
+    assert!(auth.context(&token).is_err());
+    let mut volume = Volume::format(MemDevice::new(64).unwrap()).unwrap();
+    auth.save(&mut volume, STORE_PATH).unwrap();
+    let volume = Volume::mount(volume.unmount().unwrap()).unwrap();
+    let mut loaded = AuthService::load(&volume, STORE_PATH, clock).unwrap();
+    let token = loaded
+        .login("alice", USER_PASSWORD, SessionKind::Interactive, 600)
+        .unwrap();
+    let context = loaded.context(&token).unwrap();
+    assert_eq!(context.group_id, group);
+    assert!(!context.supplementary_groups.contains(&group));
+    assert!(SecurityManager::check_capability(&context, "CAP_INPUT_INJECT").is_err());
+    loaded.accounts().validate().unwrap();
+}
 struct TestClock(AtomicU64);
 impl Clock for TestClock {
     fn now(&self) -> Result<u64, AuthError> {

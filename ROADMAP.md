@@ -2997,6 +2997,12 @@ application namespace. Damaged-slot recovery is refused for credentials.
 hyber-auth-tool init <new-image> <blocks>
 hyber-auth-tool user-add <image> <blocks> <username> [service|guest]
 hyber-auth-tool passwd <image> <blocks> <username>
+hyber-auth-tool passwd-self <image> <blocks> <username>
+hyber-auth-tool users|groups <image> <blocks>
+hyber-auth-tool group-add|group-delete <image> <blocks> <group>
+hyber-auth-tool group-join|group-leave|primary-group <image> <blocks> <username> <group>
+hyber-auth-tool capability-grant|capability-revoke <image> <blocks> <username> <capability>
+hyber-auth-tool user-delete <image> <blocks> <username>
 hyber-auth-tool lock|disable <image> <blocks> <username>
 hyber-auth-tool unlock <image> <blocks> <username> <active|service|guest>
 hyber-auth-tool check <image> <blocks>
@@ -3005,6 +3011,12 @@ hyber run --auth <image> <blocks> <username> <script-or-project>
 ```
 
 Passwords are terminal prompts, never command arguments. The hosted login
+tool confirms new passwords; `passwd-self` verifies the current user's password.
+Administrative group and capability mutations require root authentication and
+pass through `AuthService::edit_accounts` before durable save. Shell `chmod`
+and `chgrp` enforce object ownership and group membership but currently modify
+runtime metadata only; persistent HostFS metadata remains Special_3 work.
+The hosted login
 adapter detects persisted store changes and invalidates its old session.
 It is a single-process authority adapter, not the future IPC login daemon.
 Existing no-argument development shell/CLI modes remain trusted bootstrap
