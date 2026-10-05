@@ -3014,8 +3014,8 @@ Passwords are terminal prompts, never command arguments. The hosted login
 tool confirms new passwords; `passwd-self` verifies the current user's password.
 Administrative group and capability mutations require root authentication and
 pass through `AuthService::edit_accounts` before durable save. Shell `chmod`
-and `chgrp` enforce object ownership and group membership but currently modify
-runtime metadata only; persistent HostFS metadata remains Special_3 work.
+and `chgrp` enforce object ownership and group membership and persist HostFS
+metadata through the Special_3 VFS/provider boundary.
 The hosted login
 adapter detects persisted store changes and invalidates its old session.
 It is a single-process authority adapter, not the future IPC login daemon.
@@ -3109,9 +3109,23 @@ logical paths to Lua without host-path access.
 
 The shell provisions the complete authenticated home tree and user runtime/temp
 roots. The in-memory developer context applies the same isolation rules. HostFS
-persists directory contents but does not yet persist Hyber ownership/mode
-metadata across a fresh import; native/persistent provider enforcement of write
-quotas remains future work and must not be claimed as complete.
+persists checksummed Hyber ownership, mode, timestamps, flags, and extended
+metadata in versioned user xattrs. Fresh imports validate these records before
+exposing objects. VFS enforces aggregate per-user storage-class logical-byte
+quotas, including sparse growth, deletion accounting, and rename boundaries.
+Service data/runtime trees use the same quota mechanism. Native block/inode
+quotas are not implied by this hosted implementation.
+
+The audit adds full-tree cleanup preflight (mount boundaries, ownership,
+references, depth/count limits), canonical layout revalidation, and Lua
+execution-identity binding. Reprovisioning refuses foreign-owned directories
+and preserves intentional permissions instead of silently adopting/resetting
+them. Legacy HostFS imports with lost Hyber ownership require explicit
+migration. Reopen tests exercise persistent ownership, cross-user denial, and
+quota enforcement. HostFS requires user-xattr support and an exclusive
+cooperating root lock; direct host edits are outside this authority boundary.
+Same-user application sandboxing remains Special_6. See
+`docs/design/storage-layout.md` for the hosted persistence/failure contract.
 
 ---
 
@@ -3158,6 +3172,20 @@ invalid commands cannot corrupt the input buffer
 shell restart preserves only configured persistent history
 ```
 
+## Hosted implementation
+
+`hyber-shell::input::Controller` is the device-neutral input/history state
+machine. The Linux terminal adapter and future GUI consumers dispatch the
+same events; navigation never submits. Unicode editing, draft restoration,
+reverse search, cancel, EOF, bounded paste, and quoted command parsing are
+tested. History is opt-in, limited to 100 entries and 24 KiB, and stored as
+private `shell.history` metadata on the user's shell state directory. Leading
+space, sensitive command classes, secret-like markers, and explicitly excluded
+patterns prevent recording; arbitrary unlabeled secrets cannot be inferred.
+`history clear`, `history save on|off`, `history search`, and `history exclude`
+expose this policy. Identity changes reset all session shell state. A PTY test
+exercises the actual terminal adapter; no GUI runtime is introduced here.
+
 ---
 
 # Special_5 — Lua Shell Profiles and Environment
@@ -3202,6 +3230,30 @@ profile failures are recoverable
 environment changes are session-scoped
 aliases and prompt customization use stable shell APIs
 ```
+
+## Hosted implementation and alias commands
+
+Profiles return a validated configuration table for aliases, environment,
+prompt, completion, key bindings, and before/after hooks. The restricted Lua
+runtime has memory/instruction/source/output limits, no host I/O or process
+API, and cannot acquire authority. Profile files and ancestors are checked
+for trusted ownership and unsafe write permissions before VFS reads. Errors
+discard profile configuration and restore safe defaults. Non-interactive input
+skips profiles unless `--profiles` is explicitly supplied.
+
+```text
+alias                         list aliases
+alias ll='ls -l'               define or replace a session alias
+alias ll                      inspect one alias
+unalias ll                    remove one alias
+unalias --all                 clear aliases
+```
+
+Aliases expand parsed argument vectors, preserve quoted arguments, and reject
+cycles, excessive depth/size, and multi-command replacements. They cannot
+invoke a host shell or bypass dispatch permissions. Persist declarations in a
+Lua profile explicitly; interactive definitions are session-local. See
+`docs/development/shell-profiles.md` for the full supported contract.
 
 ---
 

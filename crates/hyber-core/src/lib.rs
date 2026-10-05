@@ -304,7 +304,7 @@ impl fmt::Display for ObjectState {
 }
 
 // 2.9 Metadata Types
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum MetadataValue {
     String(String),
     Integer(i64),

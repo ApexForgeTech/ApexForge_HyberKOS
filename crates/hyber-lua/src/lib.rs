@@ -253,6 +253,17 @@ fn run_lua_script_with_session_and_layout_impl(
     }));
 
     let exec_res = (|| -> Result<(), mlua::Error> {
+        {
+            let state = lock(&state)?;
+            if let Some(layout) = &state.app_layout {
+                layout.validate().map_err(lua_err)?;
+                if layout.user.user_id != state.security_context.user_id {
+                    return Err(lua_err(
+                        "application layout does not match execution identity".into(),
+                    ));
+                }
+            }
+        }
         let lua = Lua::new();
         // Host filesystem/process APIs bypass Hyber permissions and sessions.
         for name in [
@@ -616,14 +627,17 @@ fn build_obj(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
                 let mut ks = lock(&state)?;
                 VFS::check_traversal(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path, false)
                     .map_err(lua_err)?;
-                let obj_id = ks
-                    .ns_mgr
-                    .resolve(&path, ks.ns_mgr.root())
-                    .map_err(lua_err)?;
                 let context = ks.security_context.clone();
-                ks.obj_mgr
-                    .set_metadata_secure(obj_id, &context, &key, meta_val)
-                    .map_err(lua_err)?;
+                let KernelState {
+                    vfs,
+                    ns_mgr,
+                    obj_mgr,
+                    ..
+                } = &mut *ks;
+                vfs.mutate_metadata(ns_mgr, obj_mgr, &context, &path, |objects, id| {
+                    objects.set_metadata_secure(id, &context, &key, meta_val)
+                })
+                .map_err(lua_err)?;
                 Ok(true)
             },
         )?;
@@ -1129,8 +1143,14 @@ mod tests {
         let mut objects = ObjectManager::new();
         let namespace = NamespaceManager::new(&mut objects);
         let mut processes = ProcessManager::new();
+        let context = SecurityContext {
+            user_id: hyber_core::UserId(1000),
+            group_id: hyber_core::GroupId(1000),
+            supplementary_groups: vec![],
+            capabilities: vec![],
+        };
         let process_id = processes
-            .create_process(&mut objects, None, SecurityContext::root(), None)
+            .create_process(&mut objects, None, context.clone(), None)
             .unwrap();
         let user = UserLayout::new(
             hyber_core::UserId(1000),
@@ -1155,10 +1175,49 @@ mod tests {
             objects,
             Arc::new(Mutex::new(processes)),
             process_id,
-            SecurityContext::root(),
+            context,
             None,
             Some(layout),
         );
         assert!(result.is_ok(), "Lua app layout failed: {result:?}");
+    }
+
+    #[test]
+    fn lua_rejects_forged_or_foreign_application_layout_before_execution() {
+        let foreign = AppLayout::new(
+            UserLayout::new(
+                hyber_core::UserId(1000),
+                hyber_core::GroupId(1000),
+                "alice",
+                "/users/alice",
+            )
+            .unwrap(),
+            "editor",
+        )
+        .unwrap();
+        let mut forged = AppLayout::new(UserLayout::root(), "editor").unwrap();
+        forged.data = Path::parse("/data/other-app");
+        for layout in [foreign, forged] {
+            let mut objects = ObjectManager::new();
+            let namespace = NamespaceManager::new(&mut objects);
+            let mut processes = ProcessManager::new();
+            let pid = processes
+                .create_process(&mut objects, None, SecurityContext::root(), None)
+                .unwrap();
+            let (_, _, _, _, result) = run_lua_script_with_session_and_layout(
+                "error('script must not execute')",
+                VFS::new(),
+                namespace,
+                HandleManager::new(),
+                objects,
+                Arc::new(Mutex::new(processes)),
+                pid,
+                SecurityContext::root(),
+                None,
+                Some(layout),
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(!error.contains("script must not execute"), "{error}");
+        }
     }
 }

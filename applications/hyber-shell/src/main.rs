@@ -1,7 +1,7 @@
 //! HyberKOS Shell — First User-Space Environment
 //! Phase 7–12 — REPL with Standard, Native, Virtual Namespace & Lua Commands
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +17,12 @@ use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
 use hyber_process::{ProcessManager, ProcessProvider};
 use hyber_service::{ServiceManager, ServiceProvider};
+use hyber_shell::{
+    input::{self, Controller, Event},
+    profiles::{self, Profiles},
+};
 use hyber_vfs::{Provider, VFS};
+mod terminal;
 
 /// HyberKOS Shell state
 struct HyberShell {
@@ -33,6 +38,10 @@ struct HyberShell {
     svc_mgr: Arc<Mutex<ServiceManager>>,
     layout: LayoutManager,
     running: bool,
+    input: Controller,
+    profiles: Profiles,
+    history_path: Option<Path>,
+    explicit_profiles: bool,
 }
 
 impl HyberShell {
@@ -132,6 +141,7 @@ impl HyberShell {
             .map_err(|e| format!("Failed to initialize HostFS at {:?}: {}", host_root, e))?;
         let root_id = ns_mgr.root();
         hostfs.bind_root(root_id);
+        hostfs.restore_root_metadata(&mut obj_mgr, root_id)?;
         Self::sync_host_directory(&host_root, &mut obj_mgr, &mut ns_mgr, &mut hostfs, root_id)
             .map_err(|e| format!("Failed to sync host directory: {}", e))?;
 
@@ -256,6 +266,10 @@ impl HyberShell {
             svc_mgr,
             layout,
             running: true,
+            input: Controller::default(),
+            profiles: Profiles::default(),
+            history_path: None,
+            explicit_profiles: false,
         })
     }
 
@@ -337,25 +351,320 @@ impl HyberShell {
         )
     }
 
+    fn prepare_interaction(&mut self, interactive: bool) -> Result<(), String> {
+        self.input = Controller::default();
+        self.profiles = Profiles::default();
+        let context = self.current_security_context()?;
+        let user = if let Some(session) = &self.session {
+            UserLayout::new(
+                context.user_id,
+                context.group_id,
+                session.username().map_err(|e| e.to_string())?,
+                session.home().map_err(|e| e.to_string())?,
+            )?
+        } else {
+            UserLayout::root()
+        };
+        self.layout.provision_user(
+            &mut self.vfs,
+            &mut self.ns_mgr,
+            &mut self.obj_mgr,
+            &SecurityContext::root(),
+            &user,
+        )?;
+        let app = hyber_layout::AppLayout::new(user.clone(), "hyber-shell")?;
+        self.layout.ensure_application(
+            &mut self.vfs,
+            &mut self.ns_mgr,
+            &mut self.obj_mgr,
+            &context,
+            &app,
+        )?;
+        self.history_path = Some(app.state);
+        for name in profiles::profile_paths(
+            &user.home.to_string(),
+            self.session.is_some(),
+            interactive,
+            self.explicit_profiles,
+        ) {
+            let path = Path::parse(&name);
+            if let Ok(id) = self.vfs.lookup(&self.ns_mgr, &path) {
+                let object = self.obj_mgr.lookup(id).ok_or("profile object missing")?;
+                let owner = if name.starts_with("/etc/") {
+                    UserId(0)
+                } else {
+                    user.user_id
+                };
+                if object.owner != owner
+                    || object.permissions & 0o022 != 0
+                    || object.object_type != ObjectType::File
+                {
+                    return Err(format!("unsafe profile ownership/mode: {name}"));
+                }
+                // Validate ancestors as well; a writable directory could let a
+                // different identity replace an otherwise read-only profile.
+                for count in 0..path.components.len() {
+                    let ancestor = Path {
+                        is_absolute: true,
+                        components: path.components[..count].to_vec(),
+                    };
+                    let ancestor_id = self.vfs.lookup(&self.ns_mgr, &ancestor)?;
+                    let object = self
+                        .obj_mgr
+                        .lookup(ancestor_id)
+                        .ok_or("profile ancestor missing")?;
+                    if (object.owner != UserId(0) && object.owner != owner)
+                        || object.permissions & 0o022 != 0
+                    {
+                        return Err(format!("unsafe profile ancestor: {ancestor}"));
+                    }
+                }
+                let source = self.read_text(&path, 64 * 1024)?;
+                self.profiles.load(&name, &source)?;
+            }
+        }
+        if self.profiles.persistent_history {
+            let path = self.history_path.as_ref().ok_or("history unavailable")?;
+            VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, path, false)?;
+            let id = self.vfs.lookup(&self.ns_mgr, path)?;
+            let object = self.obj_mgr.lookup(id).ok_or("history directory missing")?;
+            if object.owner != context.user_id || object.permissions != 0o700 {
+                return Err("history directory is not private".into());
+            }
+            if let Some(MetadataValue::String(text)) =
+                self.obj_mgr
+                    .get_metadata_secure(id, &context, "shell.history")?
+            {
+                self.input.load(text)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_text(&mut self, path: &Path, limit: usize) -> Result<String, String> {
+        let context = self.current_security_context()?;
+        let handle = self.vfs.open(
+            &self.ns_mgr,
+            &mut self.handle_mgr,
+            &mut self.obj_mgr,
+            self.process_id,
+            &context,
+            path,
+            Rights::read_only(),
+        )?;
+        let result = (|| {
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let count = self.vfs.read_secure(
+                    &mut self.handle_mgr,
+                    &self.obj_mgr,
+                    self.process_id,
+                    &context,
+                    handle,
+                    &mut buffer,
+                )?;
+                if count == 0 {
+                    break;
+                }
+                if bytes.len() + count > limit {
+                    return Err("text exceeds size limit".into());
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            String::from_utf8(bytes).map_err(|_| "text is not UTF-8".into())
+        })();
+        let closed = self.vfs.close(
+            &mut self.handle_mgr,
+            &mut self.obj_mgr,
+            self.process_id,
+            handle,
+        );
+        match result {
+            Ok(text) => {
+                closed?;
+                Ok(text)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn save_history(&mut self) -> Result<(), String> {
+        if !self.profiles.persistent_history {
+            return Ok(());
+        }
+        let context = self.current_security_context()?;
+        let path = self
+            .history_path
+            .as_ref()
+            .ok_or("history unavailable for this identity")?;
+        let id = self.vfs.lookup(&self.ns_mgr, path)?;
+        let object = self.obj_mgr.lookup(id).ok_or("history directory missing")?;
+        if object.owner != context.user_id || object.permissions != 0o700 {
+            return Err("history directory is not private".into());
+        }
+        let text = self.input.encode()?;
+        self.vfs.mutate_metadata(
+            &self.ns_mgr,
+            &mut self.obj_mgr,
+            &context,
+            path,
+            |objects, id| {
+                objects.set_metadata_secure(
+                    id,
+                    &context,
+                    "shell.history",
+                    MetadataValue::String(text),
+                )
+            },
+        )
+    }
+    fn save_history_warning(&mut self) {
+        if let Err(e) = self.save_history() {
+            eprintln!("History warning: {e}");
+        }
+    }
+
+    fn cmd_alias(&mut self, args: &[&str]) -> Result<(), String> {
+        match args {
+            [] => {
+                for (name, value) in self.profiles.aliases.entries() {
+                    println!("alias {name}={value:?}");
+                }
+                Ok(())
+            }
+            [definition] => {
+                if let Some((name, value)) = definition.split_once('=') {
+                    self.profiles.aliases.set(name, value)
+                } else {
+                    println!(
+                        "{}",
+                        self.profiles
+                            .aliases
+                            .entries()
+                            .get(*definition)
+                            .ok_or("alias not found")?
+                    );
+                    Ok(())
+                }
+            }
+            _ => Err("Usage: alias [name | name='command arguments']".into()),
+        }
+    }
+    fn cmd_unalias(&mut self, args: &[&str]) -> Result<(), String> {
+        match args {
+            ["--all"] => {
+                self.profiles.aliases.clear();
+                Ok(())
+            }
+            [name] if self.profiles.aliases.remove(name) => Ok(()),
+            [_] => Err("alias not found".into()),
+            _ => Err("Usage: unalias <name|--all>".into()),
+        }
+    }
+    fn cmd_env(&mut self, args: &[&str]) -> Result<(), String> {
+        match args {
+            [] => {
+                for (key, value) in &self.profiles.environment {
+                    println!("{key}={value}");
+                }
+                Ok(())
+            }
+            [name, value] => self.profiles.set_env(name, value),
+            [name] => {
+                println!(
+                    "{}",
+                    self.profiles
+                        .environment
+                        .get(*name)
+                        .ok_or("environment variable missing")?
+                );
+                Ok(())
+            }
+            _ => Err("Usage: env [name [value]]".into()),
+        }
+    }
+    fn cmd_history(&mut self, args: &[&str]) -> Result<(), String> {
+        match args {
+            [] => {
+                for (i, line) in self.input.history().iter().enumerate() {
+                    println!("{} {line}", i + 1);
+                }
+                Ok(())
+            }
+            ["clear"] => {
+                self.input.dispatch(Event::ClearHistory)?;
+                self.save_history()
+            }
+            ["save", "on"] => {
+                self.profiles.persistent_history = true;
+                self.save_history()
+            }
+            ["save", "off"] => {
+                self.profiles.persistent_history = false;
+                Ok(())
+            }
+            ["exclude", pattern] => self.input.exclude(pattern),
+            ["search", query] => {
+                for line in self
+                    .input
+                    .history()
+                    .iter()
+                    .rev()
+                    .filter(|line| line.contains(query))
+                {
+                    println!("{line}");
+                }
+                Ok(())
+            }
+            _ => Err("Usage: history [clear|save on/off|search <text>|exclude <text>]".into()),
+        }
+    }
+
     /// Main REPL loop
     fn run(&mut self) {
         let stdin = io::stdin();
-        let mut stdout = io::stdout();
+        let interactive = stdin.is_terminal() && io::stdout().is_terminal();
+        if let Err(error) = self.prepare_interaction(interactive) {
+            eprintln!("Profile/history warning; safe mode: {error}");
+            self.profiles.fallback();
+        }
 
         println!("HyberKOS Shell v0.12.5  (Phase 12.5 — Advanced Lua Orchestration)");
         println!("Type 'exit' to quit.\n");
 
         while self.running {
-            // Print prompt with current directory
-            print!("hyber:{}$ ", self.current_dir);
-            stdout.flush().unwrap();
-
-            // Read user input
+            if interactive {
+                let user = self.whoami_name().unwrap_or_else(|_| "unknown".into());
+                let prompt = self
+                    .profiles
+                    .prompt(&self.current_dir.to_string(), &user)
+                    .unwrap_or_else(|error| {
+                        eprintln!("Profile warning: {error}");
+                        "hyber> ".into()
+                    });
+                match terminal::read(&mut self.input, &mut self.profiles, &prompt) {
+                    Ok(Some(line)) => {
+                        self.execute(&line);
+                        self.save_history_warning();
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        eprintln!("Input warning: {error}");
+                        self.input.dispatch(Event::Cancel).ok();
+                    }
+                }
+                continue;
+            }
             let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
+            match io::Read::take(stdin.lock(), (input::MAX_LINE + 2) as u64).read_line(&mut line) {
                 Ok(0) => break, // EOF
                 Ok(_) => {
-                    let line = line.trim();
+                    if line.len() > input::MAX_LINE {
+                        eprintln!("Command line too large");
+                        break;
+                    }
+                    let line = line.trim_end_matches(['\r', '\n']);
                     if line.is_empty() {
                         continue;
                     }
@@ -375,38 +684,52 @@ impl HyberShell {
 
     /// Parse and execute a command line (can contain multiple commands separated by ';')
     fn execute(&mut self, input: &str) {
-        let mut commands = Vec::new();
-        let mut current_cmd = String::new();
-        let mut in_quotes = false;
-        let mut quote_char = ' ';
-
-        for c in input.chars() {
-            if in_quotes {
-                if c == quote_char {
-                    in_quotes = false;
+        let commands = match input::parse(input) {
+            Ok(commands) => commands,
+            Err(error) => {
+                eprintln!("Parse error: {error}");
+                return;
+            }
+        };
+        let safe_history = commands.iter().all(|words| {
+            self.profiles
+                .aliases
+                .expand(words.clone())
+                .is_ok_and(|expanded| !self.input.is_sensitive(&expanded.join(" ")))
+        });
+        if safe_history {
+            self.input.remember(input);
+        }
+        for words in commands {
+            let words = match self.profiles.aliases.expand(words) {
+                Ok(words) => words,
+                Err(error) => {
+                    eprintln!("Alias error: {error}");
+                    break;
                 }
-                current_cmd.push(c);
-            } else {
-                if c == '"' || c == '\'' {
-                    in_quotes = true;
-                    quote_char = c;
-                    current_cmd.push(c);
-                } else if c == ';' {
-                    if !current_cmd.trim().is_empty() {
-                        commands.push(current_cmd.trim().to_string());
-                    }
-                    current_cmd.clear();
-                } else {
-                    current_cmd.push(c);
+            };
+            let user = self.whoami_name().unwrap_or_default();
+            for key in ["before_command"] {
+                match self
+                    .profiles
+                    .callback(key, &self.current_dir.to_string(), &user, &words[0])
+                {
+                    Ok(text) if !text.is_empty() => println!("{text}"),
+                    Err(e) => eprintln!("Profile warning: {e}"),
+                    _ => (),
                 }
             }
-        }
-        if !current_cmd.trim().is_empty() {
-            commands.push(current_cmd.trim().to_string());
-        }
-
-        for cmd in commands {
-            self.execute_single(&cmd);
+            self.execute_words(&words);
+            match self.profiles.callback(
+                "after_command",
+                &self.current_dir.to_string(),
+                &user,
+                &words[0],
+            ) {
+                Ok(text) if !text.is_empty() => println!("{text}"),
+                Err(e) => eprintln!("Profile warning: {e}"),
+                _ => (),
+            }
             if !self.running {
                 break;
             }
@@ -414,7 +737,12 @@ impl HyberShell {
     }
 
     /// Execute a single command
+    #[cfg(test)]
     fn execute_single(&mut self, input: &str) {
+        self.execute(input);
+    }
+
+    fn execute_words(&mut self, words: &[String]) {
         if let Some(session) = &self.session {
             match session.context() {
                 Ok(context) => {
@@ -434,7 +762,7 @@ impl HyberShell {
                 }
             }
         }
-        let parts: Vec<&str> = input.split_whitespace().collect();
+        let parts: Vec<&str> = words.iter().map(String::as_str).collect();
         if parts.is_empty() {
             return;
         }
@@ -443,6 +771,10 @@ impl HyberShell {
         let args = &parts[1..];
 
         let result = match command {
+            "alias" => self.cmd_alias(args),
+            "unalias" => self.cmd_unalias(args),
+            "history" => self.cmd_history(args),
+            "env" => self.cmd_env(args),
             // Standard Base Commands
             "pwd" => self.cmd_pwd(args),
             "whoami" => self.cmd_whoami(args),
@@ -701,33 +1033,32 @@ impl HyberShell {
         // Check if file already exists (update modified_at)
         let context = self.current_security_context()?;
         VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
-        if let Ok(obj_id) = self.ns_mgr.resolve(&path, self.ns_mgr.root()) {
-            let context = self
-                .proc_mgr
-                .lock()
-                .map_err(|_| "Process manager lock poisoned")?
-                .get_process(self.process_id)
-                .ok_or("Shell process not found")?
-                .security_context
-                .clone();
-            if let Some(obj) = self.obj_mgr.lookup_mut(obj_id) {
-                hyber_core::SecurityManager::check_access(
-                    &context,
-                    obj.owner,
-                    obj.group,
-                    obj.permissions,
-                    Rights {
-                        write: true,
-                        ..Rights::empty()
-                    },
-                )?;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("Time went backwards")
-                    .as_secs();
-                obj.modified_at = now;
-                return Ok(());
-            }
+        if self.ns_mgr.resolve(&path, self.ns_mgr.root()).is_ok() {
+            return self.vfs.mutate_metadata(
+                &self.ns_mgr,
+                &mut self.obj_mgr,
+                &context,
+                &path,
+                |objects, id| {
+                    let obj = objects.lookup_mut(id).ok_or("Object not found")?;
+                    hyber_core::SecurityManager::check_access(
+                        &context,
+                        obj.owner,
+                        obj.group,
+                        obj.permissions,
+                        Rights {
+                            write: true,
+                            ..Rights::empty()
+                        },
+                    )?;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    obj.modified_at = obj.modified_at.max(obj.created_at).max(now);
+                    Ok(())
+                },
+            );
         }
 
         let name = components.last().unwrap().0.clone();
@@ -1339,7 +1670,13 @@ impl HyberShell {
                     return Err("Missing key argument".to_string());
                 }
                 let key = positional[2];
-                if self.obj_mgr.remove_metadata_secure(obj_id, &context, key)? {
+                if self.vfs.mutate_metadata(
+                    &self.ns_mgr,
+                    &mut self.obj_mgr,
+                    &context,
+                    &path,
+                    |objects, id| objects.remove_metadata_secure(id, &context, key),
+                )? {
                     println!("Metadata removed.");
                 } else {
                     println!("Key not found.");
@@ -1372,8 +1709,13 @@ impl HyberShell {
                     _ => return Err("Unsupported type. Use: string, int, bool".to_string()),
                 };
 
-                self.obj_mgr
-                    .set_metadata_secure(obj_id, &context, key, meta_val)?;
+                self.vfs.mutate_metadata(
+                    &self.ns_mgr,
+                    &mut self.obj_mgr,
+                    &context,
+                    &path,
+                    |objects, id| objects.set_metadata_secure(id, &context, key, meta_val),
+                )?;
                 println!("Metadata set.");
             }
             _ => return Err("Unknown meta action. Use: ls, get, set, rm".to_string()),
@@ -1438,8 +1780,13 @@ impl HyberShell {
         let context = self.current_security_context()?;
         let path = self.resolve_path(args[1]);
         VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
-        let id = self.vfs.lookup(&self.ns_mgr, &path)?;
-        self.obj_mgr.chmod(id, &context, mode)
+        self.vfs.mutate_metadata(
+            &self.ns_mgr,
+            &mut self.obj_mgr,
+            &context,
+            &path,
+            |objects, id| objects.chmod(id, &context, mode),
+        )
     }
 
     fn cmd_chgrp(&mut self, args: &[&str]) -> Result<(), String> {
@@ -1456,8 +1803,13 @@ impl HyberShell {
         };
         let path = self.resolve_path(args[1]);
         VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
-        let id = self.vfs.lookup(&self.ns_mgr, &path)?;
-        self.obj_mgr.chgrp(id, &context, group)
+        self.vfs.mutate_metadata(
+            &self.ns_mgr,
+            &mut self.obj_mgr,
+            &context,
+            &path,
+            |objects, id| objects.chgrp(id, &context, group),
+        )
     }
 
     fn cmd_chown(&mut self, args: &[&str]) -> Result<(), String> {
@@ -1474,8 +1826,13 @@ impl HyberShell {
         };
         let path = self.resolve_path(args[1]);
         VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
-        let id = self.vfs.lookup(&self.ns_mgr, &path)?;
-        self.obj_mgr.chown(id, &context, owner)
+        self.vfs.mutate_metadata(
+            &self.ns_mgr,
+            &mut self.obj_mgr,
+            &context,
+            &path,
+            |objects, id| objects.chown(id, &context, owner),
+        )
     }
 
     fn cmd_su(&mut self, args: &[&str]) -> Result<(), String> {
@@ -1520,6 +1877,9 @@ impl HyberShell {
                 proc.security_context.capabilities.clear();
             }
             println!("Switched to UID: {}, GID: {}", uid, gid);
+            self.input = Controller::default();
+            self.profiles = Profiles::default();
+            self.history_path = None;
         }
         Ok(())
     }
@@ -1676,9 +2036,9 @@ impl HyberShell {
         println!("Standard Commands:");
         println!("  pwd                     Print working directory");
         println!("  whoami                  Print current Hyber account name");
-        println!("  chmod <mode> <path>      Set runtime Hyber rwx permissions (octal)");
-        println!("  chgrp <group> <path>     Set runtime Hyber object group");
-        println!("  chown <user> <path>      Transfer runtime Hyber object ownership (admin)");
+        println!("  chmod <mode> <path>      Set Hyber rwx permissions (octal)");
+        println!("  chgrp <group> <path>     Set Hyber object group");
+        println!("  chown <user> <path>      Transfer Hyber object ownership (admin)");
         println!("  cd <path>               Change directory");
         println!("  ls [-l] [-a] [path]     List directory contents");
         println!("  mkdir [-p] <path>       Create directory");
@@ -1734,6 +2094,10 @@ impl HyberShell {
         println!();
         println!("  exit                    Exit shell");
         println!("  help                    Show this help");
+        println!("  alias [name | name='command args']  List, inspect or define an alias");
+        println!("  unalias <name|--all>     Remove session aliases");
+        println!("  history [clear|search text|exclude text|save on/off]");
+        println!("  env [name [value]]      Inspect/change session-only environment");
         Ok(())
     }
 
@@ -1751,16 +2115,7 @@ impl HyberShell {
                     .to_string(),
             );
         }
-        let mut script = args.join(" ");
-        // Strip outer quotes if the user quoted the script to protect ';'
-        let len = script.len();
-        if len >= 2 {
-            let first = script.chars().next().unwrap();
-            let last = script.chars().last().unwrap();
-            if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-                script = script[1..len - 1].to_string();
-            }
-        }
+        let script = args.join(" ");
         self.run_lua_script(&script)
     }
 
@@ -1887,7 +2242,22 @@ impl HyberShell {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    let host_override = if args.get(1).is_some_and(|arg| arg == "--host-root") {
+        if args.len() < 3 {
+            eprintln!("--host-root requires an isolated directory");
+            std::process::exit(1);
+        }
+        let path = PathBuf::from(args.remove(2));
+        args.remove(1);
+        Some(path)
+    } else {
+        None
+    };
+    let explicit_profiles = args.get(1).is_some_and(|arg| arg == "--profiles");
+    if explicit_profiles {
+        args.remove(1);
+    }
     let session = if args.len() == 5 && args[1] == "--auth" {
         let result = args[3]
             .parse::<u64>()
@@ -1911,15 +2281,16 @@ fn main() {
     } else if args.len() == 1 {
         None
     } else {
-        eprintln!("usage: hyber-shell [--auth <image> <blocks> <username>]");
+        eprintln!("usage: hyber-shell [--host-root <directory>] [--profiles] [--auth <image> <blocks> <username>]");
         std::process::exit(1);
     };
     // Default host root: ~/hyber-host
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let host_root = PathBuf::from(home).join("hyber-host");
+    let host_root = host_override.unwrap_or_else(|| PathBuf::from(home).join("hyber-host"));
 
     match HyberShell::new(host_root.clone()) {
         Ok(mut shell) => {
+            shell.explicit_profiles = explicit_profiles;
             shell.session = session;
             if shell.session.is_some() {
                 if let Err(error) = shell.ensure_session_home() {
@@ -1942,6 +2313,377 @@ fn main() {
 mod session_tests {
     use super::*;
     use hyber_auth::{AuthService, SessionGuard, SessionKind, SystemClock};
+
+    fn write_text(shell: &mut HyberShell, path: &str, text: &str) {
+        let path = Path::parse(path);
+        let (parent, name) = path.parent_and_name().unwrap();
+        let context = shell.current_security_context().unwrap();
+        shell
+            .vfs
+            .create(
+                &mut shell.ns_mgr,
+                &mut shell.obj_mgr,
+                &context,
+                &parent,
+                &name,
+                ObjectType::File,
+            )
+            .unwrap();
+        let handle = shell
+            .vfs
+            .open(
+                &shell.ns_mgr,
+                &mut shell.handle_mgr,
+                &mut shell.obj_mgr,
+                shell.process_id,
+                &context,
+                &path,
+                Rights::read_write(),
+            )
+            .unwrap();
+        shell
+            .vfs
+            .write_secure(
+                &mut shell.handle_mgr,
+                &mut shell.obj_mgr,
+                shell.process_id,
+                &context,
+                handle,
+                text.as_bytes(),
+            )
+            .unwrap();
+        shell
+            .vfs
+            .close(
+                &mut shell.handle_mgr,
+                &mut shell.obj_mgr,
+                shell.process_id,
+                handle,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn profiles_aliases_and_private_history_survive_shell_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("hyber-profile-history-{}", std::process::id()));
+        {
+            let mut shell = HyberShell::new(dir.clone()).unwrap();
+            shell.prepare_interaction(false).unwrap();
+            write_text(&mut shell, "/users/root/.hyberrc.lua", "return {history=true, aliases={mk='mkdir'}, env={EDITOR='hyber'}, prompt=function(c) return c.user..'> ' end}");
+            shell.prepare_interaction(true).unwrap();
+            assert!(shell.profiles.persistent_history);
+            assert_eq!(shell.profiles.prompt("/", "root").unwrap(), "root> ");
+            shell.execute("mk '/temporary/space name'");
+            assert!(shell
+                .vfs
+                .lookup(&shell.ns_mgr, &Path::parse("/temporary/space name"))
+                .is_ok());
+            shell.execute("alias md='mkdir'");
+            shell.execute("md /temporary/alias");
+            assert!(shell
+                .vfs
+                .lookup(&shell.ns_mgr, &Path::parse("/temporary/alias"))
+                .is_ok());
+            shell.execute("mkdir /temporary/must-not-exist; cat 'unterminated");
+            assert!(shell
+                .vfs
+                .lookup(&shell.ns_mgr, &Path::parse("/temporary/must-not-exist"))
+                .is_err());
+            shell.execute("env API_TOKEN secret-value");
+            shell.save_history().unwrap();
+            assert!(!shell.input.encode().unwrap().contains("secret-value"));
+        }
+        {
+            let mut shell = HyberShell::new(dir.clone()).unwrap();
+            shell.prepare_interaction(false).unwrap();
+            assert!(shell.input.history().is_empty());
+            assert!(shell.profiles.aliases.entries().is_empty());
+            shell.prepare_interaction(true).unwrap();
+            assert!(shell
+                .input
+                .history()
+                .iter()
+                .any(|s| s.contains("space name")));
+            assert!(!shell.profiles.aliases.entries().contains_key("md")); // session-only alias
+            assert!(shell
+                .vfs
+                .lookup(&shell.ns_mgr, &Path::parse("/temporary/alias"))
+                .is_err());
+            shell.cmd_history(&["clear"]).unwrap();
+        }
+        let mut shell = HyberShell::new(dir.clone()).unwrap();
+        shell.prepare_interaction(true).unwrap();
+        assert!(shell.input.history().is_empty());
+        shell.cmd_su(&["1000"]).unwrap();
+        assert!(shell.history_path.is_none());
+        assert!(shell.profiles.aliases.entries().is_empty());
+        drop(shell);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quota_counts_sparse_growth_blocks_moves_and_releases_deleted_bytes() {
+        let dir = std::env::temp_dir().join(format!("hyber-quota-boundary-{}", std::process::id()));
+        let mut shell = HyberShell::new(dir.clone()).unwrap();
+        shell.prepare_interaction(false).unwrap();
+        let context = SecurityContext::root();
+        let parent = Path::parse("/users/root/.cache");
+        let id = shell.vfs.lookup(&shell.ns_mgr, &parent).unwrap();
+        shell.vfs.set_quota(&shell.ns_mgr, id, 4).unwrap();
+        shell
+            .vfs
+            .create(
+                &mut shell.ns_mgr,
+                &mut shell.obj_mgr,
+                &context,
+                &parent,
+                "file",
+                ObjectType::File,
+            )
+            .unwrap();
+        let path = Path::parse("/users/root/.cache/file");
+        let handle = shell
+            .vfs
+            .open(
+                &shell.ns_mgr,
+                &mut shell.handle_mgr,
+                &mut shell.obj_mgr,
+                shell.process_id,
+                &context,
+                &path,
+                Rights::read_write(),
+            )
+            .unwrap();
+        shell
+            .handle_mgr
+            .update_offset(shell.process_id, handle, 4)
+            .unwrap();
+        assert!(shell
+            .vfs
+            .write_secure(
+                &mut shell.handle_mgr,
+                &mut shell.obj_mgr,
+                shell.process_id,
+                &context,
+                handle,
+                b"x"
+            )
+            .is_err());
+        assert_eq!(
+            shell
+                .vfs
+                .write_secure(
+                    &mut shell.handle_mgr,
+                    &mut shell.obj_mgr,
+                    shell.process_id,
+                    &context,
+                    handle,
+                    b""
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            shell
+                .obj_mgr
+                .lookup(shell.vfs.lookup(&shell.ns_mgr, &path).unwrap())
+                .unwrap()
+                .size,
+            0
+        );
+        shell
+            .vfs
+            .close(
+                &mut shell.handle_mgr,
+                &mut shell.obj_mgr,
+                shell.process_id,
+                handle,
+            )
+            .unwrap();
+        assert!(shell
+            .vfs
+            .rename(
+                &mut shell.ns_mgr,
+                &mut shell.obj_mgr,
+                &context,
+                &parent,
+                "file",
+                &Path::parse("/users/root/.config"),
+                "file"
+            )
+            .is_err());
+        assert!(shell
+            .vfs
+            .rename(
+                &mut shell.ns_mgr,
+                &mut shell.obj_mgr,
+                &context,
+                &Path::parse("/users"),
+                "root",
+                &Path::parse("/users"),
+                "other"
+            )
+            .is_err());
+        shell
+            .vfs
+            .remove(
+                &mut shell.ns_mgr,
+                &mut shell.obj_mgr,
+                &context,
+                &parent,
+                "file",
+            )
+            .unwrap();
+        write_text(&mut shell, "/users/root/.cache/next", "four");
+        shell
+            .vfs
+            .remove(
+                &mut shell.ns_mgr,
+                &mut shell.obj_mgr,
+                &context,
+                &parent,
+                "next",
+            )
+            .unwrap();
+        write_text(&mut shell, "/users/root/.cache/reclaimed", "four");
+        drop(shell);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hosted_layout_reopens_with_metadata_and_enforced_quota() {
+        let dir = std::env::temp_dir().join(format!("hyber-layout-reopen-{}", std::process::id()));
+        let root = SecurityContext::root();
+        let user = UserLayout::new(UserId(42), GroupId(42), "alice", "/users/alice").unwrap();
+        let alice = SecurityContext {
+            user_id: UserId(42),
+            group_id: GroupId(42),
+            supplementary_groups: vec![],
+            capabilities: vec![],
+        };
+        let path = Path::parse("/users/alice/.local/share/file");
+        {
+            let mut shell = HyberShell::new(dir.clone()).unwrap();
+            shell
+                .layout
+                .provision_user(
+                    &mut shell.vfs,
+                    &mut shell.ns_mgr,
+                    &mut shell.obj_mgr,
+                    &root,
+                    &user,
+                )
+                .unwrap();
+            let parent = Path::parse("/users/alice/.local/share");
+            let quota = shell.vfs.lookup(&shell.ns_mgr, &parent).unwrap();
+            shell.vfs.set_quota(&shell.ns_mgr, quota, 4).unwrap();
+            shell
+                .vfs
+                .create(
+                    &mut shell.ns_mgr,
+                    &mut shell.obj_mgr,
+                    &alice,
+                    &parent,
+                    "file",
+                    ObjectType::File,
+                )
+                .unwrap();
+            let handle = shell
+                .vfs
+                .open(
+                    &shell.ns_mgr,
+                    &mut shell.handle_mgr,
+                    &mut shell.obj_mgr,
+                    shell.process_id,
+                    &alice,
+                    &path,
+                    Rights::read_write(),
+                )
+                .unwrap();
+            shell
+                .vfs
+                .write_secure(
+                    &mut shell.handle_mgr,
+                    &mut shell.obj_mgr,
+                    shell.process_id,
+                    &alice,
+                    handle,
+                    b"data",
+                )
+                .unwrap();
+            assert!(shell
+                .vfs
+                .write_secure(
+                    &mut shell.handle_mgr,
+                    &mut shell.obj_mgr,
+                    shell.process_id,
+                    &alice,
+                    handle,
+                    b"x"
+                )
+                .is_err());
+            shell
+                .vfs
+                .mutate_metadata(
+                    &shell.ns_mgr,
+                    &mut shell.obj_mgr,
+                    &alice,
+                    &path,
+                    |objects, id| {
+                        objects.set_metadata_secure(
+                            id,
+                            &alice,
+                            "user.test",
+                            MetadataValue::String("saved".into()),
+                        )
+                    },
+                )
+                .unwrap();
+            shell.cleanup();
+        }
+        let mut shell = HyberShell::new(dir.clone()).unwrap();
+        shell
+            .layout
+            .provision_user(
+                &mut shell.vfs,
+                &mut shell.ns_mgr,
+                &mut shell.obj_mgr,
+                &root,
+                &user,
+            )
+            .unwrap();
+        let id = shell.vfs.lookup(&shell.ns_mgr, &path).unwrap();
+        let object = shell.obj_mgr.lookup(id).unwrap();
+        assert_eq!(
+            (object.owner, object.group, object.permissions, object.size),
+            (UserId(42), GroupId(42), 0o600, 4)
+        );
+        assert_eq!(
+            object.extended_metadata["user.test"],
+            MetadataValue::String("saved".into())
+        );
+        let bob = SecurityContext {
+            user_id: UserId(43),
+            group_id: GroupId(43),
+            supplementary_groups: vec![],
+            capabilities: vec![],
+        };
+        assert!(shell
+            .vfs
+            .open(
+                &shell.ns_mgr,
+                &mut shell.handle_mgr,
+                &mut shell.obj_mgr,
+                shell.process_id,
+                &bob,
+                &path,
+                Rights::read_only()
+            )
+            .is_err());
+        drop(shell);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn numeric_su_cannot_regain_root_and_authenticated_logout_stops_dispatch() {

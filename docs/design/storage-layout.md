@@ -35,6 +35,13 @@ traversing private trees. Application directories inherit the same owner and
 mode. An unprivileged caller cannot create a layout for another user or adopt a
 pre-existing directory owned by another identity.
 
+This also applies to privileged provisioning: an existing foreign-owned home
+is an error, not an implicit ownership transfer. Reprovisioning preserves the
+mode and group of existing same-owner directories. Reusing an account name
+with a new UID requires an explicit administrative data-migration decision.
+Public layout fields are revalidated at mutation boundaries; changing a
+derived application path cannot redirect provisioning or cleanup.
+
 Service state is separate from user state:
 
 ```text
@@ -54,16 +61,41 @@ of those disposable classes; it cannot receive an arbitrary path. It walks and
 removes only children of the derived root, has depth/object safety limits, and
 returns a `CleanupReport` containing the exact target and object count.
 
-The layout policy declares explicit byte quotas for every class. Providers or
-future write mediators must call `Quotas::check_quota` before committing a new
-allocation; the current VFS provider trait has no quota callback, so this
-hosted foundation does not claim kernel-enforced write quotas yet.
+Cleanup preflights the complete tree before any removal. It refuses mount
+points at or below the target, foreign-owned or non-live objects, active
+references, aliases, unsupported object kinds, and depth/object-limit
+violations. Unicode and spaces in ordinary filenames are supported (the
+ASCII identifier restriction does not apply to user filenames). Provider I/O
+failure during deletion is not transactional; the error reports the number
+already removed. No cleanup operation deletes persistent classes.
+
+The layout authority registers aggregate logical-byte quotas in VFS for each
+user's config/data/state/cache/runtime/temporary tree and each service's data
+and runtime tree. VFS checks file growth (including sparse offsets) before
+writing. Overwrites without growth remain possible, deletion releases usage,
+and empty writes do not grow files. Moving across quota domains or moving a
+quota root/ancestor is rejected; use copy then remove. Fresh provisioning
+rebuilds membership and usage from imported objects. These are hosted VFS
+logical-file-byte limits, not native block, inode, or metadata quotas. Raw
+provider and ObjectManager access is a trusted internal boundary.
 
 The shell maps `/runtime` and `/temporary` to MemFS, so those locations are
-lost at shell restart. HostFS currently persists path contents but not Hyber
-owner/group/mode metadata across a fresh shell import. Persistent ownership
-metadata therefore requires the planned persistent provider integration; it
-must not be substituted with host Unix ownership.
+lost at shell restart. HostFS stores versioned, checksummed Hyber ownership,
+mode, timestamps, flags, and extended metadata in `user.hyber.metadata.v1`
+xattrs. Metadata updates use atomic xattr replacement and a file sync; VFS
+restores its previous metadata on error and HostFS refuses further operations
+after uncertain writes until reopened. Host Unix ownership is never imported.
+Names and contents survive restart; metadata follows rename. Corrupt records
+fail import. The host filesystem must support user xattrs; its own xattr size
+limit may be smaller than the codec's 60 KiB maximum and failures are surfaced.
+A cooperating exclusive root lock prevents independent hosted writers from
+using stale quota/accounting state. This does not protect against the host OS
+owner editing files or attributes directly. Data and xattr updates are not a
+single crash-atomic transaction; HyberFS's snapshot journal is a separate
+storage contract. Legacy homes without trustworthy ownership require explicit
+migration and are never silently reassigned.
+Per-app paths also do not yet sandbox two applications running with the same
+user identity; manifest-derived confinement belongs to Special_6.
 
 ## Lua API
 
@@ -81,3 +113,5 @@ hyber.app.runtime_dir()
 Lua still accesses these paths through `hyber.fs`, so VFS traversal, object
 permissions, handles, and session revalidation remain authoritative. No API
 returns a Linux path.
+Before Lua executes, the supplied layout is validated and its user must match
+the current execution/session identity.

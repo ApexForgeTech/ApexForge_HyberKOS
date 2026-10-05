@@ -415,6 +415,12 @@ impl ObjectManager {
         )
     }
 
+    /// Validate persisted metadata using the same rules as runtime mutations.
+    pub fn validate_metadata_entry(key: &str, value: &MetadataValue) -> Result<(), String> {
+        Self::validate_metadata_key(key)?;
+        Self::validate_metadata_value(value, 0)
+    }
+
     fn validate_metadata_key(key: &str) -> Result<(), String> {
         let (namespace, name) = key
             .split_once('.')

@@ -10,6 +10,11 @@ use hyber_object::ObjectManager;
 // 6.3 — Provider Interface
 // ==========================================
 pub trait Provider {
+    /// Persist an already validated metadata update before reporting success.
+    /// Volatile providers intentionally retain only the ObjectManager copy.
+    fn persist_metadata(&mut self, _object: &hyber_object::Object) -> Result<(), String> {
+        Ok(())
+    }
     fn create(
         &mut self,
         obj_mgr: &mut ObjectManager,
@@ -95,6 +100,8 @@ impl MountTable {
 pub struct VFS {
     providers: std::collections::HashMap<String, Box<dyn Provider>>,
     mount_table: MountTable,
+    quota_roots: std::collections::HashMap<ObjectId, u64>,
+    quota_members: std::collections::HashMap<ObjectId, ObjectId>,
 }
 
 impl VFS {
@@ -102,6 +109,8 @@ impl VFS {
         Self {
             providers: std::collections::HashMap::new(),
             mount_table: MountTable::new(),
+            quota_roots: Default::default(),
+            quota_members: Default::default(),
         }
     }
 
@@ -116,6 +125,66 @@ impl VFS {
 
     pub fn lookup(&self, ns_mgr: &NamespaceManager, path: &Path) -> Result<ObjectId, String> {
         ns_mgr.resolve(&path.normalize(), ns_mgr.root())
+    }
+
+    /// Trusted layout authority installs aggregate, per-class limits. Rebuilt
+    /// from the imported namespace on restart, never from host UID/GID values.
+    pub fn set_quota(
+        &mut self,
+        ns: &NamespaceManager,
+        root: ObjectId,
+        limit: u64,
+    ) -> Result<(), String> {
+        let mut pending = vec![root];
+        let mut members = std::collections::HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !members.insert(id) {
+                return Err("quota namespace cycle".into());
+            }
+            if self.quota_members.get(&id).is_some_and(|old| *old != root) {
+                return Err("overlapping quota roots".into());
+            }
+            if let Some(entries) = ns.list_directory(id) {
+                pending.extend(entries.into_iter().map(|node| node.object_id));
+            }
+        }
+        for id in members {
+            self.quota_members.insert(id, root);
+        }
+        self.quota_roots.insert(root, limit);
+        Ok(())
+    }
+
+    /// Authorize using ObjectManager operations, persist, and restore the
+    /// previous in-memory metadata if persistence fails. Providers must refuse
+    /// further I/O if the durable outcome is uncertain.
+    pub fn mutate_metadata<T>(
+        &mut self,
+        ns: &NamespaceManager,
+        objects: &mut ObjectManager,
+        context: &hyber_core::SecurityContext,
+        path: &Path,
+        change: impl FnOnce(&mut ObjectManager, ObjectId) -> Result<T, String>,
+    ) -> Result<T, String> {
+        Self::check_traversal(ns, objects, context, path, false)?;
+        let id = self.lookup(ns, path)?;
+        let old = objects.lookup(id).ok_or("metadata object missing")?.clone();
+        let provider = self
+            .mount_table
+            .find_provider(&path.normalize())
+            .ok_or("metadata provider missing")?;
+        let provider = self
+            .providers
+            .get_mut(&provider)
+            .ok_or("metadata provider missing")?;
+        let result = change(objects, id).and_then(|value| {
+            provider.persist_metadata(objects.lookup(id).ok_or("metadata object missing")?)?;
+            Ok(value)
+        });
+        if result.is_err() {
+            *objects.lookup_mut(id).ok_or("metadata object missing")? = old;
+        }
+        result
     }
 
     /// Check search permission on all ancestor directories. With include_target,
@@ -291,6 +360,27 @@ impl VFS {
             return Err("Object is not live".into());
         }
 
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if let Some(root) = self.quota_members.get(&object_id) {
+            let used = self
+                .quota_members
+                .iter()
+                .filter(|(_, r)| *r == root)
+                .try_fold(0u64, |sum, (id, _)| {
+                    sum.checked_add(obj_mgr.lookup(*id).map_or(0, |o| o.size))
+                })
+                .ok_or("quota usage overflow")?;
+            let growth = (offset + buffer.len() as u64).saturating_sub(object.size);
+            if growth > 0
+                && used
+                    .checked_add(growth)
+                    .is_none_or(|size| size > self.quota_roots[root])
+            {
+                return Err("storage quota exceeded".into());
+            }
+        }
         let provider = self
             .providers
             .get_mut(&provider_name)
@@ -307,10 +397,12 @@ impl VFS {
             if new_size > obj.size {
                 obj.size = new_size;
             }
-            obj.modified_at = std::time::SystemTime::now()
+            let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
+            obj.modified_at = obj.modified_at.max(obj.created_at).max(now);
+            provider.persist_metadata(obj)?;
         }
 
         Ok(bytes_written)
@@ -394,6 +486,14 @@ impl VFS {
         } else {
             0o600
         };
+        if let Err(error) = provider.persist_metadata(object) {
+            // A failed durable create must not look successful to callers.
+            let _ = provider.remove(obj_mgr, ns_mgr, parent_id, name);
+            return Err(error);
+        }
+        if let Some(root) = self.quota_members.get(&parent_id).copied() {
+            self.quota_members.insert(id, root);
+        }
         Ok(id)
     }
 
@@ -412,6 +512,12 @@ impl VFS {
             .find_provider(&parent_path)
             .ok_or_else(|| format!("No provider mounted for path: {}", parent_path))?;
         let parent_id = ns_mgr.resolve(&parent_path, ns_mgr.root())?;
+        let child = ns_mgr
+            .lookup(parent_id, name)
+            .ok_or("remove target missing")?;
+        if self.quota_roots.contains_key(&child) {
+            return Err("cannot remove a quota root".into());
+        }
         let parent = obj_mgr
             .lookup(parent_id)
             .ok_or("Parent directory not found")?;
@@ -432,7 +538,9 @@ impl VFS {
             .get_mut(&provider_name)
             .ok_or_else(|| format!("Provider {} not found", provider_name))?;
 
-        provider.remove(obj_mgr, ns_mgr, parent_id, name)
+        provider.remove(obj_mgr, ns_mgr, parent_id, name)?;
+        self.quota_members.remove(&child);
+        Ok(())
     }
 
     /// 7.6 Requirement:  rename in VFS level
@@ -467,6 +575,23 @@ impl VFS {
 
         let old_parent_id = ns_mgr.resolve(&old_parent_path, ns_mgr.root())?;
         let new_parent_id = ns_mgr.resolve(&new_parent_path, ns_mgr.root())?;
+        let child = ns_mgr
+            .lookup(old_parent_id, old_name)
+            .ok_or("rename target missing")?;
+        let mut descendants = vec![child];
+        while let Some(id) = descendants.pop() {
+            if self.quota_roots.contains_key(&id) {
+                return Err("cannot move a quota root or its ancestor".into());
+            }
+            if let Some(nodes) = ns_mgr.list_directory(id) {
+                descendants.extend(nodes.into_iter().map(|n| n.object_id));
+            }
+        }
+        if self.quota_roots.contains_key(&child)
+            || self.quota_members.get(&old_parent_id) != self.quota_members.get(&new_parent_id)
+        {
+            return Err("rename across quota boundaries is unsupported; copy then remove".into());
+        }
         for parent_id in [old_parent_id, new_parent_id] {
             let parent = obj_mgr
                 .lookup(parent_id)

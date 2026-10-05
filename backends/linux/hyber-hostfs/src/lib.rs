@@ -10,6 +10,7 @@ use hyber_core::{ObjectId, ObjectType};
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
 use hyber_vfs::Provider;
+mod metadata;
 
 /// 7.1 & 7.2 — HostFS Provider
 /// Maps HyberKOS namespace to a specific, isolated Linux directory.
@@ -25,6 +26,8 @@ pub struct HostFSProvider {
     /// Maps Hyber ObjectId to an open Linux File.
     /// Hyber Handle -> HostFS internal state -> Linux FD
     active_files: HashMap<ObjectId, File>,
+    failed: bool,
+    _root_lock: File,
 }
 
 impl HostFSProvider {
@@ -47,10 +50,18 @@ impl HostFSProvider {
             ));
         }
 
+        // One hosted authority per root: independent cached namespaces must
+        // not race ownership changes or independently spend the same quota.
+        let root_lock = File::open(&root_path)?;
+        root_lock
+            .try_lock()
+            .map_err(|e| std::io::Error::other(format!("HostFS root is in use: {e}")))?;
         Ok(Self {
             root_path,
             object_paths: HashMap::new(),
             active_files: HashMap::new(),
+            failed: false,
+            _root_lock: root_lock,
         })
     }
 
@@ -60,8 +71,23 @@ impl HostFSProvider {
         self.object_paths.insert(root_id, PathBuf::new());
     }
 
+    pub fn restore_root_metadata(
+        &self,
+        objects: &mut ObjectManager,
+        root_id: ObjectId,
+    ) -> Result<(), String> {
+        let file = metadata::open(&self.get_linux_path(root_id)?)?;
+        if let Some(record) = metadata::load(&file)? {
+            record.apply(objects.lookup_mut(root_id).ok_or("root object missing")?);
+        }
+        Ok(())
+    }
+
     /// Helper: Get the full Linux path for a specific ObjectId
     fn get_linux_path(&self, obj_id: ObjectId) -> Result<PathBuf, String> {
+        if self.failed {
+            return Err("HostFS durable outcome uncertain; reopen required".into());
+        }
         let relative = self
             .object_paths
             .get(&obj_id)
@@ -110,17 +136,6 @@ impl HostFSProvider {
         if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
             return Err(format!("Invalid namespace node name '{name}'"));
         }
-        let obj_id = obj_mgr.create_object(obj_type);
-        ns_mgr
-            .create_node(obj_mgr, parent_id, name, obj_id)
-            .map_err(|e| format!("Namespace error: {}", e))?;
-
-        if obj_type == ObjectType::Directory {
-            ns_mgr
-                .initialize_directory(obj_id)
-                .map_err(|e| format!("Init dir error: {}", e))?;
-        }
-
         let parent_path = self
             .object_paths
             .get(&parent_id)
@@ -133,12 +148,42 @@ impl HostFSProvider {
             parent_path.join(name)
         };
 
+        let file = metadata::open(&self.get_linux_path(parent_id)?.join(name))?;
+        let host = file.metadata().map_err(|e| e.to_string())?;
+        if (obj_type == ObjectType::File && !host.is_file())
+            || (obj_type == ObjectType::Directory && !host.is_dir())
+        {
+            return Err("HostFS import type mismatch".into());
+        }
+        let stored = metadata::load(&file)?;
+        let obj_id = obj_mgr.create_object(obj_type);
+        if let Some(record) = stored {
+            record.apply(obj_mgr.lookup_mut(obj_id).ok_or("import object missing")?);
+        }
+        obj_mgr.lookup_mut(obj_id).unwrap().size = if host.is_file() { host.len() } else { 0 };
+        if let Err(error) = ns_mgr.create_node(obj_mgr, parent_id, name, obj_id) {
+            obj_mgr.release(obj_id);
+            obj_mgr.destroy(obj_id);
+            return Err(error);
+        }
+        if obj_type == ObjectType::Directory {
+            ns_mgr.initialize_directory(obj_id)?;
+        }
         self.object_paths.insert(obj_id, new_relative_path);
         Ok(obj_id)
     }
 }
 
 impl Provider for HostFSProvider {
+    fn persist_metadata(&mut self, object: &hyber_object::Object) -> Result<(), String> {
+        let file = metadata::open(&self.get_linux_path(object.id)?)?;
+        let bytes = metadata::encode(object)?;
+        if let Err(error) = metadata::store(&file, &bytes) {
+            self.failed = true;
+            return Err(error);
+        }
+        Ok(())
+    }
     fn create(
         &mut self,
         obj_mgr: &mut ObjectManager,
@@ -382,6 +427,9 @@ impl Provider for HostFSProvider {
 
     fn write(&mut self, object_id: ObjectId, offset: u64, buffer: &[u8]) -> Result<usize, String> {
         let linux_path = self.get_linux_path(object_id)?;
+        // A partial write/failed flush makes cached size/quota accounting
+        // uncertain. Refuse all subsequent access until a fresh import.
+        self.failed = true;
 
         // 7.4 FD Isolation: Open or reuse file
         let mut file = OpenOptions::new()
@@ -405,7 +453,7 @@ impl Provider for HostFSProvider {
 
         // Keep it in active_files for future operations (satisfies 7.4)
         self.active_files.insert(object_id, file);
-
+        self.failed = false;
         Ok(buffer.len())
     }
 
@@ -427,6 +475,43 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("hyber-hostfs-test-{}-{stamp}", std::process::id()))
+    }
+
+    #[test]
+    fn metadata_survives_rename_and_rejects_damage_and_invalid_keys() {
+        let dir = scratch_dir();
+        let provider = HostFSProvider::new(&dir).unwrap();
+        assert!(HostFSProvider::new(&dir).is_err());
+        let path = dir.join("original");
+        std::fs::write(&path, b"data").unwrap();
+        let file = metadata::open(&path).unwrap();
+        let mut object = hyber_object::Object::new(ObjectId(7), ObjectType::File);
+        object.owner = hyber_core::UserId(42);
+        object.permissions = 0o600;
+        let encoded = metadata::encode(&object).unwrap();
+        metadata::store(&file, &encoded).unwrap();
+        std::fs::rename(&path, dir.join("renamed")).unwrap();
+        let reopened = metadata::open(&dir.join("renamed")).unwrap();
+        let mut restored = hyber_object::Object::new(ObjectId(99), ObjectType::File);
+        metadata::load(&reopened)
+            .unwrap()
+            .unwrap()
+            .apply(&mut restored);
+        assert_eq!(restored.owner, object.owner);
+        assert_eq!(restored.permissions, 0o600);
+        assert_eq!(restored.id, ObjectId(99));
+        let mut corrupt = encoded;
+        corrupt[0] ^= 1;
+        metadata::store(&file, &corrupt).unwrap();
+        assert!(metadata::load(&reopened).is_err());
+        object
+            .extended_metadata
+            .insert("invalid".into(), hyber_core::MetadataValue::Boolean(true));
+        metadata::store(&file, &metadata::encode(&object).unwrap()).unwrap();
+        assert!(metadata::load(&reopened).is_err());
+        drop(provider);
+        assert!(HostFSProvider::new(&dir).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

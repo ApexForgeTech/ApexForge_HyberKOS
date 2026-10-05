@@ -91,6 +91,14 @@ pub struct UserLayout {
 }
 
 impl UserLayout {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_component(&self.username, "username")?;
+        if self.home != Path::parse(&format!("/users/{}", self.username)) {
+            return Err("user home must be exactly /users/<username>".into());
+        }
+        Ok(())
+    }
+
     pub fn new(
         user_id: UserId,
         group_id: GroupId,
@@ -99,7 +107,11 @@ impl UserLayout {
     ) -> Result<Self, String> {
         let username = username.into();
         validate_component(&username, "username")?;
-        let home = Path::parse(home.as_ref()).normalize();
+        let home_text = home.as_ref();
+        if home_text != format!("/users/{username}") {
+            return Err("user home must be exactly /users/<username>".into());
+        }
+        let home = Path::parse(home_text);
         let expected = Path::parse(&format!("/users/{username}"));
         if home != expected {
             return Err("user home must be exactly /users/<username>".into());
@@ -132,6 +144,7 @@ pub struct AppLayout {
 
 impl AppLayout {
     pub fn new(user: UserLayout, app_id: impl Into<String>) -> Result<Self, String> {
+        user.validate()?;
         let app_id = app_id.into();
         validate_component(&app_id, "application id")?;
         let home = user.home.to_string();
@@ -156,6 +169,13 @@ impl AppLayout {
             StorageClass::Temporary => &self.temporary,
             StorageClass::Runtime => &self.runtime,
         }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if *self != Self::new(self.user.clone(), self.app_id.clone())? {
+            return Err("application layout contains noncanonical paths".into());
+        }
+        Ok(())
     }
 }
 
@@ -236,6 +256,7 @@ impl LayoutManager {
         system: &SecurityContext,
         user: &UserLayout,
     ) -> Result<(), String> {
+        user.validate()?;
         self.initialize_system(vfs, namespace, objects, system)?;
         for path in [
             user.home.clone(),
@@ -261,6 +282,32 @@ impl LayoutManager {
                 0o700,
             )?;
         }
+        for (path, class) in [
+            (append(&user.home, ".config")?, StorageClass::Config),
+            (
+                Path::parse(&format!("{}/.local/share", user.home)),
+                StorageClass::Data,
+            ),
+            (
+                Path::parse(&format!("{}/.local/state", user.home)),
+                StorageClass::State,
+            ),
+            (append(&user.home, ".cache")?, StorageClass::Cache),
+            (
+                Path::parse(&format!("/runtime/users/{}", user.user_id.0)),
+                StorageClass::Runtime,
+            ),
+            (
+                Path::parse(&format!("/temporary/users/{}", user.user_id.0)),
+                StorageClass::Temporary,
+            ),
+        ] {
+            vfs.set_quota(
+                namespace,
+                namespace.resolve(&path, namespace.root())?,
+                self.quotas.limit(class),
+            )?;
+        }
         Ok(())
     }
 
@@ -275,6 +322,7 @@ impl LayoutManager {
         caller: &SecurityContext,
         app: &AppLayout,
     ) -> Result<(), String> {
+        app.validate()?;
         if caller.user_id != app.user.user_id && caller.user_id != UserId(0) {
             return Err("application layout belongs to another user".into());
         }
@@ -323,6 +371,16 @@ impl LayoutManager {
         for path in [&data, &runtime] {
             self.ensure_directory(vfs, namespace, objects, system, path, owner, group, 0o700)?;
         }
+        vfs.set_quota(
+            namespace,
+            namespace.resolve(&data, namespace.root())?,
+            self.quotas.data,
+        )?;
+        vfs.set_quota(
+            namespace,
+            namespace.resolve(&runtime, namespace.root())?,
+            self.quotas.runtime,
+        )?;
         Ok((data, runtime))
     }
 
@@ -368,6 +426,7 @@ impl LayoutManager {
         class: StorageClass,
     ) -> Result<CleanupReport, String> {
         require_system(system)?;
+        user.validate()?;
         if !class.is_disposable() {
             return Err("only cache, temporary, and runtime state may be cleaned".into());
         }
@@ -377,8 +436,55 @@ impl LayoutManager {
             StorageClass::Runtime => Path::parse(&format!("/runtime/users/{}", user.user_id.0)),
             _ => unreachable!(),
         };
+        // Validate the entire traversal before removing anything. In particular,
+        // a nested mount must never turn disposable cleanup into data deletion.
+        if vfs.list_mounts().iter().any(|mount| {
+            let path = mount.path.normalize();
+            path.components.starts_with(&target.components)
+                && path.components.len() >= target.components.len()
+        }) {
+            return Err("cleanup target contains a mount point".into());
+        }
+        let mut pending = vec![(target.clone(), 0)];
+        let mut paths = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while let Some((path, depth)) = pending.pop() {
+            if depth > MAX_CLEANUP_DEPTH || seen.len() > MAX_CLEANUP_OBJECTS {
+                return Err("cleanup safety limit reached".into());
+            }
+            let id = namespace.resolve(&path, namespace.root())?;
+            if !seen.insert(id) {
+                return Err("cleanup encountered an aliased object".into());
+            }
+            let object = objects.lookup(id).ok_or("cleanup object missing")?;
+            if object.owner != user.user_id
+                || object.references != 1
+                || object.state != hyber_core::ObjectState::Live
+            {
+                return Err("cleanup object has foreign ownership or active references".into());
+            }
+            if object.object_type == ObjectType::Directory {
+                let entries = vfs.enumerate_secure(namespace, objects, system, &path)?;
+                if seen.len() + pending.len() + entries.len() > MAX_CLEANUP_OBJECTS + 1 {
+                    return Err("cleanup safety limit reached".into());
+                }
+                for (name, _) in entries {
+                    pending.push((append(&path, &name)?, depth + 1));
+                }
+            } else if object.object_type != ObjectType::File || path == target {
+                return Err("cleanup encountered an unsupported object type".into());
+            }
+            if path != target {
+                paths.push(path);
+            }
+        }
         let mut removed = 0;
-        self.clear_children(vfs, namespace, objects, system, &target, 0, &mut removed)?;
+        for path in paths.into_iter().rev() {
+            let (parent, name) = path.parent_and_name().ok_or("invalid cleanup path")?;
+            vfs.remove(namespace, objects, system, &parent, &name)
+                .map_err(|error| format!("cleanup stopped after {removed} removals: {error}"))?;
+            removed += 1;
+        }
         Ok(CleanupReport {
             class,
             path: target,
@@ -395,7 +501,33 @@ impl LayoutManager {
         path: &Path,
     ) -> Result<u64, String> {
         require_system(system)?;
-        self.usage_inner(vfs, namespace, objects, system, &path.normalize(), 0)
+        let mut pending = vec![(path.normalize(), 0)];
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0u64;
+        while let Some((path, depth)) = pending.pop() {
+            if depth > MAX_CLEANUP_DEPTH || seen.len() >= MAX_CLEANUP_OBJECTS {
+                return Err("usage safety limit reached".into());
+            }
+            let id = namespace.resolve(&path, namespace.root())?;
+            if !seen.insert(id) {
+                return Err("usage encountered an aliased object".into());
+            }
+            let object = objects.lookup(id).ok_or("usage object missing")?;
+            if object.object_type == ObjectType::Directory {
+                let entries = vfs.enumerate_secure(namespace, objects, system, &path)?;
+                if seen.len() + pending.len() + entries.len() > MAX_CLEANUP_OBJECTS {
+                    return Err("usage safety limit reached".into());
+                }
+                for (name, _) in entries {
+                    pending.push((append(&path, &name)?, depth + 1));
+                }
+            } else {
+                total = total
+                    .checked_add(object.size)
+                    .ok_or("usage arithmetic overflow")?;
+            }
+        }
+        Ok(total)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -421,22 +553,27 @@ impl LayoutManager {
                 components: components.clone(),
                 is_absolute: true,
             };
-            let id = match namespace.resolve(&current, namespace.root()) {
-                Ok(id) => id,
+            let (id, created) = match namespace.resolve(&current, namespace.root()) {
+                Ok(id) => (id, false),
                 Err(_) => {
                     let (parent, name) = current.parent_and_name().ok_or("invalid layout path")?;
-                    vfs.create(
-                        namespace,
-                        objects,
-                        actor,
-                        &parent,
-                        &name,
-                        ObjectType::Directory,
-                    )?
+                    (
+                        vfs.create(
+                            namespace,
+                            objects,
+                            actor,
+                            &parent,
+                            &name,
+                            ObjectType::Directory,
+                        )?,
+                        true,
+                    )
                 }
             };
             let object = objects.lookup(id).ok_or("layout object missing")?;
-            if object.object_type != ObjectType::Directory {
+            if object.object_type != ObjectType::Directory
+                || object.state != hyber_core::ObjectState::Live
+            {
                 return Err(format!("layout path is not a directory: {current}"));
             }
             // Intermediate shared roots remain system-owned. The final target
@@ -446,86 +583,28 @@ impl LayoutManager {
                     let existing = objects.lookup(id).ok_or("layout object missing")?;
                     (existing.owner, existing.group, existing.permissions)
                 };
-                if actor.user_id == owner && existing_owner != owner {
+                if !created && existing_owner != owner {
                     return Err("existing layout directory belongs to another user".into());
                 }
-                if existing_owner != owner {
-                    objects.chown(id, actor, owner)?;
+                if !created {
+                    // Provisioning is not chmod/chgrp: preserve deliberate changes.
+                    continue;
                 }
-                if existing_group != group {
-                    objects.chgrp(id, actor, group)?;
-                }
-                if existing_mode != mode {
-                    objects.chmod(id, actor, mode)?;
-                }
+                vfs.mutate_metadata(namespace, objects, actor, &current, |objects, id| {
+                    if existing_owner != owner {
+                        objects.chown(id, actor, owner)?;
+                    }
+                    if existing_group != group {
+                        objects.chgrp(id, actor, group)?;
+                    }
+                    if existing_mode != mode {
+                        objects.chmod(id, actor, mode)?;
+                    }
+                    Ok(())
+                })?;
             }
         }
         Ok(())
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "bounded cleanup carries explicit VFS state and traversal limits"
-    )]
-    fn clear_children(
-        &self,
-        vfs: &mut VFS,
-        namespace: &mut NamespaceManager,
-        objects: &mut ObjectManager,
-        system: &SecurityContext,
-        directory: &Path,
-        depth: usize,
-        removed: &mut usize,
-    ) -> Result<(), String> {
-        if depth > MAX_CLEANUP_DEPTH || *removed >= MAX_CLEANUP_OBJECTS {
-            return Err("cleanup safety limit reached".into());
-        }
-        let entries = vfs.enumerate_secure(namespace, objects, system, directory)?;
-        for (name, id) in entries {
-            let child = append(directory, &name)?;
-            if objects
-                .lookup(id)
-                .is_some_and(|object| object.object_type == ObjectType::Directory)
-            {
-                self.clear_children(vfs, namespace, objects, system, &child, depth + 1, removed)?;
-            }
-            vfs.remove(namespace, objects, system, directory, &name)?;
-            *removed = removed.checked_add(1).ok_or("cleanup count overflow")?;
-        }
-        Ok(())
-    }
-
-    fn usage_inner(
-        &self,
-        vfs: &VFS,
-        namespace: &NamespaceManager,
-        objects: &ObjectManager,
-        system: &SecurityContext,
-        path: &Path,
-        depth: usize,
-    ) -> Result<u64, String> {
-        if depth > MAX_CLEANUP_DEPTH {
-            return Err("usage traversal depth exceeded".into());
-        }
-        let id = namespace.resolve(path, namespace.root())?;
-        let object = objects.lookup(id).ok_or("usage object missing")?;
-        if object.object_type != ObjectType::Directory {
-            return Ok(object.size);
-        }
-        let mut total = 0u64;
-        for (name, _) in vfs.enumerate_secure(namespace, objects, system, path)? {
-            total = total
-                .checked_add(self.usage_inner(
-                    vfs,
-                    namespace,
-                    objects,
-                    system,
-                    &append(path, &name)?,
-                    depth + 1,
-                )?)
-                .ok_or("usage arithmetic overflow")?;
-        }
-        Ok(total)
     }
 }
 
@@ -548,7 +627,14 @@ fn validate_component(value: &str, what: &str) -> Result<(), String> {
 }
 
 fn append(parent: &Path, component: &str) -> Result<Path, String> {
-    validate_component(component, "path component")?;
+    if component.is_empty()
+        || component == "."
+        || component == ".."
+        || component.contains('/')
+        || component.contains('\0')
+    {
+        return Err("invalid path component".into());
+    }
     if !parent.is_absolute {
         return Err("layout parent must be absolute".into());
     }
@@ -681,6 +767,175 @@ mod tests {
             .check_quota(StorageClass::Runtime, quotas.runtime, 1)
             .is_err());
         assert!(quotas.check_quota(StorageClass::Data, 1, 2).is_ok());
+    }
+
+    #[test]
+    fn forged_layouts_and_noncanonical_homes_are_rejected() {
+        let (mut vfs, mut ns, mut objects, root) = fixture();
+        let manager = LayoutManager::default();
+        for home in ["/users/other/../alice", "/users//alice", "/users/alice/"] {
+            assert!(UserLayout::new(UserId(1), GroupId(1), "alice", home).is_err());
+        }
+        let mut user = UserLayout::root();
+        user.home = Path::parse("/data");
+        assert!(manager
+            .provision_user(&mut vfs, &mut ns, &mut objects, &root, &user)
+            .is_err());
+        assert!(manager
+            .cleanup_user_disposable(
+                &mut vfs,
+                &mut ns,
+                &mut objects,
+                &root,
+                &user,
+                StorageClass::Cache
+            )
+            .is_err());
+        let mut app = AppLayout::new(UserLayout::root(), "editor").unwrap();
+        app.data = Path::parse("/data/private");
+        assert!(manager
+            .ensure_application(&mut vfs, &mut ns, &mut objects, &root, &app)
+            .is_err());
+        assert!(ns.resolve(&Path::parse("/data"), ns.root()).is_err());
+    }
+
+    #[test]
+    fn reprovisioning_never_transfers_existing_ownership_or_resets_modes() {
+        let (mut vfs, mut ns, mut objects, root) = fixture();
+        let manager = LayoutManager::default();
+        let user = UserLayout::new(UserId(1), GroupId(1), "alice", "/users/alice").unwrap();
+        manager
+            .provision_user(&mut vfs, &mut ns, &mut objects, &root, &user)
+            .unwrap();
+        let id = ns.resolve(&user.home, ns.root()).unwrap();
+        objects.chmod(id, &root, 0o750).unwrap();
+        manager
+            .provision_user(&mut vfs, &mut ns, &mut objects, &root, &user)
+            .unwrap();
+        assert_eq!(objects.lookup(id).unwrap().permissions, 0o750);
+        let recycled_name =
+            UserLayout::new(UserId(2), GroupId(2), "alice", "/users/alice").unwrap();
+        assert!(manager
+            .provision_user(&mut vfs, &mut ns, &mut objects, &root, &recycled_name)
+            .is_err());
+        assert_eq!(objects.lookup(id).unwrap().owner, UserId(1));
+    }
+
+    #[test]
+    fn cleanup_preflights_mounts_ownership_and_references_and_accepts_utf8() {
+        let (mut vfs, mut ns, mut objects, root) = fixture();
+        let manager = LayoutManager::default();
+        let user = UserLayout::root();
+        manager
+            .provision_user(&mut vfs, &mut ns, &mut objects, &root, &user)
+            .unwrap();
+        let cache = append(&user.home, ".cache").unwrap();
+        let name = "sınaq sənədi.txt";
+        let file = vfs
+            .create(&mut ns, &mut objects, &root, &cache, name, ObjectType::File)
+            .unwrap();
+        objects.lookup_mut(file).unwrap().size = 42;
+        assert_eq!(
+            manager.usage(&vfs, &ns, &objects, &root, &cache).unwrap(),
+            42
+        );
+        assert!(objects.retain(file));
+        assert!(manager
+            .cleanup_user_disposable(
+                &mut vfs,
+                &mut ns,
+                &mut objects,
+                &root,
+                &user,
+                StorageClass::Cache
+            )
+            .is_err());
+        assert!(objects.lookup(file).is_some());
+        assert!(!objects.release(file)); // Still retained by its namespace node.
+        assert_eq!(objects.lookup(file).unwrap().references, 1);
+        objects.chown(file, &root, UserId(9)).unwrap();
+        assert!(manager
+            .cleanup_user_disposable(
+                &mut vfs,
+                &mut ns,
+                &mut objects,
+                &root,
+                &user,
+                StorageClass::Cache
+            )
+            .is_err());
+        objects.chown(file, &root, UserId(0)).unwrap();
+        let report = manager
+            .cleanup_user_disposable(
+                &mut vfs,
+                &mut ns,
+                &mut objects,
+                &root,
+                &user,
+                StorageClass::Cache,
+            )
+            .unwrap();
+        assert_eq!(report.removed_objects, 1);
+        vfs.create(
+            &mut ns,
+            &mut objects,
+            &root,
+            &cache,
+            "keep",
+            ObjectType::File,
+        )
+        .unwrap();
+        // Even a mount to the same provider is a boundary, not disposable data.
+        vfs.mount(append(&cache, "nested").unwrap(), "mem".into());
+        assert!(manager
+            .cleanup_user_disposable(
+                &mut vfs,
+                &mut ns,
+                &mut objects,
+                &root,
+                &user,
+                StorageClass::Cache
+            )
+            .is_err());
+        assert!(ns
+            .resolve(&append(&cache, "keep").unwrap(), ns.root())
+            .is_ok());
+    }
+
+    #[test]
+    fn cleanup_depth_failure_does_not_partially_delete() {
+        let (mut vfs, mut ns, mut objects, root) = fixture();
+        let manager = LayoutManager::default();
+        let user = UserLayout::root();
+        manager
+            .provision_user(&mut vfs, &mut ns, &mut objects, &root, &user)
+            .unwrap();
+        let cache = append(&user.home, ".cache").unwrap();
+        let mut path = cache.clone();
+        for _ in 0..=MAX_CLEANUP_DEPTH {
+            vfs.create(
+                &mut ns,
+                &mut objects,
+                &root,
+                &path,
+                "d",
+                ObjectType::Directory,
+            )
+            .unwrap();
+            path = append(&path, "d").unwrap();
+        }
+        assert!(manager
+            .cleanup_user_disposable(
+                &mut vfs,
+                &mut ns,
+                &mut objects,
+                &root,
+                &user,
+                StorageClass::Cache
+            )
+            .is_err());
+        assert!(ns.resolve(&path, ns.root()).is_ok());
+        assert!(manager.usage(&vfs, &ns, &objects, &root, &cache).is_err());
     }
 
     #[test]

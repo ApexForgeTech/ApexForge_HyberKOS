@@ -559,6 +559,8 @@ impl<D: BlockDevice> Volume<D> {
             self.state.next_id = id;
             return Err(error);
         }
+        let metadata = &mut self.state.objects.get_mut(&parent).unwrap().metadata;
+        metadata.modified = metadata.modified.max(timestamp);
         self.dirty = true;
         Ok(id)
     }
@@ -663,6 +665,7 @@ impl<D: BlockDevice> Volume<D> {
     }
     pub fn rename(&mut self, old: &str, new: &str) -> Result<(), FsError> {
         self.writable()?;
+        let timestamp = timestamp()?;
         let (op, on) = self.parent_and_name(old)?;
         let (np, nn) = self.parent_and_name(new)?;
         let oid = self
@@ -711,11 +714,16 @@ impl<D: BlockDevice> Volume<D> {
                 .insert(on, oid);
             return Err(error);
         }
+        for parent in [op, np] {
+            let metadata = &mut self.state.objects.get_mut(&parent).unwrap().metadata;
+            metadata.modified = metadata.modified.max(timestamp);
+        }
         self.dirty = true;
         Ok(())
     }
     pub fn unlink(&mut self, path: &str) -> Result<(), FsError> {
         self.writable()?;
+        let timestamp = timestamp()?;
         let (parent, name) = self.parent_and_name(path)?;
         let id = self
             .state
@@ -741,6 +749,8 @@ impl<D: BlockDevice> Volume<D> {
             .entries
             .remove(&name);
         self.state.objects.remove(&id);
+        let metadata = &mut self.state.objects.get_mut(&parent).unwrap().metadata;
+        metadata.modified = metadata.modified.max(timestamp);
         self.dirty = true;
         Ok(())
     }
@@ -877,7 +887,7 @@ impl<D: BlockDevice> Volume<D> {
         metadata: Metadata,
     ) -> Result<(), FsError> {
         self.writable()?;
-        validate_mode(metadata.mode)?;
+        validate_metadata(&metadata)?;
         if data.len() > slot_capacity(self.blocks) {
             return Err(FsError::NoSpace);
         }
@@ -1128,6 +1138,12 @@ fn decode_state(b: &[u8]) -> Result<State, FsError> {
     let mut objects = BTreeMap::new();
     for _ in 0..count {
         let id = r.u64()?;
+        if objects
+            .last_key_value()
+            .is_some_and(|(previous, _)| *previous >= id)
+        {
+            return Err(FsError::Corrupt("object records are not strictly sorted"));
+        }
         let kind = ObjectKind::from_byte(r.byte()?)?;
         let mut metadata = Metadata {
             owner: r.u32()?,
@@ -1146,6 +1162,13 @@ fn decode_state(b: &[u8]) -> Result<State, FsError> {
             let key = String::from_utf8(r.raw()?)
                 .map_err(|_| FsError::Corrupt("invalid metadata utf8"))?;
             let value = r.raw()?;
+            if metadata
+                .extended
+                .last_key_value()
+                .is_some_and(|(previous, _)| previous >= &key)
+            {
+                return Err(FsError::Corrupt("metadata keys are not strictly sorted"));
+            }
             if metadata.extended.insert(key, value).is_some() {
                 return Err(FsError::Corrupt("duplicate metadata key"));
             }
@@ -1158,6 +1181,12 @@ fn decode_state(b: &[u8]) -> Result<State, FsError> {
                 String::from_utf8(r.raw()?).map_err(|_| FsError::Corrupt("invalid name utf8"))?;
             validate_name(&n)?;
             let child = r.u64()?;
+            if entries
+                .last_key_value()
+                .is_some_and(|(previous, _)| previous >= &n)
+            {
+                return Err(FsError::Corrupt("directory names are not strictly sorted"));
+            }
             if entries.insert(n, child).is_some() {
                 return Err(FsError::Corrupt("duplicate name"));
             }
@@ -1232,6 +1261,94 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_mutation_times_persist_and_failed_operations_preserve_state() {
+        let mut fs = Volume::format(MemDevice::new(8).unwrap()).unwrap();
+        fs.create_dir("/a", 0o700).unwrap();
+        fs.create_dir("/b", 0o700).unwrap();
+        let old = Metadata {
+            created: 1,
+            modified: 1,
+            ..Metadata::default()
+        };
+        fs.set_metadata("/a", old.clone()).unwrap();
+        fs.create_file("/a/file", 0o600).unwrap();
+        assert!(fs.stat("/a").unwrap().metadata.modified > 1);
+        fs.set_metadata("/a", old.clone()).unwrap();
+        fs.set_metadata("/b", old.clone()).unwrap();
+        fs.rename("/a/file", "/b/file").unwrap();
+        assert!(fs.stat("/a").unwrap().metadata.modified > 1);
+        assert!(fs.stat("/b").unwrap().metadata.modified > 1);
+        fs.set_metadata("/b", old).unwrap();
+        fs.unlink("/b/file").unwrap();
+        let expected = fs.stat("/b").unwrap().metadata;
+        assert!(expected.modified > 1);
+        let before = fs.state.clone();
+        assert!(fs.unlink("/b/missing").is_err());
+        assert_eq!(fs.state, before);
+        let fs = Volume::mount(fs.unmount().unwrap()).unwrap();
+        assert_eq!(fs.stat("/b").unwrap().metadata, expected);
+    }
+
+    #[test]
+    fn noncanonical_record_order_is_rejected_and_recovery_is_read_only() {
+        let mut fs = Volume::format(MemDevice::new(16).unwrap()).unwrap();
+        fs.create_file("/alpha", 0o600).unwrap();
+        fs.sync().unwrap();
+        let state = fs.state.clone();
+        let mut payload = Vec::new();
+        putv(&mut payload, state.next_id);
+        putv(&mut payload, state.root);
+        putv(&mut payload, state.objects.len() as u64);
+        for (&id, object) in state.objects.iter().rev() {
+            let single = State {
+                objects: BTreeMap::from([(id, object.clone())]),
+                ..state.clone()
+            };
+            payload.extend_from_slice(&encode_state(&single)[24..]);
+        }
+        assert!(decode_state(&payload).is_err());
+        let inactive = 1 - fs.active_slot;
+        let generation = fs.generation + 1;
+        let mut device = fs.into_device();
+        write_slot(&mut device, 16, inactive, generation, &payload).unwrap();
+        let mut recovered = Volume::mount(device).unwrap();
+        assert!(!recovered.recovery_warnings().is_empty());
+        assert!(recovered.stat("/alpha").is_ok());
+        assert!(recovered.create_file("/must-not-write", 0o600).is_err());
+        assert!(recovered.sync().is_err());
+    }
+
+    #[test]
+    fn metadata_and_directory_key_order_are_validated() {
+        let mut fs = Volume::format(MemDevice::new(16).unwrap()).unwrap();
+        fs.create_file("/entry-alpha", 0o600).unwrap();
+        fs.create_file("/entry-bravo", 0o600).unwrap();
+        let mut metadata = fs.stat("/").unwrap().metadata;
+        metadata.extended.insert("key-alpha".into(), vec![]);
+        metadata.extended.insert("key-bravo".into(), vec![]);
+        fs.set_metadata("/", metadata).unwrap();
+        let original = encode_state(&fs.state);
+        for (first, second) in [
+            (b"key-alpha".as_slice(), b"key-bravo".as_slice()),
+            (b"entry-alpha".as_slice(), b"entry-bravo".as_slice()),
+        ] {
+            let mut payload = original.clone();
+            let a = payload
+                .windows(first.len())
+                .position(|bytes| bytes == first)
+                .unwrap();
+            let b = payload
+                .windows(second.len())
+                .position(|bytes| bytes == second)
+                .unwrap();
+            payload[a..a + first.len()].copy_from_slice(second);
+            payload[b..b + second.len()].copy_from_slice(first);
+            assert!(decode_state(&payload).is_err());
+        }
+        assert_eq!(decode_state(&original).unwrap(), fs.state);
+    }
 
     #[test]
     fn metadata_roundtrip_uuid_and_invalid_updates() {

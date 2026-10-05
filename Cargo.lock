@@ -217,6 +217,9 @@ dependencies = [
 [[package]]
 name = "hyber-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "hyber-device"
@@ -252,6 +255,9 @@ dependencies = [
  "hyber-namespace",
  "hyber-object",
  "hyber-vfs",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -352,6 +358,9 @@ dependencies = [
  "hyber-process",
  "hyber-service",
  "hyber-vfs",
+ "libc",
+ "mlua",
+ "serde_json",
 ]
 
 [[package]]

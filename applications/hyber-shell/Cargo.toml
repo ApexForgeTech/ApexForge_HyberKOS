@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+libc = "0.2"
+serde_json = "1"
+mlua = { version = "0.9", features = ["lua54", "vendored"] }
 hyber-auth = { path = "../../crates/hyber-auth" }
 hyber-core = { path = "../../crates/hyber-core" }
 hyber-object = { path = "../../crates/hyber-object" }

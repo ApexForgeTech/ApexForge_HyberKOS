@@ -85,6 +85,10 @@ Metadata keys and directory names are encoded sorted. Duplicate keys, names,
 IDs, or trailing payload bytes are invalid. Modes permit only rwx bits
 (`0..0777`). Modified time cannot precede creation time. Creation and content
 writes use hosted Unix seconds; same-second writes may share a timestamp.
+Decoding rejects non-increasing object IDs, metadata keys, and directory names,
+even when the payload checksum is valid. Successful create/unlink updates the
+parent directory's modified time; rename updates both parents. Times never
+regress, and rejected mutations leave these timestamps unchanged.
 
 Every non-root object has exactly one parent; hard links are unsupported.
 Root must be a directory. Files have no entries; directories have no file
