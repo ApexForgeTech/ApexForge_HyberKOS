@@ -21,5 +21,9 @@ hyber-device     = { path = "../../crates/hyber-device" }
 hyber-service    = { path = "../../crates/hyber-service" }
 hyber-memfs      = { path = "../../crates/hyber-memfs" }
 hyber-hostfs     = { path = "../../backends/linux/hyber-hostfs" }
+hyber-layout     = { path = "../../crates/hyber-layout" }
 toml             = "0.8"
 serde            = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+hyber-identity   = { path = "../../crates/hyber-identity" }

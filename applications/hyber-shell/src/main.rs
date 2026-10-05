@@ -11,6 +11,7 @@ use hyber_core::{
 use hyber_device::{DeviceClass, DeviceManager, DeviceProvider};
 use hyber_handle::HandleManager;
 use hyber_hostfs::HostFSProvider;
+use hyber_layout::{LayoutManager, UserLayout};
 use hyber_memfs::MemFSProvider;
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
@@ -30,6 +31,7 @@ struct HyberShell {
     proc_mgr: Arc<Mutex<ProcessManager>>,
     dev_mgr: Arc<Mutex<DeviceManager>>,
     svc_mgr: Arc<Mutex<ServiceManager>>,
+    layout: LayoutManager,
     running: bool,
 }
 
@@ -59,7 +61,12 @@ impl HyberShell {
         let mut proc_mgr = ProcessManager::new();
         let root_security = SecurityContext::root();
         let shell_pid = proc_mgr
-            .create_process(&mut obj_mgr, None, root_security, Some(std::process::id()))
+            .create_process(
+                &mut obj_mgr,
+                None,
+                root_security.clone(),
+                Some(std::process::id()),
+            )
             .map_err(|e| format!("Failed to create shell process: {e}"))?;
         proc_mgr
             .start_process(shell_pid)
@@ -228,6 +235,12 @@ impl HyberShell {
         vfs.register_provider("tmp-memfs".to_string(), Box::new(MemFSProvider::new()));
         vfs.mount(Path::parse("/temporary"), "tmp-memfs".to_string());
 
+        // Special_3 owns the canonical data roots. Run this after virtual
+        // mounts exist so runtime and temporary state are never accidentally
+        // created in the persistent HostFS provider.
+        let layout = LayoutManager::default();
+        layout.initialize_system(&mut vfs, &mut ns_mgr, &mut obj_mgr, &root_security)?;
+
         let current_dir = Path::parse("/");
 
         Ok(Self {
@@ -241,6 +254,7 @@ impl HyberShell {
             proc_mgr: proc_mgr_arc,
             dev_mgr,
             svc_mgr,
+            layout,
             running: true,
         })
     }
@@ -304,53 +318,23 @@ impl HyberShell {
         Ok(())
     }
 
-    /// Materialize the authenticated identity's validated `/users/<name>`
-    /// directory before accepting commands.  Identity owns the path policy;
-    /// this shell only creates the missing namespace object with a privileged
-    /// bootstrap context, then assigns it to the session identity.
+    /// Materialize the authenticated identity's complete Special_3 layout
+    /// before accepting commands. Identity provides the canonical home path;
+    /// LayoutManager creates only Hyber namespace objects and never uses a
+    /// host account or caller-supplied path.
     fn ensure_session_home(&mut self) -> Result<(), String> {
         let session = self.session.as_ref().ok_or("no authenticated session")?;
         let context = session.context().map_err(|e| e.to_string())?;
+        let username = session.username().map_err(|e| e.to_string())?;
         let home = session.home().map_err(|e| e.to_string())?;
-        let path = Path::parse(&home).normalize();
-        if !path.is_absolute || path.components.len() != 2 || path.components[0].0 != "users" {
-            return Err("identity supplied an invalid home path".into());
-        }
-
-        match self.ns_mgr.resolve(&path, self.ns_mgr.root()) {
-            Ok(id) => {
-                let object = self.obj_mgr.lookup(id).ok_or("home object missing")?;
-                if object.object_type != ObjectType::Directory
-                    || object.owner != context.user_id
-                    || object.group != context.group_id
-                {
-                    return Err("existing home directory belongs to another identity".into());
-                }
-                Ok(())
-            }
-            Err(_) => {
-                let (parent, name) = path.parent_and_name().ok_or("invalid home path")?;
-                let bootstrap = SecurityContext {
-                    user_id: UserId(0),
-                    group_id: GroupId(0),
-                    supplementary_groups: Vec::new(),
-                    capabilities: Vec::new(),
-                };
-                let id = self.vfs.create(
-                    &mut self.ns_mgr,
-                    &mut self.obj_mgr,
-                    &bootstrap,
-                    &parent,
-                    &name,
-                    ObjectType::Directory,
-                )?;
-                let object = self.obj_mgr.lookup_mut(id).ok_or("home object missing")?;
-                object.owner = context.user_id;
-                object.group = context.group_id;
-                object.permissions = 0o700;
-                Ok(())
-            }
-        }
+        let user = UserLayout::new(context.user_id, context.group_id, username, home)?;
+        self.layout.provision_user(
+            &mut self.vfs,
+            &mut self.ns_mgr,
+            &mut self.obj_mgr,
+            &SecurityContext::root(),
+            &user,
+        )
     }
 
     /// Main REPL loop
@@ -1973,6 +1957,9 @@ mod session_tests {
         shell
             .cmd_chgrp(&["root", "/temporary/permission-test"])
             .unwrap();
+        shell
+            .cmd_chown(&["root", "/temporary/permission-test"])
+            .unwrap();
         assert!(shell
             .cmd_chmod(&["4755", "/temporary/permission-test"])
             .is_err());
@@ -1982,6 +1969,9 @@ mod session_tests {
             .is_err());
         assert!(shell
             .cmd_chgrp(&["root", "/temporary/permission-test"])
+            .is_err());
+        assert!(shell
+            .cmd_chown(&["root", "/temporary/permission-test"])
             .is_err());
         assert!(shell.whoami_name().is_err());
         assert!(shell.cmd_su(&["0"]).is_err());
@@ -2002,6 +1992,25 @@ mod session_tests {
         assert_eq!(home_object.owner, UserId(0));
         assert_eq!(home_object.group, GroupId(0));
         assert_eq!(home_object.permissions, 0o700);
+        for path in [
+            "/users/root/Documents",
+            "/users/root/Downloads",
+            "/users/root/.config",
+            "/users/root/.local/share",
+            "/users/root/.local/state",
+            "/users/root/.cache",
+            "/users/root/.local/bin",
+            "/runtime/users/0",
+            "/temporary/users/0",
+        ] {
+            let id = shell
+                .ns_mgr
+                .resolve(&Path::parse(path), shell.ns_mgr.root())
+                .unwrap();
+            let object = shell.obj_mgr.lookup(id).unwrap();
+            assert_eq!(object.owner, UserId(0), "{path}");
+            assert_eq!(object.permissions, 0o700, "{path}");
+        }
         assert!(shell.cmd_su(&["0"]).is_err());
         shell.execute_single("pwd");
         assert!(shell.running);

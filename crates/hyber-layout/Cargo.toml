@@ -1,0 +1,14 @@
+[package]
+name = "hyber-layout"
+version = "0.1.0"
+edition = "2021"
+description = "Special_3 Hyber home, application-data, runtime, and cleanup layout"
+
+[dependencies]
+hyber-core = { path = "../hyber-core" }
+hyber-object = { path = "../hyber-object" }
+hyber-namespace = { path = "../hyber-namespace" }
+hyber-vfs = { path = "../hyber-vfs" }
+
+[dev-dependencies]
+hyber-memfs = { path = "../hyber-memfs" }

@@ -16,5 +16,6 @@ members = [
     "applications/hyberfs-tool",
     "crates/hyber-identity",
     "crates/hyber-auth",
+    "crates/hyber-layout",
 ]
 resolver = "2"

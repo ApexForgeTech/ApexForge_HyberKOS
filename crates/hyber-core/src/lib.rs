@@ -492,8 +492,10 @@ mod tests {
             supplementary_groups: vec![],
             capabilities: vec![],
         };
-        let connect = Rights {
+        let special = Rights {
             connect: true,
+            wait: true,
+            signal: true,
             ..Rights::empty()
         };
         assert!(SecurityManager::check_access(
@@ -501,18 +503,18 @@ mod tests {
             UserId(1000),
             GroupId(1000),
             0o777,
-            connect,
+            special,
         )
         .is_err());
-        context.capabilities.push(Capability {
-            name: "CAP_OBJECT_CONNECT".into(),
-        });
+        for name in ["CAP_OBJECT_CONNECT", "CAP_OBJECT_WAIT", "CAP_OBJECT_SIGNAL"] {
+            context.capabilities.push(Capability { name: name.into() });
+        }
         assert!(SecurityManager::check_access(
             &context,
             UserId(1000),
             GroupId(1000),
             0o777,
-            connect,
+            special,
         )
         .is_ok());
     }

@@ -58,6 +58,16 @@
 //! | `hyber.log.warn(msg)` | warning print |
 //! | `hyber.log.error(msg)` | error print |
 //!
+//! ### `hyber.app` *(Special_3)*
+//! | Function | Description |
+//! |---|---|
+//! | `hyber.app.config_dir()` | private configuration directory |
+//! | `hyber.app.data_dir()` | persistent application-data directory |
+//! | `hyber.app.state_dir()` | recoverable state directory |
+//! | `hyber.app.cache_dir()` | disposable cache directory |
+//! | `hyber.app.temp_dir()` | disposable temporary directory |
+//! | `hyber.app.runtime_dir()` | volatile runtime directory |
+//!
 //! ### `hyber.input` *(early, OS-neutral event queue)*
 //! | Function | Description |
 //! |---|---|
@@ -68,6 +78,7 @@
 
 use hyber_core::{MetadataValue, Path, ProcessId, Rights, SecurityContext, SecurityManager};
 use hyber_handle::HandleManager;
+use hyber_layout::AppLayout;
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
 use hyber_process::ProcessManager;
@@ -87,6 +98,7 @@ struct KernelState {
     proc_mgr: Arc<Mutex<ProcessManager>>,
     process_id: ProcessId,
     security_context: SecurityContext,
+    app_layout: Option<AppLayout>,
     input_queue: VecDeque<InputEvent>,
 }
 
@@ -125,7 +137,7 @@ pub fn run_lua_script(
     ObjectManager,
     Result<(), mlua::Error>,
 ) {
-    run_lua_script_with_session(
+    run_lua_script_with_session_and_layout(
         script,
         vfs,
         ns_mgr,
@@ -135,6 +147,42 @@ pub fn run_lua_script(
         process_id,
         security_context,
         None,
+        None,
+    )
+}
+
+/// Execute a Lua script with an authenticated session and, when it is an
+/// application, the canonical Special_3 logical storage paths.
+#[allow(clippy::too_many_arguments, clippy::arc_with_non_send_sync)]
+pub fn run_lua_script_with_session_and_layout(
+    script: &str,
+    vfs: VFS,
+    ns_mgr: NamespaceManager,
+    handle_mgr: HandleManager,
+    obj_mgr: ObjectManager,
+    proc_mgr: Arc<Mutex<ProcessManager>>,
+    process_id: ProcessId,
+    security_context: SecurityContext,
+    session: Option<hyber_auth::SessionGuard>,
+    app_layout: Option<AppLayout>,
+) -> (
+    VFS,
+    NamespaceManager,
+    HandleManager,
+    ObjectManager,
+    Result<(), mlua::Error>,
+) {
+    run_lua_script_with_session_and_layout_impl(
+        script,
+        vfs,
+        ns_mgr,
+        handle_mgr,
+        obj_mgr,
+        proc_mgr,
+        process_id,
+        security_context,
+        session,
+        app_layout,
     )
 }
 
@@ -158,6 +206,39 @@ pub fn run_lua_script_with_session(
     ObjectManager,
     Result<(), mlua::Error>,
 ) {
+    run_lua_script_with_session_and_layout(
+        script,
+        vfs,
+        ns_mgr,
+        handle_mgr,
+        obj_mgr,
+        proc_mgr,
+        process_id,
+        security_context,
+        session,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::arc_with_non_send_sync)]
+fn run_lua_script_with_session_and_layout_impl(
+    script: &str,
+    vfs: VFS,
+    ns_mgr: NamespaceManager,
+    handle_mgr: HandleManager,
+    obj_mgr: ObjectManager,
+    proc_mgr: Arc<Mutex<ProcessManager>>,
+    process_id: ProcessId,
+    security_context: SecurityContext,
+    session: Option<hyber_auth::SessionGuard>,
+    app_layout: Option<AppLayout>,
+) -> (
+    VFS,
+    NamespaceManager,
+    HandleManager,
+    ObjectManager,
+    Result<(), mlua::Error>,
+) {
     let state = Arc::new(Mutex::new(KernelState {
         session,
         vfs,
@@ -167,6 +248,7 @@ pub fn run_lua_script_with_session(
         proc_mgr,
         process_id,
         security_context,
+        app_layout,
         input_queue: VecDeque::new(),
     }));
 
@@ -217,6 +299,7 @@ fn build_hyber_table(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<()>
     hyber.set("proc", build_proc(lua, Arc::clone(&state))?)?;
     hyber.set("sec", build_sec(lua, Arc::clone(&state))?)?;
     hyber.set("input", build_input(lua, Arc::clone(&state))?)?;
+    hyber.set("app", build_app(lua, Arc::clone(&state))?)?;
     hyber.set("log", build_log(lua)?)?;
     hyber.set(
         "cls",
@@ -718,6 +801,38 @@ fn build_sec(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
     Ok(t)
 }
 
+// ── hyber.app ───────────────────────────────────────────────────────────────
+
+/// Logical application storage locations. Lua gets Hyber namespace paths, not
+/// host paths; access still goes through `hyber.fs` and the VFS permission
+/// checks. A future persistent provider can keep this API unchanged.
+fn build_app(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>> {
+    let table = lua.create_table()?;
+    macro_rules! logical_dir {
+        ($name:literal, $field:ident) => {{
+            let state = Arc::clone(&state);
+            table.set(
+                $name,
+                lua.create_function(move |_lua, ()| {
+                    let state = lock(&state)?;
+                    state
+                        .app_layout
+                        .as_ref()
+                        .map(|layout| layout.$field.to_string())
+                        .ok_or_else(|| lua_err("application layout is unavailable".into()))
+                })?,
+            )?;
+        }};
+    }
+    logical_dir!("config_dir", config);
+    logical_dir!("data_dir", data);
+    logical_dir!("state_dir", state);
+    logical_dir!("cache_dir", cache);
+    logical_dir!("temp_dir", temporary);
+    logical_dir!("runtime_dir", runtime);
+    Ok(table)
+}
+
 // ── hyber.input ─────────────────────────────────────────────────────────────
 
 /// Input is intentionally an OS-neutral event queue.  A future display/input
@@ -892,6 +1007,7 @@ fn metadata_to_lua<'lua>(lua: &'lua Lua, val: &MetadataValue) -> LuaResult<LuaVa
 mod tests {
     use super::*;
     use hyber_core::ObjectType;
+    use hyber_layout::{AppLayout, UserLayout};
 
     #[test]
     fn metadata_cannot_bypass_private_parent_directory() {
@@ -1006,5 +1122,43 @@ mod tests {
             SecurityContext::root(),
         );
         assert!(result.is_ok(), "Lua input script failed: {result:?}");
+    }
+
+    #[test]
+    fn logical_application_directories_are_exposed_without_host_paths() {
+        let mut objects = ObjectManager::new();
+        let namespace = NamespaceManager::new(&mut objects);
+        let mut processes = ProcessManager::new();
+        let process_id = processes
+            .create_process(&mut objects, None, SecurityContext::root(), None)
+            .unwrap();
+        let user = UserLayout::new(
+            hyber_core::UserId(1000),
+            hyber_core::GroupId(1000),
+            "alice",
+            "/users/alice",
+        )
+        .unwrap();
+        let layout = AppLayout::new(user, "editor").unwrap();
+        let (_, _, _, _, result) = run_lua_script_with_session_and_layout(
+            r#"
+                assert(hyber.app.config_dir() == '/users/alice/.config/editor')
+                assert(hyber.app.data_dir() == '/users/alice/.local/share/editor')
+                assert(hyber.app.state_dir() == '/users/alice/.local/state/editor')
+                assert(hyber.app.cache_dir() == '/users/alice/.cache/editor')
+                assert(hyber.app.temp_dir() == '/temporary/users/1000/editor')
+                assert(hyber.app.runtime_dir() == '/runtime/users/1000/editor')
+            "#,
+            VFS::new(),
+            namespace,
+            HandleManager::new(),
+            objects,
+            Arc::new(Mutex::new(processes)),
+            process_id,
+            SecurityContext::root(),
+            None,
+            Some(layout),
+        );
+        assert!(result.is_ok(), "Lua app layout failed: {result:?}");
     }
 }

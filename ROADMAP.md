@@ -3098,6 +3098,21 @@ runtime/temp cleanup is safe and observable
 persistent paths survive remount; cache/temp are disposable
 ```
 
+## Current Hosted Foundation
+
+The current implementation is `crates/hyber-layout`. It validates canonical
+user/app identifiers, provisions the global/user/service layout through Hyber
+VFS, assigns Hyber owner/group/mode metadata, derives per-application logical
+paths, defines explicit class quotas, and performs bounded observable cleanup
+only for cache/runtime/temporary roots. `hyber.app.*_dir()` exposes those
+logical paths to Lua without host-path access.
+
+The shell provisions the complete authenticated home tree and user runtime/temp
+roots. The in-memory developer context applies the same isolation rules. HostFS
+persists directory contents but does not yet persist Hyber ownership/mode
+metadata across a fresh import; native/persistent provider enforcement of write
+quotas remains future work and must not be claimed as complete.
+
 ---
 
 # Special_4 — Shell Input, History, and Navigation

@@ -1,5 +1,6 @@
-use hyber_core::{ObjectType, Path, ProcessId, SecurityContext};
+use hyber_core::{Path, ProcessId, SecurityContext};
 use hyber_handle::HandleManager;
+use hyber_layout::{AppLayout, LayoutManager, UserLayout};
 use hyber_memfs::MemFSProvider;
 use hyber_namespace::NamespaceManager;
 use hyber_object::ObjectManager;
@@ -21,13 +22,25 @@ pub struct AppContext {
     pub proc_mgr: Arc<Mutex<ProcessManager>>,
     pub process_id: ProcessId,
     pub security_context: SecurityContext,
+    pub app_layout: AppLayout,
 }
 
 impl AppContext {
     pub fn new() -> Result<Self, String> {
+        Self::new_for_app("script")
+    }
+
+    pub fn new_for_app(app_id: &str) -> Result<Self, String> {
+        Self::for_identity(SecurityContext::root(), UserLayout::root(), app_id)
+    }
+
+    fn for_identity(
+        security_context: SecurityContext,
+        user_layout: UserLayout,
+        app_id: &str,
+    ) -> Result<Self, String> {
         let mut obj_mgr = ObjectManager::new();
-        let ns_mgr = NamespaceManager::new(&mut obj_mgr);
-        let security_context = SecurityContext::root();
+        let mut ns_mgr = NamespaceManager::new(&mut obj_mgr);
         let mut process_manager = ProcessManager::new();
         let process_id =
             process_manager.create_process(&mut obj_mgr, None, security_context.clone(), None)?;
@@ -36,8 +49,20 @@ impl AppContext {
         let mut vfs = VFS::new();
         vfs.register_provider("app-memfs".into(), Box::new(MemFSProvider::new()));
         vfs.mount(Path::parse("/"), "app-memfs".into());
+        let layout = LayoutManager::default();
+        let system = SecurityContext::root();
+        layout.initialize_system(&mut vfs, &mut ns_mgr, &mut obj_mgr, &system)?;
+        layout.provision_user(&mut vfs, &mut ns_mgr, &mut obj_mgr, &system, &user_layout)?;
+        let app_layout = AppLayout::new(user_layout, app_id)?;
+        layout.ensure_application(
+            &mut vfs,
+            &mut ns_mgr,
+            &mut obj_mgr,
+            &security_context,
+            &app_layout,
+        )?;
 
-        let mut context = Self {
+        Ok(Self {
             session: None,
             vfs,
             ns_mgr,
@@ -46,43 +71,19 @@ impl AppContext {
             proc_mgr: Arc::new(Mutex::new(process_manager)),
             process_id,
             security_context,
-        };
-
-        // Give every command the same volatile application areas.  Persistent
-        // HostFS and a stable cross-language ABI remain explicitly out of scope
-        // until their planned phases.
-        for name in ["apps", "data", "runtime", "temporary"] {
-            context.vfs.create(
-                &mut context.ns_mgr,
-                &mut context.obj_mgr,
-                &context.security_context,
-                &Path::parse("/"),
-                name,
-                ObjectType::Directory,
-            )?;
-        }
-        Ok(context)
+            app_layout,
+        })
     }
 
-    pub fn authenticated(session: hyber_auth::SessionGuard) -> Result<Self, String> {
+    pub fn authenticated_for_app(
+        session: hyber_auth::SessionGuard,
+        app_id: &str,
+    ) -> Result<Self, String> {
         let security = session.context().map_err(|e| e.to_string())?;
-        let mut context = Self::new()?;
-        // The private app namespace belongs to this session, including its root.
-        let mut ids = vec![context.ns_mgr.root()];
-        for path in ["/apps", "/data", "/runtime", "/temporary"] {
-            ids.push(
-                context
-                    .ns_mgr
-                    .resolve(&Path::parse(path), context.ns_mgr.root())?,
-            );
-        }
-        for id in ids {
-            if let Some(object) = context.obj_mgr.lookup_mut(id) {
-                object.owner = security.user_id;
-                object.group = security.group_id;
-                object.permissions = 0o700;
-            }
-        }
+        let username = session.username().map_err(|e| e.to_string())?;
+        let home = session.home().map_err(|e| e.to_string())?;
+        let user = UserLayout::new(security.user_id, security.group_id, username, home)?;
+        let mut context = Self::for_identity(security.clone(), user, app_id)?;
         context
             .proc_mgr
             .lock()
@@ -93,5 +94,62 @@ impl AppContext {
         context.security_context = security;
         context.session = Some(session);
         Ok(context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyber_auth::{AuthService, SessionGuard, SessionKind, SystemClock};
+    use hyber_identity::AccountState;
+
+    #[test]
+    fn authenticated_context_preserves_system_roots_and_provisions_private_layout() {
+        let password = b"temporary root password";
+        let mut auth = AuthService::provision(password, Arc::new(SystemClock)).unwrap();
+        let admin = auth
+            .login("root", password, SessionKind::Interactive, 600)
+            .unwrap();
+        let group = auth
+            .edit_accounts(&admin, |accounts| accounts.create_group("users"))
+            .unwrap();
+        let alice = auth
+            .edit_accounts(&admin, |accounts| {
+                accounts.create_user("alice", group, AccountState::Active)
+            })
+            .unwrap();
+        auth.set_password(&admin, alice, b"temporary alice password")
+            .unwrap();
+        let token = auth
+            .login(
+                "alice",
+                b"temporary alice password",
+                SessionKind::NonInteractive,
+                600,
+            )
+            .unwrap();
+        let context = AppContext::authenticated_for_app(
+            SessionGuard::new(Arc::new(Mutex::new(auth)), token).unwrap(),
+            "script",
+        )
+        .unwrap();
+        let apps = context
+            .ns_mgr
+            .resolve(&Path::parse("/apps"), context.ns_mgr.root())
+            .unwrap();
+        let apps = context.obj_mgr.lookup(apps).unwrap();
+        assert_eq!(apps.owner, hyber_core::UserId(0));
+        assert_eq!(apps.permissions, 0o755);
+        let home = context
+            .ns_mgr
+            .resolve(&Path::parse("/users/alice"), context.ns_mgr.root())
+            .unwrap();
+        let home = context.obj_mgr.lookup(home).unwrap();
+        assert_eq!(home.owner, alice);
+        assert_eq!(home.permissions, 0o700);
+        assert_eq!(
+            context.app_layout.data.to_string(),
+            "/users/alice/.local/share/script"
+        );
     }
 }

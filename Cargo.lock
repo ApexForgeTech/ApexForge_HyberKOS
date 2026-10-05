@@ -201,6 +201,8 @@ dependencies = [
  "hyber-device",
  "hyber-handle",
  "hyber-hostfs",
+ "hyber-identity",
+ "hyber-layout",
  "hyber-lua",
  "hyber-memfs",
  "hyber-namespace",
@@ -260,12 +262,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyber-layout"
+version = "0.1.0"
+dependencies = [
+ "hyber-core",
+ "hyber-memfs",
+ "hyber-namespace",
+ "hyber-object",
+ "hyber-vfs",
+]
+
+[[package]]
 name = "hyber-lua"
 version = "0.1.0"
 dependencies = [
  "hyber-auth",
  "hyber-core",
  "hyber-handle",
+ "hyber-layout",
  "hyber-namespace",
  "hyber-object",
  "hyber-process",
@@ -330,6 +344,7 @@ dependencies = [
  "hyber-device",
  "hyber-handle",
  "hyber-hostfs",
+ "hyber-layout",
  "hyber-lua",
  "hyber-memfs",
  "hyber-namespace",

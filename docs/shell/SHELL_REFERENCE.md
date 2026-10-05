@@ -732,6 +732,26 @@ print("Tag: " .. tag)
 
 ---
 
+## `hyber.app` — Logical Application Storage
+
+```lua
+local config  = hyber.app.config_dir()
+local data    = hyber.app.data_dir()
+local state   = hyber.app.state_dir()
+local cache   = hyber.app.cache_dir()
+local temp    = hyber.app.temp_dir()
+local runtime = hyber.app.runtime_dir()
+```
+
+These return Hyber namespace paths only. They never expose a Linux path and
+must be used with `hyber.fs`, so ordinary traversal, object permission, handle,
+and session checks still apply. `config`, `data`, and `state` are persistent
+classes; `cache`, `temp`, and `runtime` are disposable classes. See the
+[storage-layout contract](../design/storage-layout.md) for ownership, cleanup,
+and hosted-persistence limits.
+
+---
+
 ## `hyber.proc` — Process Information
 
 ```lua

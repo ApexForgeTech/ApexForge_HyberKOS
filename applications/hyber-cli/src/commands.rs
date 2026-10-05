@@ -18,15 +18,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
         (args, None)
     };
     let input = one_path(args, "run [--auth <image> <blocks> <username>] <path>")?;
-    let script_path = script_path(&input)?;
+    let (script_path, app_id) = script_path(&input)?;
     let script = std::fs::read_to_string(&script_path)
         .map_err(|e| format!("cannot read {}: {e}", script_path.display()))?;
     let context = match session {
-        Some(session) => AppContext::authenticated(session)?,
-        None => AppContext::new()?,
+        Some(session) => AppContext::authenticated_for_app(session, &app_id)?,
+        None => AppContext::new_for_app(&app_id)?,
     };
     let guard = context.session.clone();
-    let (vfs, ns_mgr, handles, objects, result) = hyber_lua::run_lua_script_with_session(
+    let (vfs, ns_mgr, handles, objects, result) = hyber_lua::run_lua_script_with_session_and_layout(
         &script,
         context.vfs,
         context.ns_mgr,
@@ -36,6 +36,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         context.process_id,
         context.security_context,
         context.session,
+        Some(context.app_layout),
     );
     // Keep ownership explicit until the runtime returns; this ensures all Lua
     // mutations were retained and avoids silently discarding borrowed state.
@@ -161,13 +162,13 @@ fn one_path(args: &[String], usage: &str) -> Result<String, String> {
     Ok(args[0].clone())
 }
 
-fn script_path(input: &str) -> Result<PathBuf, String> {
+fn script_path(input: &str) -> Result<(PathBuf, String), String> {
     let input_path = FsPath::new(input);
     if input_path.is_file() {
         if input_path.extension().and_then(|e| e.to_str()) != Some("lua") {
             return Err("only .lua scripts are supported in Phase 14".into());
         }
-        return Ok(input_path.to_path_buf());
+        return Ok((input_path.to_path_buf(), "script".into()));
     }
     if !input_path.is_dir() {
         return Err(format!(
@@ -194,7 +195,7 @@ fn script_path(input: &str) -> Result<PathBuf, String> {
     if let Some(permissions) = manifest.permissions {
         let _ = (permissions.read, permissions.write); // parsed now; Phase 13 enforces portable manifests.
     }
-    Ok(canonical_entry)
+    Ok((canonical_entry, manifest.name))
 }
 
 #[cfg(test)]
