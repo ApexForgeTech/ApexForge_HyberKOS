@@ -195,8 +195,13 @@ impl ProcessManager {
         self.processes.insert(id, process);
 
         // FIX Gap 2: Inherit parent handles into the child
-        if let (Some(parent), Some(hm)) = (parent_id, handle_mgr) {
-            hm.inherit_into_child(obj_mgr, parent, id);
+        if let (Some(parent), Some(hm)) = (parent_id, handle_mgr)
+            && let Err(error) = hm.inherit_into_child(obj_mgr, parent, id)
+        {
+            self.processes.remove(&id);
+            obj_mgr.release(obj_id);
+            obj_mgr.destroy(obj_id);
+            return Err(error);
         }
 
         // Every process starts with a primary thread

@@ -420,7 +420,11 @@ fn build_ns(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>
         let exists_fn = lua.create_function(move |_lua, path_str: String| {
             let path = Path::parse(&path_str);
             let ks = lock(&state)?;
-            Ok(ks.ns_mgr.resolve(&path, ks.ns_mgr.root()).is_ok())
+            Ok(
+                VFS::check_traversal(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path, false)
+                    .is_ok()
+                    && ks.ns_mgr.resolve(&path, ks.ns_mgr.root()).is_ok(),
+            )
         })?;
         t.set("exists", exists_fn)?;
     }
@@ -461,6 +465,8 @@ fn build_obj(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
         let info_fn = lua.create_function(move |lua, path_str: String| {
             let path = Path::parse(&path_str);
             let ks = lock(&state)?;
+            VFS::check_traversal(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path, false)
+                .map_err(lua_err)?;
             let obj_id = ks
                 .ns_mgr
                 .resolve(&path, ks.ns_mgr.root())
@@ -499,6 +505,8 @@ fn build_obj(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
         let meta_get = lua.create_function(move |lua, (path_str, key): (String, String)| {
             let path = Path::parse(&path_str);
             let ks = lock(&state)?;
+            VFS::check_traversal(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path, false)
+                .map_err(lua_err)?;
             let obj_id = ks
                 .ns_mgr
                 .resolve(&path, ks.ns_mgr.root())
@@ -531,6 +539,8 @@ fn build_obj(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
                 let path = Path::parse(&path_str);
                 let meta_val = parse_metadata_value(&val_type, val_str)?;
                 let mut ks = lock(&state)?;
+                VFS::check_traversal(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path, false)
+                    .map_err(lua_err)?;
                 let obj_id = ks
                     .ns_mgr
                     .resolve(&path, ks.ns_mgr.root())
@@ -685,6 +695,11 @@ fn build_sec(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
                 let path = Path::parse(&path_str);
                 let requested_rights = parse_mode(&rights_str)?;
                 let ks = lock(&state)?;
+                if VFS::check_traversal(&ks.ns_mgr, &ks.obj_mgr, &ks.security_context, &path, false)
+                    .is_err()
+                {
+                    return Ok(false);
+                }
 
                 let obj_id = ks
                     .ns_mgr
@@ -898,6 +913,46 @@ fn metadata_to_lua<'lua>(lua: &'lua Lua, val: &MetadataValue) -> LuaResult<LuaVa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyber_core::ObjectType;
+
+    #[test]
+    fn metadata_cannot_bypass_private_parent_directory() {
+        let mut objects = ObjectManager::new();
+        let mut ns = NamespaceManager::new(&mut objects);
+        let dir = objects.create_object(ObjectType::Directory);
+        objects.lookup_mut(dir).unwrap().permissions = 0o700;
+        ns.create_node(&objects, ns.root(), "private", dir).unwrap();
+        ns.initialize_directory(dir).unwrap();
+        let file = objects.create_object(ObjectType::File);
+        objects.lookup_mut(file).unwrap().permissions = 0o666;
+        ns.create_node(&objects, dir, "file", file).unwrap();
+        let context = SecurityContext {
+            user_id: hyber_core::UserId(1000),
+            group_id: hyber_core::GroupId(1000),
+            supplementary_groups: vec![],
+            capabilities: vec![],
+        };
+        let mut processes = ProcessManager::new();
+        let pid = processes
+            .create_process(&mut objects, None, context.clone(), None)
+            .unwrap();
+        let (_, _, _, _, result) = run_lua_script(
+            r#"
+            assert(not hyber.ns.exists('/private/file'))
+            assert(not pcall(hyber.obj.info, '/private/file'))
+            assert(not pcall(hyber.obj.meta_get, '/private/file', 'user.secret'))
+            assert(not pcall(hyber.obj.meta_set, '/private/file', 'user.secret', 'string', 'changed'))
+            "#,
+            VFS::new(),
+            ns,
+            HandleManager::new(),
+            objects,
+            Arc::new(Mutex::new(processes)),
+            pid,
+            context,
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
 
     #[test]
     fn authenticated_lua_rechecks_revocation_and_blocks_host_libraries() {

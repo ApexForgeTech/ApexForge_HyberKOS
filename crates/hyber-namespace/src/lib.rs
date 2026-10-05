@@ -1,4 +1,4 @@
-use hyber_core::{Node, ObjectId, ObjectType, Path};
+use hyber_core::{Node, ObjectId, ObjectState, ObjectType, Path};
 use std::collections::HashMap;
 
 use hyber_object::ObjectManager;
@@ -47,8 +47,24 @@ impl NamespaceManager {
 
         // A node may only point to a live object.  Without this check dangling
         // namespace entries can be created trivially.
-        if object_manager.lookup(object_id).is_none() {
+        if object_manager
+            .lookup(object_id)
+            .is_none_or(|o| o.state != ObjectState::Live || o.references == 0)
+        {
             return Err(format!("Object {:?} does not exist", object_id));
+        }
+        // The current providers transfer the initial reference to one node.
+        // Hard links require separate reference accounting and are deferred.
+        if object_id == self.root
+            || self
+                .directory_contents
+                .values()
+                .any(|entries| entries.values().any(|id| *id == object_id))
+        {
+            return Err("Object already has a namespace node; hard links are unsupported".into());
+        }
+        if object_id == parent || self.is_descendant(parent, object_id) {
+            return Err("Cannot create a namespace cycle".into());
         }
 
         // Validate: Parent must exist and be a Directory
@@ -56,7 +72,10 @@ impl NamespaceManager {
             .lookup(parent)
             .ok_or_else(|| format!("Parent directory {:?} does not exist", parent))?;
 
-        if parent_obj.object_type != ObjectType::Directory {
+        if parent_obj.object_type != ObjectType::Directory
+            || parent_obj.state != ObjectState::Live
+            || parent_obj.references == 0
+        {
             return Err(format!(
                 "Parent {:?} is not a directory (type: {})",
                 parent, parent_obj.object_type
@@ -146,11 +165,21 @@ impl NamespaceManager {
     }
 
     pub fn remove_node(&mut self, parent_id: ObjectId, name: &str) -> Option<ObjectId> {
+        let id = self.lookup(parent_id, name)?;
+        if id == self.root
+            || self
+                .directory_contents
+                .get(&id)
+                .is_some_and(|entries| !entries.is_empty())
+        {
+            return None;
+        }
         let contents = self.directory_contents.get_mut(&parent_id)?;
         let object_id = contents.remove(name)?;
         if object_id != self.root {
             self.parent_directories.remove(&object_id);
         }
+        self.directory_contents.remove(&object_id);
         Some(object_id)
     }
 
@@ -188,8 +217,17 @@ impl NamespaceManager {
             return Err("Cannot move a directory into itself or its descendant".to_string());
         }
 
-        // 2. Remove from old parent
-        self.remove_node(old_parent_id, old_name);
+        if old_parent_id == new_parent_id && old_name == new_name {
+            return Ok(());
+        }
+        if self.lookup(new_parent_id, new_name).is_some() {
+            return Err(format!("Node '{}' already exists in new parent", new_name));
+        }
+        // A move preserves the directory's contents and reference ownership.
+        self.directory_contents
+            .get_mut(&old_parent_id)
+            .ok_or("source parent missing")?
+            .remove(old_name);
 
         // 3. Add to new parent
         let new_parent_contents =
@@ -287,6 +325,28 @@ mod tests {
     use super::NamespaceManager;
     use hyber_core::ObjectType;
     use hyber_object::ObjectManager;
+
+    #[test]
+    fn node_ownership_and_directory_lifetime_are_consistent() {
+        let mut objects = ObjectManager::new();
+        let mut ns = NamespaceManager::new(&mut objects);
+        let root = ns.root();
+        let dir = objects.create_object(ObjectType::Directory);
+        ns.create_node(&objects, root, "dir", dir).unwrap();
+        ns.initialize_directory(dir).unwrap();
+        let file = objects.create_object(ObjectType::File);
+        ns.create_node(&objects, dir, "file", file).unwrap();
+        assert!(ns.create_node(&objects, root, "alias", file).is_err());
+        assert!(ns.create_node(&objects, dir, "cycle", root).is_err());
+        assert!(ns.remove_node(root, "dir").is_none());
+        ns.rename_node(root, "dir", root, "renamed").unwrap();
+        assert_eq!(ns.lookup(dir, "file"), Some(file));
+        assert_eq!(ns.remove_node(dir, "file"), Some(file));
+        assert_eq!(ns.remove_node(root, "renamed"), Some(dir));
+        assert!(ns.list_directory(dir).is_none());
+        objects.release(file);
+        assert!(ns.create_node(&objects, root, "dead", file).is_err());
+    }
 
     #[test]
     fn node_names_and_targets_are_validated() {

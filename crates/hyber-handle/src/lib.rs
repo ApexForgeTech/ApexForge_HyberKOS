@@ -65,9 +65,12 @@ impl HandleTable {
         rights: Rights,
         provider_name: String,
         flags: HandleFlags,
-    ) -> HandleId {
+    ) -> Result<HandleId, String> {
         let handle_id = HandleId(self.next_handle_id);
-        self.next_handle_id += 1;
+        self.next_handle_id = self
+            .next_handle_id
+            .checked_add(1)
+            .ok_or("HandleId space exhausted")?;
 
         let handle = Handle {
             handle_id,
@@ -79,7 +82,7 @@ impl HandleTable {
         };
 
         self.handles.insert(handle_id, handle);
-        handle_id
+        Ok(handle_id)
     }
 
     pub fn remove_handle(&mut self, handle_id: HandleId) -> Option<ObjectId> {
@@ -155,9 +158,13 @@ impl HandleManager {
         }
 
         let table = self.get_or_create_table(process_id);
-        let handle_id = table.allocate_handle(object_id, rights, provider_name, flags);
-
-        Ok(handle_id)
+        match table.allocate_handle(object_id, rights, provider_name, flags) {
+            Ok(id) => Ok(id),
+            Err(error) => {
+                object_manager.release(object_id);
+                Err(error)
+            }
+        }
     }
 
     pub fn close(
@@ -166,10 +173,14 @@ impl HandleManager {
         process_id: ProcessId,
         handle_id: HandleId,
     ) -> Result<(), String> {
-        let table = self.get_or_create_table(process_id);
+        let table = self
+            .process_tables
+            .get_mut(&process_id)
+            .ok_or("Process has no handles")?;
 
         if let Some(object_id) = table.remove_handle(handle_id) {
             object_manager.release(object_id);
+            object_manager.destroy(object_id);
             Ok(())
         } else {
             Err(format!(
@@ -314,7 +325,15 @@ impl HandleManager {
         object_manager: &mut ObjectManager,
         parent_id: ProcessId,
         child_id: ProcessId,
-    ) {
+    ) -> Result<(), String> {
+        if parent_id == child_id
+            || self
+                .process_tables
+                .get(&child_id)
+                .is_some_and(|t| !t.handles.is_empty())
+        {
+            return Err("Handle inheritance requires a distinct empty child table".into());
+        }
         // Collect inheritable handles from parent first to avoid borrow issues
         let inheritable: Vec<(ObjectId, Rights, String, HandleFlags)> = self
             .process_tables
@@ -328,12 +347,19 @@ impl HandleManager {
             })
             .unwrap_or_default();
 
+        let mut opened = Vec::new();
         for (obj_id, rights, provider, flags) in inheritable {
-            // Bump the strong ref count so the child's table keeps the object alive
-            object_manager.retain(obj_id);
-            let child_table = self.get_or_create_table(child_id);
-            child_table.allocate_handle(obj_id, rights, provider, flags);
+            match self.open_with_flags(object_manager, child_id, obj_id, rights, provider, flags) {
+                Ok(handle) => opened.push(handle),
+                Err(error) => {
+                    for handle in opened {
+                        self.close(object_manager, child_id, handle)?;
+                    }
+                    return Err(error);
+                }
+            }
         }
+        Ok(())
     }
 
     /// Helper: Update offset (for read/write operations)
@@ -347,7 +373,10 @@ impl HandleManager {
             .get_handle_mut(process_id, handle_id)
             .ok_or_else(|| format!("Handle {:?} not found", handle_id))?;
 
-        handle.offset += bytes_read;
+        handle.offset = handle
+            .offset
+            .checked_add(bytes_read)
+            .ok_or("Handle offset overflow")?;
         Ok(())
     }
 
@@ -374,6 +403,66 @@ mod tests {
     use super::*;
     use hyber_core::{ObjectType, ProcessId, Rights};
     use hyber_object::ObjectManager;
+
+    #[test]
+    fn failed_inheritance_and_last_close_preserve_reference_accounting() {
+        let (mut objects, mut handles, parent) = setup();
+        let file = ObjectId(1);
+        let h = handles
+            .open_with_flags(
+                &mut objects,
+                parent,
+                file,
+                Rights::read_only(),
+                "mem".into(),
+                HandleFlags::default_inheritable(),
+            )
+            .unwrap();
+        assert!(handles
+            .inherit_into_child(&mut objects, parent, parent)
+            .is_err());
+        objects.lookup_mut(file).unwrap().references = u64::MAX;
+        assert!(handles
+            .inherit_into_child(&mut objects, parent, ProcessId(2))
+            .is_err());
+        assert!(handles.list_handles(ProcessId(2)).is_empty());
+        objects.lookup_mut(file).unwrap().references = 1;
+        handles.close(&mut objects, parent, h).unwrap();
+        assert!(objects.lookup(file).is_none());
+        assert!(handles.close(&mut objects, parent, h).is_err());
+    }
+
+    #[test]
+    fn exhausted_handle_ids_and_offsets_do_not_wrap_or_leak() {
+        let (mut objects, mut handles, pid) = setup();
+        handles.get_or_create_table(pid).next_handle_id = u64::MAX;
+        assert!(handles
+            .open(
+                &mut objects,
+                pid,
+                ObjectId(1),
+                Rights::read_only(),
+                "mem".into()
+            )
+            .is_err());
+        assert_eq!(objects.lookup(ObjectId(1)).unwrap().references, 1);
+        handles.get_or_create_table(pid).next_handle_id = 1;
+        let h = handles
+            .open(
+                &mut objects,
+                pid,
+                ObjectId(1),
+                Rights::read_only(),
+                "mem".into(),
+            )
+            .unwrap();
+        handles.get_handle_mut(pid, h).unwrap().offset = u64::MAX;
+        assert!(handles.update_offset(pid, h, 1).is_err());
+        assert_eq!(handles.get_handle(pid, h).unwrap().offset, u64::MAX);
+        assert!(handles
+            .check_rights(ProcessId(2), h, Rights::read_only())
+            .is_err());
+    }
 
     fn setup() -> (ObjectManager, HandleManager, ProcessId) {
         let mut obj_mgr = ObjectManager::new();
@@ -408,7 +497,7 @@ mod tests {
         )
         .unwrap();
 
-        hm.inherit_into_child(&mut obj_mgr, parent, child);
+        hm.inherit_into_child(&mut obj_mgr, parent, child).unwrap();
 
         // Child should have exactly 1 handle
         assert_eq!(hm.list_handles(child).len(), 1);

@@ -148,6 +148,35 @@ retroactively erase already returned bytes or reclaim unguarded trusted calls.
 
 ## Verification
 
+### Object, node, and handle integration
+
+UserId and GroupId identify Hyber accounts; ObjectId identifies a resource.
+An account ID is never interpreted as an ObjectId or host UID/GID. Sessions
+derive the current SecurityContext, including supplementary memberships.
+Owner permission bits take precedence over group bits; group membership does
+not let an owner bypass a restrictive owner mode.
+
+The hosted namespace currently permits one node per object. Providers transfer
+the object's initial strong reference to that node. Additional hard links are
+rejected until link reference accounting is implemented. Root links, dead
+objects, dead parents, and namespace cycles are rejected. Removing a nonempty
+directory is refused; removing an empty directory clears its namespace index.
+Rename preserves its ObjectId, children, and open handles.
+
+Each handle owns one additional strong reference and is local to its process.
+Opening or inheriting must successfully retain that reference. Failed child
+inheritance rolls back opened handles; closing the last reference releases
+the destroyed object. Exhausted handle counters and overflowing offsets return
+errors instead of wrapping. VFS validates offset ranges before provider I/O.
+
+Shell and Lua metadata access must check search permission on ancestor
+directories before checking the target's metadata permissions. A readable or
+writable child inside an inaccessible directory cannot bypass that boundary.
+Lua existence queries return false for inaccessible paths. Secure handle I/O
+checks both current object permissions and the handle's granted rights.
+Permission changes never add rights to an existing handle. Trusted raw manager
+APIs still require disciplined callers; they are not a native syscall boundary.
+
 Run workspace tests, clippy with warnings denied, format checking, and
 `hyberfsck` against clean/damaged disposable images. Tests cover identity
 corruption with recomputed checksums, supplementary groups, atomic account

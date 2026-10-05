@@ -216,6 +216,9 @@ impl VFS {
         handle_mgr.check_rights(process_id, handle_id, Rights::read_only())?;
         let object_id = handle.object_id;
         let offset = handle.offset;
+        offset
+            .checked_add(buffer.len() as u64)
+            .ok_or("Read offset overflow")?;
 
         let provider = self
             .providers
@@ -223,6 +226,9 @@ impl VFS {
             .ok_or_else(|| format!("Provider {} not found", handle.provider_name))?;
 
         let bytes_read = provider.read(object_id, offset, buffer)?;
+        if bytes_read > buffer.len() {
+            return Err("Provider returned invalid read length".into());
+        }
         handle_mgr.update_offset(process_id, handle_id, bytes_read as u64)?;
         Ok(bytes_read)
     }
@@ -244,6 +250,9 @@ impl VFS {
             .ok_or_else(|| format!("Handle {:?} not found", handle_id))?
             .object_id;
         let object = obj_mgr.lookup(object_id).ok_or("Object not found")?;
+        if object.state != hyber_core::ObjectState::Live || object.references == 0 {
+            return Err("Object is not live".into());
+        }
         hyber_core::SecurityManager::check_access(
             security_context,
             object.owner,
@@ -274,6 +283,13 @@ impl VFS {
         let object_id = handle.object_id;
         let offset = handle.offset;
         let provider_name = handle.provider_name.clone();
+        offset
+            .checked_add(buffer.len() as u64)
+            .ok_or("Write offset overflow")?;
+        let object = obj_mgr.lookup(object_id).ok_or("Object not found")?;
+        if object.state != hyber_core::ObjectState::Live || object.references == 0 {
+            return Err("Object is not live".into());
+        }
 
         let provider = self
             .providers
@@ -281,6 +297,9 @@ impl VFS {
             .ok_or_else(|| format!("Provider {} not found", provider_name))?;
 
         let bytes_written = provider.write(object_id, offset, buffer)?;
+        if bytes_written > buffer.len() {
+            return Err("Provider returned invalid write length".into());
+        }
         handle_mgr.update_offset(process_id, handle_id, bytes_written as u64)?;
 
         if let Some(obj) = obj_mgr.lookup_mut(object_id) {

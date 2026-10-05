@@ -573,6 +573,8 @@ impl HyberShell {
         };
 
         // Verify it's a directory
+        let context = self.current_security_context()?;
+        VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, true)?;
         let obj_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
         let obj = self.obj_mgr.lookup(obj_id).ok_or("Object not found")?;
         if obj.object_type != ObjectType::Directory {
@@ -712,6 +714,8 @@ impl HyberShell {
         }
 
         // Check if file already exists (update modified_at)
+        let context = self.current_security_context()?;
+        VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
         if let Ok(obj_id) = self.ns_mgr.resolve(&path, self.ns_mgr.root()) {
             let context = self
                 .proc_mgr
@@ -1102,6 +1106,8 @@ impl HyberShell {
             return Err("Usage: look <path>".to_string());
         }
         let path = self.resolve_path(positional[0]);
+        let context = self.current_security_context()?;
+        VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
         let obj_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
 
         let obj = self.obj_mgr.lookup(obj_id).ok_or("Object not found")?;
@@ -1256,6 +1262,8 @@ impl HyberShell {
             return Err("Usage: rights <path>".to_string());
         }
         let path = self.resolve_path(positional[0]);
+        let context = self.current_security_context()?;
+        VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
         let obj_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
         let obj = self.obj_mgr.lookup(obj_id).ok_or("Object not found")?;
 
@@ -1316,6 +1324,8 @@ impl HyberShell {
         }
 
         let path = self.resolve_path(positional[1]);
+        let context = self.current_security_context()?;
+        VFS::check_traversal(&self.ns_mgr, &self.obj_mgr, &context, &path, false)?;
         let obj_id = self.ns_mgr.resolve(&path, self.ns_mgr.root())?;
         let context = self
             .proc_mgr
