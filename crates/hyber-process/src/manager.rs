@@ -11,6 +11,7 @@
 
 use hyber_core::{ObjectId, ObjectType, ProcessId, SecurityContext, ThreadId};
 use hyber_handle::HandleManager;
+use hyber_ipc::IpcManager;
 use hyber_object::ObjectManager;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -411,6 +412,25 @@ impl ProcessManager {
         Ok(())
     }
 
+    /// Reap a hosted process after first releasing every Phase 19 IPC endpoint
+    /// it owns. This is the process/IPC integration boundary: a caller must
+    /// use it when the process may have created Pipe or Channel handles, so a
+    /// volatile IPC object cannot outlive its final process by accident.
+    pub fn reap_isolated_process_with_ipc(
+        &mut self,
+        objects: &mut ObjectManager,
+        handles: &mut HandleManager,
+        ipc: &mut IpcManager,
+        id: ProcessId,
+    ) -> Result<(), String> {
+        let process = self.processes.get(&id).ok_or("Process not found")?;
+        if process.state != ProcessState::Zombie {
+            return Err("Process cannot be reaped".into());
+        }
+        ipc.close_process(objects, handles, id);
+        self.reap_isolated_process(objects, id)
+    }
+
     // ── 11.5 — Process Operations: signal ────────────────────────────────────
 
     pub fn signal_process(&mut self, id: ProcessId, _signal: u32) -> Result<(), String> {
@@ -466,6 +486,34 @@ mod tests {
             .create_process(&mut objects, None, SecurityContext::root(), None)
             .unwrap();
         assert_ne!(next, pid);
+    }
+
+    #[test]
+    fn ipc_aware_reaping_closes_owned_endpoints_before_object_reclaim() {
+        let mut objects = ObjectManager::new();
+        let mut handles = HandleManager::new();
+        let mut ipc = IpcManager::new();
+        let mut manager = ProcessManager::new();
+        let context = SecurityContext::root();
+        let pid = manager
+            .create_process(&mut objects, None, context.clone(), None)
+            .unwrap();
+        manager.start_process(pid).unwrap();
+        let endpoints = ipc
+            .create_pipe(
+                &mut objects,
+                &mut handles,
+                &context,
+                (pid, &context),
+                (pid, &context),
+            )
+            .unwrap();
+        manager.stop_process(pid, 0).unwrap();
+        manager
+            .reap_isolated_process_with_ipc(&mut objects, &mut handles, &mut ipc, pid)
+            .unwrap();
+        assert!(objects.lookup(endpoints.object_id).is_none());
+        assert!(manager.get_process(pid).is_none());
     }
 
     #[test]

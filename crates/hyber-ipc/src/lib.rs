@@ -19,10 +19,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 pub const MAX_QUEUE_BYTES: usize = 64 * 1024;
+pub const MAX_QUEUE_MESSAGES: usize = 1024;
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 pub const MAX_PIPE_WRITE_BYTES: usize = 4 * 1024;
 pub const MAX_ATTACHMENTS: usize = 8;
 pub const MAX_ENDPOINTS_PER_OBJECT: usize = 32;
+pub const MAX_PENDING_REQUESTS: usize = 1024;
 pub const IPC_PROVIDER: &str = "ipc";
 /// Version of the in-memory channel record. It is explicit so an eventual
 /// cross-process transport cannot accidentally treat an incompatible record as
@@ -200,7 +202,7 @@ impl IpcManager {
                 writers: 0,
             },
         );
-        let reader_handle = self.open_endpoint(
+        let reader_handle = match self.open_endpoint(
             objects,
             handles,
             reader.0,
@@ -212,7 +214,15 @@ impl IpcManager {
                 signal: true,
                 ..Rights::empty()
             },
-        )?;
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.pipes.remove(&object);
+                objects.release(object);
+                objects.destroy(object);
+                return Err(error);
+            }
+        };
         let writer_handle = match self.open_endpoint(
             objects,
             handles,
@@ -267,7 +277,15 @@ impl IpcManager {
             ..Rights::empty()
         };
         let a_handle =
-            self.open_endpoint(objects, handles, a.0, a.1, object, EndpointSide::A, rights)?;
+            match self.open_endpoint(objects, handles, a.0, a.1, object, EndpointSide::A, rights) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.channels.remove(&object);
+                    objects.release(object);
+                    objects.destroy(object);
+                    return Err(error);
+                }
+            };
         let b_handle =
             match self.open_endpoint(objects, handles, b.0, b.1, object, EndpointSide::B, rights) {
                 Ok(handle) => handle,
@@ -488,6 +506,17 @@ impl IpcManager {
     ) -> Result<u64, IpcError> {
         let binding = self.authorize(objects, handles, process, context, handle, true, false)?;
         let side = EndpointSideKey::of(binding.side)?;
+        if self
+            .client_pending
+            .iter()
+            .filter(|key| {
+                key.object == binding.object && key.side == side && key.process == process
+            })
+            .count()
+            >= MAX_PENDING_REQUESTS
+        {
+            return Err(IpcError::WouldBlock);
+        }
         let next = self
             .next_request
             .entry((binding.object, side, process))
@@ -926,7 +955,9 @@ impl IpcManager {
             EndpointSideKey::A => &c.a_in,
             EndpointSideKey::B => &c.b_in,
         };
-        if queue.bytes.checked_add(bytes).ok_or(IpcError::Overflow)? > MAX_QUEUE_BYTES {
+        if queue.messages.len() >= MAX_QUEUE_MESSAGES
+            || queue.bytes.checked_add(bytes).ok_or(IpcError::Overflow)? > MAX_QUEUE_BYTES
+        {
             Err(IpcError::WouldBlock)
         } else {
             Ok(())
@@ -947,7 +978,10 @@ impl IpcManager {
             .get_handle(source_process, source)
             .ok_or(IpcError::InvalidHandle)?
             .clone();
-        if source_handle.provider_name == IPC_PROVIDER || !subset(rights, source_handle.rights) {
+        if rights == Rights::empty()
+            || source_handle.provider_name == IPC_PROVIDER
+            || !subset(rights, source_handle.rights)
+        {
             return Err(IpcError::AccessDenied);
         }
         let object = objects
@@ -1003,6 +1037,9 @@ impl IpcManager {
             }
         }
         self.pipes.remove(&object);
+        self.next_request.retain(|(id, _, _), _| *id != object);
+        self.client_pending.retain(|key| key.object != object);
+        self.server_pending.retain(|key| key.object != object);
         objects.release(object);
         objects.destroy(object);
     }
@@ -1491,5 +1528,74 @@ mod tests {
             panic!()
         };
         assert_eq!(response.payload, b"one");
+    }
+
+    #[test]
+    fn zero_byte_messages_and_pending_rpcs_are_bounded() {
+        let (mut ipc, mut objects, mut handles, root, a, b) = setup();
+        let endpoints = ipc
+            .create_channel(&mut objects, &mut handles, &root, (a, &root), (b, &root))
+            .unwrap();
+        for _ in 0..MAX_QUEUE_MESSAGES {
+            ipc.channel_send(
+                &mut objects,
+                &mut handles,
+                a,
+                &root,
+                endpoints.a,
+                MessageKind::Data,
+                0,
+                vec![],
+                &[],
+                (b, &root),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            ipc.channel_send(
+                &mut objects,
+                &mut handles,
+                a,
+                &root,
+                endpoints.a,
+                MessageKind::Data,
+                0,
+                vec![],
+                &[],
+                (b, &root),
+            ),
+            Err(IpcError::WouldBlock)
+        );
+        for _ in 0..MAX_QUEUE_MESSAGES {
+            ipc.channel_receive(&mut objects, &mut handles, b, &root, endpoints.b)
+                .unwrap();
+        }
+        for _ in 0..MAX_PENDING_REQUESTS {
+            ipc.rpc_request(
+                &mut objects,
+                &mut handles,
+                a,
+                &root,
+                endpoints.a,
+                vec![],
+                (b, &root),
+            )
+            .unwrap();
+            let _ = ipc
+                .channel_receive(&mut objects, &mut handles, b, &root, endpoints.b)
+                .unwrap();
+        }
+        assert_eq!(
+            ipc.rpc_request(
+                &mut objects,
+                &mut handles,
+                a,
+                &root,
+                endpoints.a,
+                vec![],
+                (b, &root),
+            ),
+            Err(IpcError::WouldBlock)
+        );
     }
 }
