@@ -76,6 +76,15 @@ fn signed_package_authenticated_daemon_and_client_independence() {
         .unwrap();
     auth.set_password(&admin, observer, b"observer integration password")
         .unwrap();
+    let operator = auth
+        .edit_accounts(&admin, |accounts| {
+            let group = accounts.create_group("operator")?;
+            let uid = accounts.create_user("operator", group, AccountState::Active)?;
+            accounts.grant_capability(uid, "CAP_SYS_ADMIN")?;
+            Ok(uid)
+        })
+        .unwrap();
+    auth.set_password(&admin, operator, PASSWORD).unwrap();
     auth.save(&mut volume, "/auth.store").unwrap();
     let manifest = "format_version=1\napp_id='payload'\nversion='1.0.0'\npublisher='test'\ndisplay_name='Payload'\nentrypoint='main.lua'\nruntime='lua'\nexecution='service'\nrequested_capabilities=['service.background']\n[resources]\nmemory_bytes=134217728\ncpu_shares=8\nhandles=64\nstorage_bytes=1024\n";
     let declaration = "return { format_version=1, service_id='payload', application_id='payload', startup='automatic', restart='on-failure', health_check='ipc-readiness', entrypoint='main.lua', requested_capabilities={'service.background'}, max_message_bytes=8192 }";
@@ -221,7 +230,8 @@ fn signed_package_authenticated_daemon_and_client_independence() {
     // Opt-in cross-binary PTY test after `cargo build --workspace`. The ordinary
     // test has no dependency on an old shell binary left in target/debug.
     if let Ok(binary) = std::env::var("HYBER_SHELL_TEST_BINARY") {
-        exercise_shell(&binary, &directory, &image, &socket);
+        exercise_shell(&binary, &directory, &image, &socket, "root");
+        exercise_shell(&binary, &directory, &image, &socket, "operator");
         assert!(request("status", Some("payload"))
             .unwrap()
             .contains("Ready: true"));
@@ -270,8 +280,9 @@ fn exercise_shell(
     directory: &std::path::Path,
     image: &std::path::Path,
     socket: &std::path::Path,
+    username: &str,
 ) {
-    let host = directory.join("shell-host");
+    let host = directory.join(format!("shell-host-{username}"));
     let (mut master_fd, mut slave_fd) = (-1, -1);
     assert_eq!(
         unsafe {
@@ -303,7 +314,7 @@ fn exercise_shell(
         .arg(&host)
         .arg("--auth")
         .arg(image)
-        .args(["256", "root"])
+        .args(["256", username])
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave));
@@ -329,6 +340,24 @@ fn exercise_shell(
     wait_text(&mut master, "Service authority password:");
     password(&mut master);
     wait_text(&mut master, "Ready: true");
+    master.write_all(b"acquire /services/payload rw\n").unwrap();
+    wait_text(
+        &mut master,
+        if username == "root" {
+            "service projection supports only read/enumerate rights"
+        } else {
+            "WRITE permission missing"
+        },
+    );
+    master.write_all(b"chmod 777 /services/payload\n").unwrap();
+    wait_text(
+        &mut master,
+        "service projection metadata is authority-owned",
+    );
+    master.write_all(b"rights /services/payload\n").unwrap();
+    wait_text(&mut master, "WRITE:   No");
+    master.write_all(b"acquire /services/payload r\n").unwrap();
+    wait_text(&mut master, "Acquired Handle");
     master.write_all(b"ls /services\n").unwrap();
     wait_text(&mut master, "payload");
     master.write_all(b"exit\n").unwrap();

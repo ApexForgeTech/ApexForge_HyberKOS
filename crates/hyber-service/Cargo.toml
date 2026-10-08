@@ -16,3 +16,4 @@ mlua = { version = "0.9", features = ["lua54", "vendored"] }
 
 [dev-dependencies]
 hyber-identity = { path = "../hyber-identity" }
+hyber-handle = { path = "../hyber-handle" }

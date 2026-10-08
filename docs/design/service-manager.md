@@ -151,6 +151,36 @@ Provider reads prompt per authenticated request (including subsequent reads);
 credentials are not cached by the VFS provider. Without attachment, development
 shell placeholders are not running services.
 
+## Object, handle and permission audit
+
+The shell's remote Service Objects are private administrative projections owned
+by the attaching administrator, not by the payload identity. The directory is
+0500 and service entries are 0400. Payload Process and Thread Objects instead
+carry the attenuated service identity and 0400 permissions. Process state and
+service lifecycle state remain distinct from Object reference lifetime.
+
+VFS checks both owner/group permissions and provider-supported rights before
+allocating a handle. Service projections reject WRITE, EXECUTE, DELETE, RENAME,
+CONNECT, WAIT and SIGNAL even for root: lifecycle authority is not a file
+handle permission. Secure reads recheck current Object metadata and handle
+rights; wrong-process and closed handles fail. Closing releases the retained
+Object reference. Projection metadata is supervisor/adapter-owned; chmod,
+chown and extended-metadata mutation through VFS fail and restore the previous
+Object metadata. Shell/Lua rights introspection includes provider restrictions.
+
+Dependent dispatch revalidates the entire dependency closure with a visited set.
+A revoked or unavailable dependency causes dependent shutdown before its parent
+can finish stopping. Failed graceful-stop delivery still revokes the session
+and starts the forced-stop deadline, without discarding the live process ID.
+Explicit administrative start after retry exhaustion resets the failed state
+and retry budget; automatic retries remain bounded.
+
+These are trusted Rust-internal managers. Raw ObjectManager/HandleManager access
+is not a sandbox boundary. Hosted worker pipes are private backend resources,
+not exported Hyber handles; general inter-service handle transfer and IPC remain
+Phase 19. Virtual status content is generated on read, so Object `size` is not
+a durable status-file length and payload state is obtained through status reads.
+
 ## Verification
 
 ```sh

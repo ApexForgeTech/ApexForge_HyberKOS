@@ -11,8 +11,14 @@ use std::sync::{Arc, Mutex};
 
 /// No lifecycle authority is obtained by opening a status projection.
 pub fn check_projection_rights(rights: hyber_core::Rights) -> Result<(), String> {
-    if rights.write || rights.execute || rights.delete || rights.rename
-        || rights.connect || rights.wait || rights.signal {
+    if rights.write
+        || rights.execute
+        || rights.delete
+        || rights.rename
+        || rights.connect
+        || rights.wait
+        || rights.signal
+    {
         return Err("service projection supports only read/enumerate rights".into());
     }
     Ok(())
@@ -50,7 +56,9 @@ impl Provider for SupervisorProvider {
     fn check_open(&self, object: ObjectId, rights: hyber_core::Rights) -> Result<(), String> {
         check_projection_rights(rights)?;
         if object == self.root {
-            if rights.read { return Err("cannot read service directory as a file".into()); }
+            if rights.read {
+                return Err("cannot read service directory as a file".into());
+            }
         } else if !self.objects.values().any(|id| *id == object) || rights.enumerate {
             return Err("invalid service projection object or operation".into());
         }

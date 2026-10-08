@@ -417,9 +417,9 @@ impl ServiceSupervisor {
             self.readiness_failed.remove(id);
             return Ok(());
         }
-        runner
+        let stop_result = runner
             .request_stop(id, process)
-            .map_err(|_| SupervisorError::Runner("service stop request failed".into()))?;
+            .map_err(|_| SupervisorError::Runner("service stop request failed".into()));
         self.restart_requested.remove(id);
         self.desired.remove(id);
         self.readiness_failed.remove(id);
@@ -432,7 +432,7 @@ impl ServiceSupervisor {
         if let Some(session) = self.sessions.remove(id) {
             let _ = session.logout();
         }
-        Ok(())
+        stop_result
     }
     pub fn disable(
         &mut self,
@@ -554,6 +554,35 @@ impl ServiceSupervisor {
     /// Revalidate on every protected dispatch. Only the declared service group
     /// is retained; account administration capabilities are never inherited.
     pub fn dispatch_context(&self, id: &ServiceId) -> Result<SecurityContext, SupervisorError> {
+        let context = self.session_context(id)?;
+        let mut pending: Vec<_> = self
+            .catalog
+            .get(id)
+            .ok_or(SupervisorError::UnknownService)?
+            .dependencies
+            .iter()
+            .collect();
+        let mut checked = BTreeSet::new();
+        while let Some(dependency) = pending.pop() {
+            if !checked.insert(dependency) {
+                continue;
+            }
+            self.session_context(dependency)?;
+            if !self.status[dependency].ready {
+                return Err(SupervisorError::DependenciesNotReady);
+            }
+            pending.extend(
+                self.catalog
+                    .get(dependency)
+                    .ok_or(SupervisorError::UnknownService)?
+                    .dependencies
+                    .iter(),
+            );
+        }
+        Ok(context)
+    }
+
+    fn session_context(&self, id: &ServiceId) -> Result<SecurityContext, SupervisorError> {
         let status = self.status.get(id).ok_or(SupervisorError::UnknownService)?;
         if status.state != SupervisorState::Running {
             return Err(SupervisorError::InvalidState);
@@ -639,20 +668,20 @@ impl ServiceSupervisor {
                         .is_some_and(|deadline| now >= deadline);
                     let revoked = self.dispatch_context(id).is_err();
                     if expired || revoked {
-                        match self.stop(actor, id, runner) {
-                            Ok(()) => {
-                                if expired && !revoked {
-                                    self.readiness_failed.insert(id.clone());
-                                }
-                                self.status.get_mut(id).unwrap().diagnostic = Some(if revoked {
-                                    "service session revoked".into()
-                                } else {
-                                    "service readiness timed out".into()
-                                });
+                        if let Err(error) = self.stop(actor, id, runner) {
+                            first_error.get_or_insert(error);
+                        }
+                        // Failed delivery may still have entered Stopping.
+                        // Preserve the timeout failure's retry policy in that case.
+                        if self.status[id].state == SupervisorState::Stopping {
+                            if expired && !revoked {
+                                self.readiness_failed.insert(id.clone());
                             }
-                            Err(error) => {
-                                first_error.get_or_insert(error);
-                            }
+                            self.status.get_mut(id).unwrap().diagnostic = Some(if revoked {
+                                "service session or dependency unavailable".into()
+                            } else {
+                                "service readiness timed out".into()
+                            });
                         }
                     }
                 }

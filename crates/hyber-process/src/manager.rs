@@ -273,7 +273,10 @@ impl ProcessManager {
         let group = process.security_context.group_id;
 
         let tid = ThreadId(self.next_tid);
-        self.next_tid = self.next_tid.checked_add(1).ok_or("Thread identifier space exhausted")?;
+        self.next_tid = self
+            .next_tid
+            .checked_add(1)
+            .ok_or("Thread identifier space exhausted")?;
 
         let obj_id = obj_mgr.create_object(ObjectType::Thread);
         if let Some(object) = obj_mgr.lookup_mut(obj_id) {
@@ -462,6 +465,30 @@ mod tests {
             .create_process(&mut objects, None, SecurityContext::root(), None)
             .unwrap();
         assert_ne!(next, pid);
+    }
+
+    #[test]
+    fn thread_objects_use_process_identity_and_reject_post_exit_creation() {
+        let mut objects = ObjectManager::new();
+        let mut manager = ProcessManager::new();
+        let mut context = SecurityContext::root();
+        context.user_id = hyber_core::UserId(42);
+        context.group_id = hyber_core::GroupId(43);
+        context.capabilities.clear();
+        let pid = manager
+            .create_process(&mut objects, None, context.clone(), None)
+            .unwrap();
+        let tid = manager.get_process(pid).unwrap().threads[0];
+        let object = objects
+            .lookup(manager.get_thread(tid).unwrap().object_id)
+            .unwrap();
+        assert_eq!(
+            (object.owner, object.group, object.permissions),
+            (context.user_id, context.group_id, 0o400)
+        );
+        manager.start_process(pid).unwrap();
+        manager.stop_process(pid, 0).unwrap();
+        assert!(manager.create_thread(&mut objects, pid).is_err());
     }
 
     #[test]

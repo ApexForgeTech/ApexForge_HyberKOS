@@ -1668,6 +1668,35 @@ impl HyberShell {
         )
         .is_ok();
 
+        let can_read = can_read
+            && self
+                .vfs
+                .check_provider_rights(&self.ns_mgr, &path, Rights::read_only())
+                .is_ok();
+        let can_write = can_write
+            && self
+                .vfs
+                .check_provider_rights(
+                    &self.ns_mgr,
+                    &path,
+                    Rights {
+                        write: true,
+                        ..Rights::empty()
+                    },
+                )
+                .is_ok();
+        let can_execute = can_execute
+            && self
+                .vfs
+                .check_provider_rights(
+                    &self.ns_mgr,
+                    &path,
+                    Rights {
+                        execute: true,
+                        ..Rights::empty()
+                    },
+                )
+                .is_ok();
         println!("READ:    {}", if can_read { "Yes" } else { "No" });
         println!("WRITE:   {}", if can_write { "Yes" } else { "No" });
         println!("EXECUTE: {}", if can_execute { "Yes" } else { "No" });
@@ -2032,12 +2061,21 @@ impl HyberShell {
     }
 
     fn attach_service_daemon(&mut self, socket: PathBuf) -> Result<(), String> {
+        if self.service_client.is_some() {
+            return Err(
+                "service projection already attached; restart the shell to reconnect".into(),
+            );
+        }
         let session = self
             .session
             .clone()
             .ok_or("service attachment requires an authenticated shell")?;
         let client = hyber_service_host::client::ServiceClient { socket, session };
         let listing = client.request("status", None)?;
+        let projection_owner = client
+            .session
+            .context()
+            .map_err(|_| "shell session invalid")?;
         let names: Vec<_> = listing
             .lines()
             .map(|line| {
@@ -2046,20 +2084,33 @@ impl HyberShell {
                     .ok_or("invalid service catalog")
             })
             .collect::<Result<_, _>>()?;
-        if names.iter().any(|name| {
-            name.is_empty()
-                || name.len() > 64
-                || !name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-                || *name == "."
-                || *name == ".."
-        }) {
+        if names.len() > 64
+            || names
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != names.len()
+            || names.iter().any(|name| {
+                name.is_empty()
+                    || name.len() > 64
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                    || *name == "."
+                    || *name == ".."
+            })
+        {
             return Err("invalid service catalog".into());
         }
         let root = self
             .ns_mgr
             .resolve(&Path::parse("/services"), self.ns_mgr.root())?;
+        // Private administrative projection: this is not payload ownership.
+        if let Some(metadata) = self.obj_mgr.lookup_mut(root) {
+            metadata.owner = projection_owner.user_id;
+            metadata.group = projection_owner.group_id;
+            metadata.permissions = 0o500;
+        }
         let old: Vec<_> = self
             .svc_mgr
             .lock()
@@ -2074,10 +2125,15 @@ impl HyberShell {
                 self.obj_mgr.destroy(object);
             }
         }
+        // The bootstrap manager must not retain entries pointing at reclaimed
+        // Objects after its provider is replaced by the remote projection.
+        *self.svc_mgr.lock().map_err(|_| "service lock poisoned")? = ServiceManager::new();
         let mut objects = std::collections::BTreeMap::new();
         for name in names {
             let object = self.obj_mgr.create_object(ObjectType::Service);
             if let Some(metadata) = self.obj_mgr.lookup_mut(object) {
+                metadata.owner = projection_owner.user_id;
+                metadata.group = projection_owner.group_id;
                 metadata.permissions = 0o400;
             }
             self.ns_mgr.create_node(&self.obj_mgr, root, name, object)?;

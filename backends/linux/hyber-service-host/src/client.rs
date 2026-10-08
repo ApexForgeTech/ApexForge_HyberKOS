@@ -85,11 +85,17 @@ pub struct RemoteServiceProvider {
 }
 impl Provider for RemoteServiceProvider {
     fn check_open(&self, object: ObjectId, rights: hyber_core::Rights) -> Result<(), String> {
-        let context = self.client.session.context().map_err(|_| "shell session invalid")?;
+        let context = self
+            .client
+            .session
+            .context()
+            .map_err(|_| "shell session invalid")?;
         hyber_core::SecurityManager::check_capability(&context, "CAP_SYS_ADMIN")?;
         hyber_service::projection::check_projection_rights(rights)?;
         if object == self.root {
-            if rights.read { return Err("cannot read service directory as a file".into()); }
+            if rights.read {
+                return Err("cannot read service directory as a file".into());
+            }
         } else if !self.objects.values().any(|id| *id == object) || rights.enumerate {
             return Err("invalid service projection object or operation".into());
         }
@@ -145,7 +151,13 @@ impl Provider for RemoteServiceProvider {
         Ok(length)
     }
     fn enumerate(&self, root: ObjectId) -> Result<Option<Vec<(String, ObjectId)>>, String> {
-        self.check_open(root, hyber_core::Rights { enumerate: true, ..hyber_core::Rights::empty() })?;
+        self.check_open(
+            root,
+            hyber_core::Rights {
+                enumerate: true,
+                ..hyber_core::Rights::empty()
+            },
+        )?;
         if root != self.root {
             return Err("not a service directory".into());
         }

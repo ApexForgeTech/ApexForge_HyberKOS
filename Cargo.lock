@@ -475,6 +475,7 @@ version = "0.1.0"
 dependencies = [
  "hyber-auth",
  "hyber-core",
+ "hyber-handle",
  "hyber-identity",
  "hyber-manifest",
  "hyber-namespace",

@@ -862,7 +862,10 @@ fn build_sec(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_
                     obj.permissions,
                     requested_rights,
                 ) {
-                    Ok(_) => Ok(true),
+                    Ok(_) => Ok(ks
+                        .vfs
+                        .check_provider_rights(&ks.ns_mgr, &path, requested_rights)
+                        .is_ok()),
                     Err(_) => Ok(false),
                 }
             })?;

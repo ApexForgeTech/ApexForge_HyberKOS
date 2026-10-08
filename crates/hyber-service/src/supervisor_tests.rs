@@ -212,14 +212,22 @@ fn failed_stop_and_unknown_poll_do_not_discard_live_process() {
             "service stop request failed".into()
         ))
     );
-    assert_eq!(supervisor.status(id), Some(&before));
-    assert!(runner.guards[0].context().is_ok());
+    assert_eq!(
+        supervisor.status(id).unwrap().state,
+        SupervisorState::Stopping
+    );
+    assert!(runner.guards[0].context().is_err());
     runner.fail_poll = true;
     supervisor
         .drive(&root, 1, &mut runner, &mut authority)
         .unwrap();
     assert_eq!(supervisor.status(id).unwrap().process_id, before.process_id);
     assert_eq!(runner.next, 1);
+    supervisor
+        .drive(&root, STOP_TIMEOUT_TICKS, &mut runner, &mut authority)
+        .unwrap();
+    assert_eq!(runner.terminated, vec![before.process_id.unwrap()]);
+    assert_eq!(supervisor.status(id).unwrap().process_id, before.process_id);
 }
 
 #[test]
@@ -303,16 +311,30 @@ fn dependency_readiness_endpoint_collision_and_revocation_fail_closed() {
         supervisor.stop(&root, &parent, &mut runner),
         Err(SupervisorError::DependenciesNotReady)
     );
-    runner.guards[1].logout().unwrap();
+    // Revoking the parent must also revoke dependent dispatch, even while
+    // the dependent's own authentication session is still valid.
+    runner.guards[0].logout().unwrap();
+    assert!(runner.guards[1].context().is_ok());
     assert_eq!(
         supervisor.dispatch_context(&child.service_id),
         Err(SupervisorError::Authorization)
     );
-    supervisor
-        .drive(&root, 2, &mut runner, &mut authority)
-        .unwrap();
+    assert_eq!(
+        supervisor.drive(&root, 2, &mut runner, &mut authority),
+        Err(SupervisorError::DependenciesNotReady)
+    );
     assert_eq!(
         supervisor.status(&child.service_id).unwrap().state,
+        SupervisorState::Stopping
+    );
+    runner
+        .processes
+        .insert(ProcessId(2), ProcessObservation::Exited(0));
+    supervisor
+        .drive(&root, 3, &mut runner, &mut authority)
+        .unwrap();
+    assert_eq!(
+        supervisor.status(&parent).unwrap().state,
         SupervisorState::Stopping
     );
 }
@@ -572,6 +594,174 @@ fn projection_is_read_only_and_revalidates_running_sessions() {
     assert!(provider.write(ObjectId(2), 0, b"stop").is_err());
     runner.guards[0].logout().unwrap();
     assert!(provider.read(ObjectId(2), 0, &mut bytes).is_err());
+}
+
+#[test]
+fn projection_vfs_handles_metadata_and_permissions_remain_consistent() {
+    use hyber_core::{GroupId, ObjectType, Path, Rights, UserId};
+    use hyber_handle::HandleManager;
+    use hyber_namespace::NamespaceManager;
+    use hyber_object::ObjectManager;
+    use hyber_vfs::VFS;
+    let (supervisor, _, _, definition, _) = setup();
+    let mut objects = ObjectManager::new();
+    let mut ns = NamespaceManager::new(&mut objects);
+    let object = objects.create_object(ObjectType::Service);
+    objects.lookup_mut(object).unwrap().permissions = 0o400;
+    ns.create_node(&objects, ns.root(), "worker", object)
+        .unwrap();
+    let provider = crate::projection::SupervisorProvider::new(
+        Arc::new(Mutex::new(supervisor)),
+        ns.root(),
+        BTreeMap::from([(definition.service_id, object)]),
+    )
+    .unwrap();
+    let mut vfs = VFS::new();
+    vfs.register_provider("services".into(), Box::new(provider));
+    vfs.mount(Path::parse("/"), "services".into());
+    let mut handles = HandleManager::new();
+    let root = SecurityContext::root();
+    let pid = ProcessId(8);
+    let path = Path::parse("/worker");
+    for rights in [
+        Rights::read_write(),
+        Rights::all(),
+        Rights {
+            signal: true,
+            ..Rights::empty()
+        },
+    ] {
+        assert!(vfs
+            .open(&ns, &mut handles, &mut objects, pid, &root, &path, rights)
+            .is_err());
+        assert_eq!(objects.lookup(object).unwrap().references, 1);
+    }
+    let other = SecurityContext {
+        user_id: UserId(100),
+        group_id: GroupId(100),
+        supplementary_groups: vec![],
+        capabilities: vec![],
+    };
+    assert!(vfs
+        .open(
+            &ns,
+            &mut handles,
+            &mut objects,
+            pid,
+            &other,
+            &path,
+            Rights::read_only()
+        )
+        .is_err());
+    let handle = vfs
+        .open(
+            &ns,
+            &mut handles,
+            &mut objects,
+            pid,
+            &root,
+            &path,
+            Rights::read_only(),
+        )
+        .unwrap();
+    assert_eq!(objects.lookup(object).unwrap().references, 2);
+    assert!(vfs
+        .mutate_metadata(&ns, &mut objects, &root, &path, |objects, id| objects
+            .chmod(id, &root, 0o777))
+        .is_err());
+    assert_eq!(objects.lookup(object).unwrap().permissions, 0o400);
+    assert_eq!(objects.lookup(object).unwrap().references, 2);
+    let mut bytes = [0; 512];
+    assert!(vfs
+        .read_secure(
+            &mut handles,
+            &objects,
+            ProcessId(9),
+            &root,
+            handle,
+            &mut bytes
+        )
+        .is_err());
+    assert!(vfs
+        .read_secure(&mut handles, &objects, pid, &other, handle, &mut bytes)
+        .is_err());
+    assert!(
+        vfs.read_secure(&mut handles, &objects, pid, &root, handle, &mut bytes)
+            .unwrap()
+            > 0
+    );
+    assert!(vfs
+        .write_secure(&mut handles, &mut objects, pid, &root, handle, b"stop")
+        .is_err());
+    vfs.close(&mut handles, &mut objects, pid, handle).unwrap();
+    assert_eq!(objects.lookup(object).unwrap().references, 1);
+    assert!(vfs
+        .read_secure(&mut handles, &objects, pid, &root, handle, &mut bytes)
+        .is_err());
+}
+
+#[test]
+fn explicit_start_recovers_a_failed_service_after_retry_exhaustion() {
+    let (mut supervisor, mut authority, mut runner, definition, _) = setup();
+    let id = &definition.service_id;
+    runner.fail_start = true;
+    supervisor
+        .start(&SecurityContext::root(), id, &mut runner, &mut authority)
+        .unwrap_err();
+    for _ in 0..MAX_RESTARTS {
+        let now = supervisor.status(id).unwrap().next_restart_at.unwrap();
+        supervisor
+            .drive(&SecurityContext::root(), now, &mut runner, &mut authority)
+            .unwrap_err();
+    }
+    assert_eq!(
+        supervisor.status(id).unwrap().state,
+        SupervisorState::Failed
+    );
+    runner.fail_start = false;
+    supervisor
+        .request_start(&SecurityContext::root(), id)
+        .unwrap();
+    supervisor
+        .drive(&SecurityContext::root(), 1000, &mut runner, &mut authority)
+        .unwrap();
+    assert_eq!(
+        supervisor.status(id).unwrap().state,
+        SupervisorState::Running
+    );
+    assert_eq!(supervisor.status(id).unwrap().restart_count, 0);
+}
+
+#[test]
+fn readiness_failure_preserves_retry_when_stop_delivery_fails() {
+    let (mut supervisor, mut authority, mut runner, definition, _) = setup();
+    let root = SecurityContext::root();
+    let id = &definition.service_id;
+    supervisor
+        .start(&root, id, &mut runner, &mut authority)
+        .unwrap();
+    let pid = supervisor.status(id).unwrap().process_id.unwrap();
+    runner.fail_stop = true;
+    assert!(supervisor
+        .drive(&root, READINESS_TIMEOUT_TICKS, &mut runner, &mut authority)
+        .is_err());
+    assert_eq!(
+        supervisor.status(id).unwrap().state,
+        SupervisorState::Stopping
+    );
+    runner.processes.insert(pid, ProcessObservation::Exited(0));
+    supervisor
+        .drive(
+            &root,
+            READINESS_TIMEOUT_TICKS + 1,
+            &mut runner,
+            &mut authority,
+        )
+        .unwrap();
+    assert_eq!(
+        supervisor.status(id).unwrap().state,
+        SupervisorState::Backoff
+    );
 }
 
 #[test]

@@ -138,6 +138,24 @@ impl VFS {
         ns_mgr.resolve(&path.normalize(), ns_mgr.root())
     }
 
+    /// Operation support for rights introspection; this does not replace the
+    /// caller's traversal, metadata or session authorization checks.
+    pub fn check_provider_rights(
+        &self,
+        ns: &NamespaceManager,
+        path: &Path,
+        rights: Rights,
+    ) -> Result<(), String> {
+        let name = self
+            .mount_table
+            .find_provider(&path.normalize())
+            .ok_or("Provider not mounted")?;
+        self.providers
+            .get(&name)
+            .ok_or("Provider not registered")?
+            .check_open(self.lookup(ns, path)?, rights)
+    }
+
     /// Trusted layout authority installs aggregate, per-class limits. Rebuilt
     /// from the imported namespace on restart, never from host UID/GID values.
     pub fn set_quota(
@@ -269,7 +287,9 @@ impl VFS {
             rights,
         )?;
 
-        self.providers.get(&provider_name).ok_or("Provider not registered")?
+        self.providers
+            .get(&provider_name)
+            .ok_or("Provider not registered")?
             .check_open(object_id, rights)?;
 
         handle_mgr.open(obj_mgr, process_id, object_id, rights, provider_name)
@@ -375,7 +395,9 @@ impl VFS {
             return Err("Object is not live".into());
         }
 
-        self.providers.get(&provider_name).ok_or("Provider not registered")?
+        self.providers
+            .get(&provider_name)
+            .ok_or("Provider not registered")?
             .check_open(object_id, write_rights)?;
         if buffer.is_empty() {
             return Ok(0);
