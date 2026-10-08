@@ -1,0 +1,15 @@
+format_version = 1
+app_id = "lua-worker"
+version = "1.0.0"
+publisher = "example"
+display_name = "Lua lifecycle example"
+entrypoint = "main.lua"
+runtime = "lua"
+execution = "service"
+requested_capabilities = ["service.background"]
+
+[resources]
+memory_bytes = 134217728
+cpu_shares = 8
+handles = 64
+storage_bytes = 1024

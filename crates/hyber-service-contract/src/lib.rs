@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const SERVICE_FORMAT_VERSION: u32 = 1;
 pub const MAX_DEPENDENCIES: usize = 64;
+pub const MAX_SERVICES: usize = 1024;
+pub const MAX_DEPENDENCY_DEPTH: usize = 128;
 pub const MAX_IPC_ENDPOINTS: usize = 32;
 pub const MAX_IPC_MESSAGE_BYTES: u32 = 16 * 1024 * 1024;
 
@@ -289,6 +291,9 @@ impl ServiceCatalog {
         definition: ServiceDefinition,
         grant: &ApplicationGrant,
     ) -> Result<(), ContractError> {
+        if self.services.len() >= MAX_SERVICES {
+            return Err(ContractError::Invalid("service catalog capacity exceeded"));
+        }
         definition.validate_against(grant)?;
         definition.validate_identity(accounts)?;
         if self.services.contains_key(&definition.service_id) {
@@ -305,6 +310,10 @@ impl ServiceCatalog {
     pub fn get(&self, id: &ServiceId) -> Option<&ServiceDefinition> {
         self.services.get(id)
     }
+    /// Deterministic, read-only catalog view for the Rust supervisor.
+    pub fn definitions(&self) -> impl Iterator<Item = (&ServiceId, &ServiceDefinition)> {
+        self.services.iter()
+    }
     /// Atomically validates a mutually-dependent declaration set. This is used
     /// when a future loader reads all Lua service definitions at once, and is
     /// the path that can distinguish a cycle from a merely missing dependency.
@@ -313,7 +322,10 @@ impl ServiceCatalog {
         accounts: &AccountRegistry,
         entries: impl IntoIterator<Item = (ServiceDefinition, ApplicationGrant)>,
     ) -> Result<(), ContractError> {
-        let entries: Vec<_> = entries.into_iter().collect();
+        let entries: Vec<_> = entries.into_iter().take(MAX_SERVICES + 1).collect();
+        if entries.len() + self.services.len() > MAX_SERVICES {
+            return Err(ContractError::Invalid("service catalog capacity exceeded"));
+        }
         for (definition, grant) in &entries {
             definition.validate_against(grant)?;
             definition.validate_identity(accounts)?;
@@ -368,6 +380,9 @@ impl ServiceCatalog {
     ) -> Result<(), ContractError> {
         if visited.contains(id) {
             return Ok(());
+        }
+        if active.len() >= MAX_DEPENDENCY_DEPTH {
+            return Err(ContractError::Invalid("service dependency depth exceeded"));
         }
         if !active.insert(id.clone()) {
             return Err(ContractError::DependencyCycle);
@@ -575,6 +590,32 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["network", "dns"]
         );
+    }
+    #[test]
+    fn oversized_and_deep_catalog_batches_fail_without_partial_registration() {
+        let grant = grant(Runtime::Lua);
+        let (accounts, identity) = accounts();
+        let mut catalog = ServiceCatalog::default();
+        let deep: Vec<_> = (0..=MAX_DEPENDENCY_DEPTH)
+            .map(|index| {
+                let mut entry = definition(&format!("svc{index:04}"), &[], identity);
+                if index < MAX_DEPENDENCY_DEPTH {
+                    entry
+                        .dependencies
+                        .insert(ServiceId(format!("svc{:04}", index + 1)));
+                }
+                (entry, grant.clone())
+            })
+            .collect();
+        assert!(catalog.register_batch(&accounts, deep).is_err());
+        assert_eq!(catalog.definitions().count(), 0);
+        assert!(catalog
+            .register_batch(
+                &accounts,
+                std::iter::repeat_n((definition("svc", &[], identity), grant), MAX_SERVICES + 1)
+            )
+            .is_err());
+        assert_eq!(catalog.definitions().count(), 0);
     }
     #[test]
     fn rejects_missing_dependency_and_unapproved_socket_policy() {

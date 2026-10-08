@@ -42,6 +42,7 @@ struct HyberShell {
     profiles: Profiles,
     history_path: Option<Path>,
     explicit_profiles: bool,
+    service_client: Option<hyber_service_host::client::ServiceClient>,
 }
 
 impl HyberShell {
@@ -270,6 +271,7 @@ impl HyberShell {
             profiles: Profiles::default(),
             history_path: None,
             explicit_profiles: false,
+            service_client: None,
         })
     }
 
@@ -666,7 +668,11 @@ impl HyberShell {
             self.profiles.fallback();
         }
 
-        println!("HyberKOS Shell v0.12.5  (Phase 12.5 — Advanced Lua Orchestration)");
+        println!(
+            "HyberKOS Shell v{}  (hosted development environment)",
+            env!("CARGO_PKG_VERSION")
+        );
+        println!("Foundation: Phases 1–12.5 and Special_1–5; package management is provided by hyber-pkg.");
         println!("Type 'exit' to quit.\n");
 
         while self.running {
@@ -839,6 +845,7 @@ impl HyberShell {
             "ps" => self.cmd_ps(args),
             "lsdev" => self.cmd_lsdev(args),
             "lssvc" => self.cmd_lssvc(args),
+            "svc" => self.cmd_svc(args),
             "tree" => self.cmd_tree(args),
             "exit" => self.cmd_exit(args),
             "help" => self.cmd_help(args),
@@ -1382,34 +1389,37 @@ impl HyberShell {
             .unwrap_or(false);
 
         let mut buffer = [0u8; 4096];
-        loop {
-            let bytes = self.vfs.read_secure(
-                &mut self.handle_mgr,
-                &self.obj_mgr,
-                self.process_id,
-                &sec_ctx,
-                handle,
-                &mut buffer,
-            )?;
-            if bytes == 0 {
-                break;
+        let read_result = (|| -> Result<(), String> {
+            loop {
+                let bytes = self.vfs.read_secure(
+                    &mut self.handle_mgr,
+                    &self.obj_mgr,
+                    self.process_id,
+                    &sec_ctx,
+                    handle,
+                    &mut buffer,
+                )?;
+                if bytes == 0 {
+                    break;
+                }
+                print!("{}", String::from_utf8_lossy(&buffer[..bytes]));
+                // Stream-aware break for devices (avoid infinite shell lockup)
+                if is_device {
+                    println!("\n[Device output truncated]");
+                    break;
+                }
             }
-            print!("{}", String::from_utf8_lossy(&buffer[..bytes]));
-            // Stream-aware break for devices (avoid infinite shell lockup)
-            if is_device {
-                println!("\n[Device output truncated]");
-                break;
-            }
-        }
-        println!();
+            println!();
+            Ok(())
+        })();
 
-        self.vfs.close(
+        let close_result = self.vfs.close(
             &mut self.handle_mgr,
             &mut self.obj_mgr,
             self.process_id,
             handle,
-        )?;
-        Ok(())
+        );
+        read_result.and(close_result)
     }
 
     // ==========================================
@@ -1970,6 +1980,9 @@ impl HyberShell {
     }
 
     fn cmd_lssvc(&self, _args: &[&str]) -> Result<(), String> {
+        if self.service_client.is_some() {
+            return self.cmd_svc(&["status"]);
+        }
         let mgr = self
             .svc_mgr
             .lock()
@@ -1994,6 +2007,91 @@ impl HyberShell {
                 s.name, s.state, pid_str, s.description
             );
         }
+        Ok(())
+    }
+
+    fn cmd_svc(&self, args: &[&str]) -> Result<(), String> {
+        if args.is_empty()
+            || args.len() > 2
+            || ![
+                "status", "start", "stop", "restart", "enable", "disable", "shutdown", "logs",
+            ]
+            .contains(&args[0])
+        {
+            return Err(
+                "usage: svc <status|start|stop|restart|enable|disable|logs|shutdown> [service-id]"
+                    .into(),
+            );
+        }
+        let client = self
+            .service_client
+            .as_ref()
+            .ok_or("start the authenticated shell with --service-socket <socket>")?;
+        println!("{}", client.request(args[0], args.get(1).copied())?);
+        Ok(())
+    }
+
+    fn attach_service_daemon(&mut self, socket: PathBuf) -> Result<(), String> {
+        let session = self
+            .session
+            .clone()
+            .ok_or("service attachment requires an authenticated shell")?;
+        let client = hyber_service_host::client::ServiceClient { socket, session };
+        let listing = client.request("status", None)?;
+        let names: Vec<_> = listing
+            .lines()
+            .map(|line| {
+                line.split_once(' ')
+                    .map(|(id, _)| id)
+                    .ok_or("invalid service catalog")
+            })
+            .collect::<Result<_, _>>()?;
+        if names.iter().any(|name| {
+            name.is_empty()
+                || name.len() > 64
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                || *name == "."
+                || *name == ".."
+        }) {
+            return Err("invalid service catalog".into());
+        }
+        let root = self
+            .ns_mgr
+            .resolve(&Path::parse("/services"), self.ns_mgr.root())?;
+        let old: Vec<_> = self
+            .svc_mgr
+            .lock()
+            .map_err(|_| "service lock poisoned")?
+            .list_services()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        for name in old {
+            if let Some(object) = self.ns_mgr.remove_node(root, &name) {
+                self.obj_mgr.release(object);
+                self.obj_mgr.destroy(object);
+            }
+        }
+        let mut objects = std::collections::BTreeMap::new();
+        for name in names {
+            let object = self.obj_mgr.create_object(ObjectType::Service);
+            if let Some(metadata) = self.obj_mgr.lookup_mut(object) {
+                metadata.permissions = 0o400;
+            }
+            self.ns_mgr.create_node(&self.obj_mgr, root, name, object)?;
+            objects.insert(name.to_owned(), object);
+        }
+        self.vfs.register_provider(
+            "svcfs".into(),
+            Box::new(hyber_service_host::client::RemoteServiceProvider {
+                client: client.clone(),
+                root,
+                objects,
+            }),
+        );
+        self.service_client = Some(client);
         Ok(())
     }
 
@@ -2067,8 +2165,20 @@ impl HyberShell {
         Ok(())
     }
 
-    fn cmd_help(&self, _args: &[&str]) -> Result<(), String> {
-        println!("=== HyberKOS Shell Commands (Phase 12.5) ===\n");
+    fn cmd_help(&self, args: &[&str]) -> Result<(), String> {
+        match args {
+            [] => (),
+            [command] => {
+                println!(
+                    "{}",
+                    shell_command_help(command)
+                        .ok_or("unknown command; run `help` to list commands")?
+                );
+                return Ok(());
+            }
+            _ => return Err("Usage: help [command]".into()),
+        }
+        println!("=== HyberKOS Shell Commands (hosted development environment) ===\n");
         println!("Standard Commands:");
         println!("  pwd                     Print working directory");
         println!("  whoami                  Print current Hyber account name");
@@ -2101,8 +2211,9 @@ impl HyberShell {
         println!("  ps                      List processes");
         println!("  lsdev                   List registered devices (/devices)");
         println!("  lssvc                   List registered services (/services)");
+        println!("  svc <action> [id]       Control independent Phase 18 services (help svc)");
         println!();
-        println!("Phase 12/12.5 — Lua Runtime & Orchestration:");
+        println!("Lua Runtime & Orchestration (Phases 12/12.5):");
         println!("  lua <script>            Execute inline Lua (quote the script)");
         println!("  luafile <path>          Execute a Lua script file from the namespace");
         println!("  Lua API:");
@@ -2128,12 +2239,21 @@ impl HyberShell {
         println!("  /system, /users, /apps, /data, /config,");
         println!("  /packages, /volumes, /developer   (HostFS)");
         println!();
+        println!("Shell state and profiles (Special_4/5):");
         println!("  exit                    Exit shell");
-        println!("  help                    Show this help");
+        println!("  help [command]          Show all commands or command-specific usage");
         println!("  alias [name | name='command args']  List, inspect or define an alias");
         println!("  unalias <name|--all>     Remove session aliases");
         println!("  history [clear|search text|exclude text|save on/off]");
         println!("  env [name [value]]      Inspect/change session-only environment");
+        println!();
+        println!("Package artifacts (Phase 17):");
+        println!("  hyber-pkg build|verify|init|trust-add|import|resolve|install|");
+        println!("            update|rollback|remove|list|check ...");
+        println!("                          Run the dedicated package tool; this shell does not");
+        println!(
+            "                          treat package administration as an unauthenticated command."
+        );
         Ok(())
     }
 
@@ -2277,8 +2397,63 @@ impl HyberShell {
     }
 }
 
+/// Command-specific usage text.  Keep this in the shell dispatcher boundary:
+/// it documents Hyber commands without exposing host command execution.
+fn shell_command_help(command: &str) -> Option<&'static str> {
+    Some(match command {
+        "help" => "Usage: help [command]\nShow the command index, or detailed usage for one shell command.\nExample: help lua",
+        "pwd" => "Usage: pwd\nPrint the current Hyber namespace directory.",
+        "whoami" => "Usage: whoami\nPrint the current Hyber account name.",
+        "cd" => "Usage: cd <path>\nChange directory. Hyber absolute and relative paths, '.', and '..' are supported.",
+        "ls" => "Usage: ls [-l] [-a] [path]\nList a Hyber directory. -l adds object details; -a includes hidden entries.",
+        "mkdir" => "Usage: mkdir [-p] <path>\nCreate a Hyber directory; -p creates missing parents.",
+        "touch" => "Usage: touch <path>\nCreate an empty file or update its modification time.",
+        "rm" => "Usage: rm [-r] <path>\nRemove a file. Directories require -r.",
+        "mv" => "Usage: mv <source> <destination>\nRename or move one namespace entry.",
+        "cp" => "Usage: cp <source> <destination>\nCopy file bytes through Hyber handles and VFS.",
+        "cat" => "Usage: cat <path>\nRead a UTF-8 file through Hyber VFS and print it.",
+        "clear" | "cls" => "Usage: clear | cls\nClear the current terminal display.",
+        "list" => "Usage: list [path]\nList names with ObjectId, type, references, and size.",
+        "look" => "Usage: look <path>\nShow detailed metadata for one Hyber object.",
+        "tree" => "Usage: tree [path]\nShow a namespace tree, limited to four levels.",
+        "acquire" => "Usage: acquire <path> [r|w|rw]\nCreate a shell handle with the requested rights.",
+        "release" => "Usage: release <handle-id>\nClose one shell handle and release its object reference.",
+        "handles" => "Usage: handles\nShow this shell process's open handle table.",
+        "mnts" => "Usage: mnts\nShow active VFS mount points and providers.",
+        "rights" => "Usage: rights <path>\nEvaluate effective rights for the current security context.",
+        "meta" => "Usage: meta ls <path> | meta get <path> <key> | meta set <path> <key> <string|int|bool> <value> | meta rm <path> <key>\nManage validated extended object metadata.",
+        "chmod" => "Usage: chmod <octal-mode> <path>\nSet Hyber rwx mode. The current user must own the object or hold authority.",
+        "chgrp" => "Usage: chgrp <group> <path>\nSet object group when permitted by Hyber ownership rules.",
+        "chown" => "Usage: chown <user> <path>\nTransfer ownership; administrative authority is required.",
+        "su" => "Usage: su <uid> [gid]\nBootstrap-only effective identity switch. Authenticated sessions reject numeric elevation.",
+        "ps" => "Usage: ps\nList Hyber process objects.",
+        "lsdev" => "Usage: lsdev\nList registered virtual device objects.",
+        "lssvc" => "Usage: lssvc\nList registered service objects.",
+        "svc" => "Usage: svc <status|start|stop|restart|enable|disable|logs|shutdown> [service-id]\nRequires authenticated --service-socket attachment. Commands authenticate with the daemon; shell exit does not stop services.",
+        "lua" => "Usage: lua <Lua source>\nExecute sandboxed Lua through Hyber APIs only.\nExample: lua \"hyber.log.info('hello')\"",
+        "luafile" => "Usage: luafile <hyber-path>\nRead a UTF-8 Lua script via Hyber VFS, then execute it in the sandbox.",
+        "alias" => "Usage: alias [name | name='command arguments']\nList, inspect, or define a session alias. Aliases cannot replace shell control commands.",
+        "unalias" => "Usage: unalias <name|--all>\nRemove one session alias or all session aliases.",
+        "history" => "Usage: history [clear|save on|save off|search <text>|exclude <text>]\nShow or manage per-user command history. `history` itself is recorded; secret-like input is never recorded.",
+        "env" => "Usage: env [name [value]]\nList, inspect, or change session-only environment values. Values are intentionally excluded from history.",
+        "exit" => "Usage: exit\nClose handles, end the shell session, and exit.",
+        _ => return None,
+    })
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
+    let service_socket = if args.get(1).is_some_and(|arg| arg == "--service-socket") {
+        if args.len() < 3 {
+            eprintln!("--service-socket requires a socket path");
+            std::process::exit(1);
+        }
+        let socket = PathBuf::from(args.remove(2));
+        args.remove(1);
+        Some(socket)
+    } else {
+        None
+    };
     let host_override = if args.get(1).is_some_and(|arg| arg == "--host-root") {
         if args.len() < 3 {
             eprintln!("--host-root requires an isolated directory");
@@ -2317,7 +2492,7 @@ fn main() {
     } else if args.len() == 1 {
         None
     } else {
-        eprintln!("usage: hyber-shell [--host-root <directory>] [--profiles] [--auth <image> <blocks> <username>]");
+        eprintln!("usage: hyber-shell [--service-socket <socket>] [--host-root <directory>] [--profiles] [--auth <image> <blocks> <username>]");
         std::process::exit(1);
     };
     // Default host root: ~/hyber-host
@@ -2328,6 +2503,13 @@ fn main() {
         Ok(mut shell) => {
             shell.explicit_profiles = explicit_profiles;
             shell.session = session;
+            if let Some(socket) = service_socket {
+                if let Err(error) = shell.attach_service_daemon(socket) {
+                    eprintln!("{error}");
+                    shell.cleanup();
+                    std::process::exit(1);
+                }
+            }
             if shell.session.is_some() {
                 if let Err(error) = shell.ensure_session_home() {
                     eprintln!("Failed to prepare authenticated home: {error}");

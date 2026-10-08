@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 hyber-core = { path = "../../crates/hyber-core" }
+hyber-auth = { path = "../../crates/hyber-auth" }
+hyber-fs = { path = "../../crates/hyber-fs" }
+hyber-manifest = { path = "../../crates/hyber-manifest" }
 hyber-package = { path = "../../crates/hyber-package" }
 hyber-package-format = { path = "../../crates/hyber-package-format" }
-

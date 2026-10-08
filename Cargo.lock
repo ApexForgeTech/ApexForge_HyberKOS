@@ -428,6 +428,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "hyber-core",
+ "hyber-fs",
  "hyber-manifest",
  "hyber-package-format",
  "sha2",
@@ -449,7 +450,10 @@ name = "hyber-pkg"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "hyber-auth",
  "hyber-core",
+ "hyber-fs",
+ "hyber-manifest",
  "hyber-package",
  "hyber-package-format",
 ]
@@ -472,9 +476,12 @@ dependencies = [
  "hyber-auth",
  "hyber-core",
  "hyber-identity",
+ "hyber-manifest",
  "hyber-namespace",
  "hyber-object",
+ "hyber-service-contract",
  "hyber-vfs",
+ "mlua",
 ]
 
 [[package]]
@@ -484,6 +491,43 @@ dependencies = [
  "hyber-core",
  "hyber-identity",
  "hyber-manifest",
+]
+
+[[package]]
+name = "hyber-service-host"
+version = "0.1.0"
+dependencies = [
+ "hyber-auth",
+ "hyber-core",
+ "hyber-manifest",
+ "hyber-namespace",
+ "hyber-object",
+ "hyber-process",
+ "hyber-service",
+ "hyber-service-contract",
+ "hyber-vfs",
+ "libc",
+ "serde_json",
+]
+
+[[package]]
+name = "hyber-serviced"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hyber-auth",
+ "hyber-core",
+ "hyber-fs",
+ "hyber-identity",
+ "hyber-manifest",
+ "hyber-package",
+ "hyber-package-format",
+ "hyber-service",
+ "hyber-service-contract",
+ "hyber-service-host",
+ "libc",
+ "mlua",
+ "serde_json",
 ]
 
 [[package]]
@@ -502,6 +546,7 @@ dependencies = [
  "hyber-object",
  "hyber-process",
  "hyber-service",
+ "hyber-service-host",
  "hyber-vfs",
  "libc",
  "mlua",

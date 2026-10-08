@@ -747,6 +747,59 @@ impl SessionGuard {
             .map_err(|_| AuthError::Unavailable)?
             .logout(&self.token)
     }
+
+    /// Issue an independent service session through an authenticated admin
+    /// guard. The child retains hosted-store freshness checks, but not the
+    /// caller's token or interactive lifetime.
+    pub fn service_session(&self, user: UserId, ttl: u64) -> Result<Self, AuthError> {
+        self.context()?;
+        let token = self
+            .service
+            .lock()
+            .map_err(|_| AuthError::Unavailable)?
+            .service_session(&self.token, user, ttl)?;
+        let child = Self {
+            service: self.service.clone(),
+            token,
+            hosted: self.hosted.clone(),
+        };
+        if let Err(error) = child.context() {
+            let _ = child.logout();
+            return Err(error);
+        }
+        Ok(child)
+    }
+
+    /// Privileged snapshot for service identity validation, without credentials.
+    pub fn administrative_accounts(&self) -> Result<AccountRegistry, AuthError> {
+        let context = self.context()?;
+        SecurityManager::check_capability(&context, "CAP_SYS_ADMIN")
+            .map_err(|_| AuthError::PermissionDenied)?;
+        Ok(self
+            .service
+            .lock()
+            .map_err(|_| AuthError::Unavailable)?
+            .accounts
+            .clone())
+    }
+
+    /// Hosted control-plane authentication. Sessions remain in the authority;
+    /// no bearer token is serialized over the local transport.
+    pub fn authenticate_client(&self, username: &str, password: &[u8]) -> Result<Self, AuthError> {
+        self.context()?;
+        let token = self
+            .service
+            .lock()
+            .map_err(|_| AuthError::Unavailable)?
+            .login(username, password, SessionKind::Interactive, 60)?;
+        let client = Self {
+            service: self.service.clone(),
+            token,
+            hosted: self.hosted.clone(),
+        };
+        client.context()?;
+        Ok(client)
+    }
 }
 
 fn password_policy(password: &[u8]) -> Result<(), AuthError> {

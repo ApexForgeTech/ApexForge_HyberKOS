@@ -10,6 +10,11 @@ use hyber_object::ObjectManager;
 // 6.3 — Provider Interface
 // ==========================================
 pub trait Provider {
+    /// Provider operation support is independent of owner/group permissions.
+    /// Even administrators cannot open a read-only projection for mutation.
+    fn check_open(&self, _object: ObjectId, _rights: Rights) -> Result<(), String> {
+        Ok(())
+    }
     /// Persist an already validated metadata update before reporting success.
     /// Volatile providers intentionally retain only the ObjectManager copy.
     fn persist_metadata(&mut self, _object: &hyber_object::Object) -> Result<(), String> {
@@ -264,6 +269,9 @@ impl VFS {
             rights,
         )?;
 
+        self.providers.get(&provider_name).ok_or("Provider not registered")?
+            .check_open(object_id, rights)?;
+
         handle_mgr.open(obj_mgr, process_id, object_id, rights, provider_name)
     }
 
@@ -300,6 +308,7 @@ impl VFS {
             .get(&handle.provider_name)
             .ok_or_else(|| format!("Provider {} not found", handle.provider_name))?;
 
+        provider.check_open(object_id, Rights::read_only())?;
         let bytes_read = provider.read(object_id, offset, buffer)?;
         if bytes_read > buffer.len() {
             return Err("Provider returned invalid read length".into());
@@ -366,6 +375,8 @@ impl VFS {
             return Err("Object is not live".into());
         }
 
+        self.providers.get(&provider_name).ok_or("Provider not registered")?
+            .check_open(object_id, write_rights)?;
         if buffer.is_empty() {
             return Ok(0);
         }

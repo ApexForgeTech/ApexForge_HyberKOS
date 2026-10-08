@@ -8,11 +8,13 @@
 
 use ed25519_dalek::VerifyingKey;
 use hyber_core::{SecurityContext, SecurityManager, UserId};
+use hyber_fs::{BlockDevice, FsError, Metadata, ObjectKind, Volume};
 use hyber_manifest::{ApplicationGrant, CapabilityName, GrantPolicy, Manifest};
 use hyber_package_format::{
     artifact_digest, Dependency, PackageFormatError, PackageId, PackageKey, PackageVersion,
     SignedPackage, VersionRequirement,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -24,6 +26,18 @@ pub const MAX_RESOLUTION_DEPTH: usize = 128;
 const REGISTRY_MAGIC: [u8; 8] = *b"HYBPKR1\0";
 const REGISTRY_VERSION: u32 = 1;
 const MAX_REGISTRY_BYTES: usize = 4 * 1024 * 1024;
+const TRUST_MAGIC: [u8; 8] = *b"HYBPKT1\0";
+const TRUST_VERSION: u32 = 1;
+const MAX_TRUST_BYTES: usize = 256 * 1024;
+
+/// Paths inside the Phase 15/16 volume.  They are HyberFS paths, not host
+/// paths, and every change becomes visible only at the volume's snapshot
+/// `sync` boundary.
+pub const PACKAGE_STATE_DIR: &str = "/packages/.state";
+pub const PACKAGE_ARTIFACT_DIR: &str = "/packages/.state/artifacts";
+pub const PACKAGE_REGISTRY_PATH: &str = "/packages/.state/registry";
+pub const PACKAGE_TRUST_PATH: &str = "/packages/.state/trust";
+pub const PACKAGE_APPS_ROOT: &str = "/apps";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyState {
@@ -121,6 +135,13 @@ pub struct PackageManager {
     pub registry: PackageRegistry,
 }
 
+/// Hosted persistent package store.  This is deliberately tied to the
+/// Phase-15/16 `Volume` transaction boundary rather than a host directory:
+/// artifacts, trust policy, registry, and installed application trees are
+/// prepared in one in-memory generation and published by one `sync()`.
+#[derive(Debug, Clone, Default)]
+pub struct HyberFsPackageStore;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackageError {
     Format(String),
@@ -146,6 +167,7 @@ pub enum PackageError {
     ReverseDependency(PackageId),
     BusyTransaction,
     GenerationOverflow,
+    Storage(String),
 }
 
 impl fmt::Display for PackageError {
@@ -176,6 +198,7 @@ impl fmt::Display for PackageError {
             Self::ReverseDependency(id) => write!(f, "package is required by {}", id.0),
             Self::BusyTransaction => f.write_str("package transaction is already in progress"),
             Self::GenerationOverflow => f.write_str("package registry generation overflow"),
+            Self::Storage(reason) => write!(f, "package storage failure: {reason}"),
         }
     }
 }
@@ -236,6 +259,104 @@ impl TrustStore {
             return Err(PackageError::KeyScopeDenied);
         }
         package.verify(&key.verifying_key).map_err(Into::into)
+    }
+
+    /// Canonical public trust state.  Private signing material is never part
+    /// of this snapshot.  A SHA-256 trailer catches storage damage before any
+    /// public key is used to validate an artifact.
+    pub fn encode_snapshot(&self) -> Result<Vec<u8>, PackageError> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&TRUST_MAGIC);
+        put_u32(&mut bytes, TRUST_VERSION);
+        put_u32(
+            &mut bytes,
+            u32::try_from(self.keys.len()).map_err(|_| PackageError::ResolutionLimit)?,
+        );
+        for key in self.keys.values() {
+            validate_trusted_key(key)?;
+            put_string(&mut bytes, &key.key_id)?;
+            put_string(&mut bytes, &key.publisher)?;
+            match &key.package_prefix {
+                Some(prefix) => {
+                    bytes.push(1);
+                    put_string(&mut bytes, prefix)?;
+                }
+                None => bytes.push(0),
+            }
+            bytes.push(match key.state {
+                KeyState::Trusted => 1,
+                KeyState::Disabled => 2,
+                KeyState::Revoked => 3,
+            });
+            bytes.extend_from_slice(&key.verifying_key.to_bytes());
+        }
+        if bytes
+            .len()
+            .checked_add(32)
+            .is_none_or(|n| n > MAX_TRUST_BYTES)
+        {
+            return Err(PackageError::ResolutionLimit);
+        }
+        let digest = Sha256::digest(&bytes);
+        bytes.extend_from_slice(&digest);
+        Ok(bytes)
+    }
+
+    pub fn decode_snapshot(bytes: &[u8]) -> Result<Self, PackageError> {
+        if bytes.len() < 8 + 4 + 4 + 32 || bytes.len() > MAX_TRUST_BYTES {
+            return Err(PackageError::Format("invalid trust snapshot length".into()));
+        }
+        let (payload, expected_digest) = bytes.split_at(bytes.len() - 32);
+        if Sha256::digest(payload).as_slice() != expected_digest {
+            return Err(PackageError::Format(
+                "trust snapshot checksum mismatch".into(),
+            ));
+        }
+        let mut reader = RegistryReader::new(payload);
+        if reader.take(8)? != TRUST_MAGIC {
+            return Err(PackageError::Format("invalid trust snapshot magic".into()));
+        }
+        if reader.u32()? != TRUST_VERSION {
+            return Err(PackageError::Format(
+                "unsupported trust snapshot version".into(),
+            ));
+        }
+        let count = reader.count(1_024)?;
+        let mut store = Self::default();
+        for _ in 0..count {
+            let key_id = reader.string(128)?;
+            let publisher = reader.string(256)?;
+            let package_prefix = match reader.byte()? {
+                0 => None,
+                1 => Some(reader.string(128)?),
+                _ => return Err(PackageError::Format("invalid trust prefix marker".into())),
+            };
+            let state = match reader.byte()? {
+                1 => KeyState::Trusted,
+                2 => KeyState::Disabled,
+                3 => KeyState::Revoked,
+                _ => return Err(PackageError::Format("invalid trust key state".into())),
+            };
+            let mut public = [0_u8; 32];
+            public.copy_from_slice(reader.take(32)?);
+            let verifying_key = VerifyingKey::from_bytes(&public)
+                .map_err(|_| PackageError::Format("invalid trusted public key".into()))?;
+            let key = TrustedKey {
+                key_id: key_id.clone(),
+                publisher,
+                package_prefix,
+                state,
+                verifying_key,
+            };
+            validate_trusted_key(&key)?;
+            if store.keys.insert(key_id, key).is_some() {
+                return Err(PackageError::Format("duplicate trusted key id".into()));
+            }
+        }
+        if !reader.finished() {
+            return Err(PackageError::Format("trailing trust snapshot bytes".into()));
+        }
+        Ok(store)
     }
 }
 
@@ -766,6 +887,58 @@ impl PackageManager {
         Ok(())
     }
 
+    /// Durable install wrapper.  The caller's manager is changed only after
+    /// the HyberFS snapshot containing registry and extracted files commits.
+    pub fn install_and_save<D: BlockDevice>(
+        &mut self,
+        volume: &mut Volume<D>,
+        store: &HyberFsPackageStore,
+        actor: &SecurityContext,
+        trust: &TrustStore,
+        policy: &GrantPolicy,
+        requested: &[Dependency],
+    ) -> Result<ResolutionPlan, PackageError> {
+        let mut next = self.clone();
+        let plan = next.install(actor, trust, policy, requested)?;
+        store.save(volume, &next, trust)?;
+        *self = next;
+        Ok(plan)
+    }
+
+    /// Durable rollback wrapper; it leaves the in-memory manager unchanged if
+    /// the backing snapshot cannot be committed.
+    pub fn rollback_and_save<D: BlockDevice>(
+        &mut self,
+        volume: &mut Volume<D>,
+        store: &HyberFsPackageStore,
+        actor: &SecurityContext,
+        trust: &TrustStore,
+        id: &PackageId,
+    ) -> Result<(), PackageError> {
+        let mut next = self.clone();
+        next.rollback(actor, trust, id)?;
+        store.save(volume, &next, trust)?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Durable removal wrapper; package-owned install trees are reconciled in
+    /// the same snapshot as the registry record deletion.
+    pub fn remove_and_save<D: BlockDevice>(
+        &mut self,
+        volume: &mut Volume<D>,
+        store: &HyberFsPackageStore,
+        actor: &SecurityContext,
+        trust: &TrustStore,
+        id: &PackageId,
+    ) -> Result<(), PackageError> {
+        let mut next = self.clone();
+        next.remove(actor, id)?;
+        store.save(volume, &next, trust)?;
+        *self = next;
+        Ok(())
+    }
+
     /// An in-progress state is never accepted as visible registry data. A
     /// persistent adapter calls this after reopening its last committed copy.
     pub fn recover(&mut self) {
@@ -773,6 +946,349 @@ impl PackageManager {
             self.registry.transaction = TransactionState::Idle;
         }
     }
+}
+
+impl HyberFsPackageStore {
+    /// Initialize the private package state roots.  A pre-existing non-directory
+    /// is rejected; this store never adopts an ambiguous filesystem object.
+    pub fn initialize<D: BlockDevice>(&self, volume: &mut Volume<D>) -> Result<(), PackageError> {
+        ensure_directory(volume, "/packages", 0o755)?;
+        ensure_directory(volume, PACKAGE_STATE_DIR, 0o700)?;
+        ensure_directory(volume, PACKAGE_ARTIFACT_DIR, 0o700)?;
+        ensure_directory(volume, PACKAGE_APPS_ROOT, 0o755)
+    }
+
+    /// Persist an already-authorized package-manager state.  This method does
+    /// not grant authority: callers must complete `PackageManager::install`,
+    /// `rollback`, or `remove` with an administrative `SecurityContext` first.
+    /// All prepared data is committed by exactly one HyberFS `sync` call.
+    pub fn save<D: BlockDevice>(
+        &self,
+        volume: &mut Volume<D>,
+        manager: &PackageManager,
+        trust: &TrustStore,
+    ) -> Result<(), PackageError> {
+        self.initialize(volume)?;
+        let registry = manager.registry.encode_snapshot()?;
+        let trust = trust.encode_snapshot()?;
+
+        for record in manager.repository.by_digest.values() {
+            let path = format!(
+                "{}/{}.hybp",
+                PACKAGE_ARTIFACT_DIR,
+                hex_digest(record.digest)
+            );
+            replace_or_verify(volume, &path, &record.artifact, private_metadata())?;
+        }
+        reconcile_application_trees(volume, &manager.registry)?;
+        volume
+            .replace_file(PACKAGE_REGISTRY_PATH, &registry, private_metadata())
+            .map_err(storage_error)?;
+        volume
+            .replace_file(PACKAGE_TRUST_PATH, &trust, private_metadata())
+            .map_err(storage_error)?;
+        volume.sync().map_err(storage_error)
+    }
+
+    /// Reload state only after first reconstructing every repository artifact
+    /// and current trust policy.  The registry decoder revalidates active
+    /// signatures, so damaged snapshots and revoked keys fail closed.
+    pub fn load<D: BlockDevice>(
+        &self,
+        volume: &Volume<D>,
+    ) -> Result<(PackageManager, TrustStore), PackageError> {
+        let trust = TrustStore::decode_snapshot(&read_all(volume, PACKAGE_TRUST_PATH)?)?;
+        let mut repository = Repository::default();
+        for (name, info) in volume.list(PACKAGE_ARTIFACT_DIR).map_err(storage_error)? {
+            if info.kind != ObjectKind::File
+                || !name.ends_with(".hybp")
+                || name.len() != 69
+                || !name[..64].bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(PackageError::Storage(
+                    "invalid package artifact entry".into(),
+                ));
+            }
+            let path = format!("{PACKAGE_ARTIFACT_DIR}/{name}");
+            let bytes = read_all(volume, &path)?;
+            let record = repository.import(&trust, &bytes)?;
+            if name[..64] != hex_digest(record.digest) {
+                return Err(PackageError::Storage(
+                    "package artifact digest/path mismatch".into(),
+                ));
+            }
+        }
+        let registry = PackageRegistry::decode_snapshot(
+            &read_all(volume, PACKAGE_REGISTRY_PATH)?,
+            &repository,
+            &trust,
+        )?;
+        validate_application_trees(volume, &registry)?;
+        Ok((
+            PackageManager {
+                repository,
+                registry,
+            },
+            trust,
+        ))
+    }
+}
+
+fn private_metadata() -> Metadata {
+    Metadata {
+        owner: 0,
+        group: 0,
+        mode: 0o600,
+        ..Metadata::default()
+    }
+}
+
+fn storage_error(error: FsError) -> PackageError {
+    PackageError::Storage(error.to_string())
+}
+
+fn ensure_directory<D: BlockDevice>(
+    volume: &mut Volume<D>,
+    path: &str,
+    mode: u32,
+) -> Result<(), PackageError> {
+    let mut current = String::new();
+    for component in path.split('/').filter(|part| !part.is_empty()) {
+        current.push('/');
+        current.push_str(component);
+        match volume.stat(&current) {
+            Ok(info) if info.kind == ObjectKind::Directory => (),
+            Ok(_) => {
+                return Err(PackageError::Storage(format!(
+                    "{current} is not a directory"
+                )))
+            }
+            Err(FsError::NotFound) => {
+                let _ = volume.create_dir(&current, mode).map_err(storage_error)?;
+            }
+            Err(error) => return Err(storage_error(error)),
+        }
+    }
+    Ok(())
+}
+
+fn read_all<D: BlockDevice>(volume: &Volume<D>, path: &str) -> Result<Vec<u8>, PackageError> {
+    let info = volume.stat(path).map_err(storage_error)?;
+    if info.kind != ObjectKind::File {
+        return Err(PackageError::Storage(format!("{path} is not a file")));
+    }
+    let length = usize::try_from(info.size).map_err(|_| PackageError::ResolutionLimit)?;
+    let mut bytes = vec![0; length];
+    let read = volume
+        .read_file(path, 0, &mut bytes)
+        .map_err(storage_error)?;
+    if read != bytes.len() {
+        return Err(PackageError::Storage(format!("short read from {path}")));
+    }
+    Ok(bytes)
+}
+
+fn replace_or_verify<D: BlockDevice>(
+    volume: &mut Volume<D>,
+    path: &str,
+    bytes: &[u8],
+    metadata: Metadata,
+) -> Result<(), PackageError> {
+    match volume.stat(path) {
+        Ok(info) if info.kind == ObjectKind::File => {
+            if read_all(volume, path)? != bytes {
+                return Err(PackageError::Storage(format!(
+                    "immutable package artifact conflict at {path}"
+                )));
+            }
+            Ok(())
+        }
+        Ok(_) => Err(PackageError::Storage(format!("{path} is not a file"))),
+        Err(FsError::NotFound) => volume
+            .replace_file(path, bytes, metadata)
+            .map_err(storage_error),
+        Err(error) => Err(storage_error(error)),
+    }
+}
+
+fn safe_component(value: &str, kind: &'static str) -> Result<(), PackageError> {
+    if value.is_empty()
+        || value.len() > 128
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return Err(PackageError::Storage(format!(
+            "invalid {kind} storage component"
+        )));
+    }
+    Ok(())
+}
+
+fn app_root(application_id: &str) -> Result<String, PackageError> {
+    safe_component(application_id, "application id")?;
+    Ok(format!("{PACKAGE_APPS_ROOT}/{application_id}"))
+}
+
+fn version_component(version: PackageVersion) -> String {
+    version.to_string()
+}
+
+fn remove_tree<D: BlockDevice>(volume: &mut Volume<D>, root: &str) -> Result<(), PackageError> {
+    let mut stack = vec![(root.to_owned(), false)];
+    let mut visited = 0_usize;
+    while let Some((path, expanded)) = stack.pop() {
+        visited = visited
+            .checked_add(1)
+            .ok_or(PackageError::ResolutionLimit)?;
+        if visited > 16_384 {
+            return Err(PackageError::ResolutionLimit);
+        }
+        let info = volume.stat(&path).map_err(storage_error)?;
+        if info.kind == ObjectKind::File || expanded {
+            volume.unlink(&path).map_err(storage_error)?;
+        } else {
+            stack.push((path.clone(), true));
+            for (name, _) in volume.list(&path).map_err(storage_error)? {
+                stack.push((format!("{path}/{name}"), false));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_application_trees<D: BlockDevice>(
+    volume: &mut Volume<D>,
+    registry: &PackageRegistry,
+) -> Result<(), PackageError> {
+    let mut desired = BTreeMap::<String, (PackageId, Vec<&InstalledPackage>)>::new();
+    for (id, versions) in &registry.installed {
+        for installed in versions {
+            desired
+                .entry(installed.record.application_id.clone())
+                .and_modify(|(_, entries)| entries.push(installed))
+                .or_insert_with(|| (id.clone(), vec![installed]));
+        }
+    }
+    for (application_id, (package_id, versions)) in &desired {
+        let root = app_root(application_id)?;
+        ensure_directory(volume, &root, 0o755)?;
+        let marker = format!("{root}/.hyber-package-owner");
+        let expected_owner = package_id.0.as_bytes();
+        match volume.stat(&marker) {
+            Ok(_) if read_all(volume, &marker)? != expected_owner => {
+                return Err(PackageError::Storage(
+                    "application root has foreign package owner".into(),
+                ))
+            }
+            Ok(_) => (),
+            Err(FsError::NotFound) => volume
+                .replace_file(&marker, expected_owner, private_metadata())
+                .map_err(storage_error)?,
+            Err(error) => return Err(storage_error(error)),
+        }
+        let desired_versions: BTreeSet<_> = versions
+            .iter()
+            .map(|installed| version_component(installed.record.key.version))
+            .collect();
+        for (name, info) in volume.list(&root).map_err(storage_error)? {
+            if name != ".hyber-package-owner"
+                && info.kind == ObjectKind::Directory
+                && !desired_versions.contains(&name)
+            {
+                remove_tree(volume, &format!("{root}/{name}"))?;
+            }
+        }
+        for installed in versions {
+            materialize_package(volume, &root, installed)?;
+        }
+    }
+    // Only roots with our private owner marker are eligible for removal;
+    // unrelated `/apps` content is never adopted or deleted.
+    for (name, info) in volume.list(PACKAGE_APPS_ROOT).map_err(storage_error)? {
+        if info.kind != ObjectKind::Directory || desired.contains_key(&name) {
+            continue;
+        }
+        let root = format!("{PACKAGE_APPS_ROOT}/{name}");
+        let marker = format!("{root}/.hyber-package-owner");
+        if let Ok(owner) = read_all(volume, &marker) {
+            if std::str::from_utf8(&owner).is_ok() {
+                remove_tree(volume, &root)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn materialize_package<D: BlockDevice>(
+    volume: &mut Volume<D>,
+    root: &str,
+    installed: &InstalledPackage,
+) -> Result<(), PackageError> {
+    let artifact = SignedPackage::decode(&installed.record.artifact)?;
+    let version = version_component(installed.record.key.version);
+    let destination = format!("{root}/{version}");
+    if volume.stat(&destination).is_ok() {
+        remove_tree(volume, &destination)?;
+    }
+    ensure_directory(volume, &destination, 0o755)?;
+    for file in artifact.input.files {
+        let mut target = destination.clone();
+        let mut components = file.path.split('/').peekable();
+        while let Some(component) = components.next() {
+            safe_component(component, "package file path")?;
+            target.push('/');
+            target.push_str(component);
+            if components.peek().is_some() {
+                ensure_directory(volume, &target, 0o755)?;
+            }
+        }
+        volume
+            .replace_file(
+                &target,
+                &file.bytes,
+                Metadata {
+                    owner: 0,
+                    group: 0,
+                    mode: 0o644,
+                    ..Metadata::default()
+                },
+            )
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+fn validate_application_trees<D: BlockDevice>(
+    volume: &Volume<D>,
+    registry: &PackageRegistry,
+) -> Result<(), PackageError> {
+    for versions in registry.installed.values() {
+        for installed in versions {
+            let root = app_root(&installed.record.application_id)?;
+            let marker = format!("{root}/.hyber-package-owner");
+            if read_all(volume, &marker)? != installed.record.key.id.0.as_bytes() {
+                return Err(PackageError::Storage(
+                    "installed application owner marker mismatch".into(),
+                ));
+            }
+            let base = format!("{root}/{}", version_component(installed.record.key.version));
+            let artifact = SignedPackage::decode(&installed.record.artifact)?;
+            for file in artifact.input.files {
+                let contents = read_all(volume, &format!("{base}/{}", file.path))?;
+                if contents != file.bytes {
+                    return Err(PackageError::Storage(
+                        "installed package file checksum mismatch".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build a deterministic signed artifact from a staging tree. This is the only
@@ -1179,6 +1695,9 @@ impl<'a> RegistryReader<'a> {
             self.take(4)?.try_into().expect("fixed-size slice"),
         ))
     }
+    fn byte(&mut self) -> Result<u8, PackageError> {
+        Ok(self.take(1)?[0])
+    }
     fn u64(&mut self) -> Result<u64, PackageError> {
         Ok(u64::from_le_bytes(
             self.take(8)?.try_into().expect("fixed-size slice"),
@@ -1219,6 +1738,7 @@ impl<'a> RegistryReader<'a> {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use hyber_fs::{MemDevice, Volume};
     use hyber_package_format::{PackageFile, PackageInput, PackageMetadata};
 
     fn manifest(app: &str, version: &str) -> String {
@@ -1406,6 +1926,77 @@ mod tests {
         let mut corrupt = snapshot;
         *corrupt.last_mut().unwrap() ^= 1;
         assert!(PackageRegistry::decode_snapshot(&corrupt, &manager.repository, &trust).is_err());
+    }
+
+    #[test]
+    fn hyberfs_store_persists_trust_registry_and_immutable_app_tree() {
+        let key = SigningKey::from_bytes(&[12; 32]);
+        let trust = trust(&key);
+        let mut manager = PackageManager::default();
+        manager
+            .repository
+            .import(&trust, &artifact("editor", "1.0.0", vec![], &key))
+            .unwrap();
+        manager
+            .install(
+                &SecurityContext::root(),
+                &trust,
+                &GrantPolicy::deny_all(),
+                &[Dependency {
+                    package: PackageId("editor".into()),
+                    requirement: VersionRequirement::Exact(PackageVersion::parse("1.0.0").unwrap()),
+                }],
+            )
+            .unwrap();
+        let store = HyberFsPackageStore;
+        let mut volume = Volume::format(MemDevice::new(256).unwrap()).unwrap();
+        store.save(&mut volume, &manager, &trust).unwrap();
+        assert_eq!(
+            read_all(&volume, "/apps/editor/1.0.0/main.lua").unwrap(),
+            b"return true"
+        );
+        let device = volume.unmount().unwrap();
+        let volume = Volume::mount(device).unwrap();
+        let (loaded, loaded_trust) = store.load(&volume).unwrap();
+        assert!(loaded
+            .registry
+            .active(&PackageId("editor".into()))
+            .is_some());
+        assert!(loaded_trust
+            .verify(&SignedPackage::decode(&artifact("editor", "1.0.0", vec![], &key)).unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    fn trust_snapshot_and_installed_tree_damage_fail_closed() {
+        let key = SigningKey::from_bytes(&[13; 32]);
+        let trust = trust(&key);
+        let mut manager = PackageManager::default();
+        manager
+            .repository
+            .import(&trust, &artifact("editor", "1.0.0", vec![], &key))
+            .unwrap();
+        manager
+            .install(
+                &SecurityContext::root(),
+                &trust,
+                &GrantPolicy::deny_all(),
+                &[Dependency {
+                    package: PackageId("editor".into()),
+                    requirement: VersionRequirement::Exact(PackageVersion::parse("1.0.0").unwrap()),
+                }],
+            )
+            .unwrap();
+        let store = HyberFsPackageStore;
+        let mut volume = Volume::format(MemDevice::new(256).unwrap()).unwrap();
+        store.save(&mut volume, &manager, &trust).unwrap();
+        volume
+            .write_file("/apps/editor/1.0.0/main.lua", 0, b"X")
+            .unwrap();
+        assert!(store.load(&volume).is_err());
+        let mut bytes = trust.encode_snapshot().unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        assert!(TrustStore::decode_snapshot(&bytes).is_err());
     }
 
     #[test]

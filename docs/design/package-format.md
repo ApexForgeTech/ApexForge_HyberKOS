@@ -89,3 +89,24 @@ capability set, installer Hyber user ID, and ordered activation history; it
 does not contain private keys. On reload it resolves every record back through
 the repository and verifies each active artifact under the current trust
 policy. A revoked/disabled key therefore cannot remain active after reload.
+
+## Hosted transaction store
+
+`HyberFsPackageStore` persists Phase 17 authority state in the same Phase
+15/16 HyberFS volume as the authenticated account store:
+
+```text
+/packages/.state/trust                 checksummed public-key policy
+/packages/.state/registry              activation/grant registry
+/packages/.state/artifacts/<sha256>.hybp
+/apps/<application-id>/.hyber-package-owner
+/apps/<application-id>/<version>/...   immutable materialized payload
+```
+
+It prepares artifacts, package trees, trust state, and registry state before a
+single volume `sync()`. On reopen it verifies the trust checksum, artifact
+names/digests/signatures, active grants, owner marker, and installed files.
+Damage or a revoked key fails closed. Mutating `hyber-pkg` commands first
+require a Special_2 interactive session with `CAP_SYS_ADMIN`. The current CLI
+uses an explicit deny-all capability policy; packages requesting capabilities
+are rejected rather than silently receiving authority.

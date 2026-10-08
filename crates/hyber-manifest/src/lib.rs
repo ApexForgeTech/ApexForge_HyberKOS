@@ -289,9 +289,10 @@ impl GrantPolicy {
                 "requested resource quota exceeds policy".into(),
             ));
         }
+        let granted_capabilities = manifest.requested_capabilities.clone();
         Ok(ApplicationGrant {
             manifest,
-            granted_capabilities: self.capabilities.clone(),
+            granted_capabilities,
         })
     }
 }
@@ -642,6 +643,23 @@ mod tests {
         m.requested_capabilities
             .insert(CapabilityName("process.spawn".into()));
         assert!(GrantPolicy::deny_all().approve(m).is_err());
+    }
+    #[test]
+    fn policy_allowlist_does_not_grant_unrequested_capabilities() {
+        let mut policy = GrantPolicy::deny_all();
+        policy
+            .capabilities
+            .insert(CapabilityName("service.background".into()));
+        policy
+            .capabilities
+            .insert(CapabilityName("process.spawn".into()));
+        let grant = policy.approve(manifest()).unwrap();
+        assert!(grant.granted_capability_set().is_empty());
+        assert!(ApplicationGrant::from_approved_capabilities(
+            grant.manifest.clone(),
+            grant.granted_capability_set()
+        )
+        .is_ok());
     }
     #[test]
     fn rejects_capabilities_without_their_declared_policy() {

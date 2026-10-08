@@ -75,6 +75,7 @@
 //! | `hyber.input.pending()` | number of queued events |
 //! | `hyber.input.emit(kind, code, value)` | inject a synthetic event; capability checked |
 //! | `hyber.input.clear()` | discard queued events |
+//!
 
 use hyber_core::{MetadataValue, Path, ProcessId, Rights, SecurityContext, SecurityManager};
 use hyber_handle::HandleManager;

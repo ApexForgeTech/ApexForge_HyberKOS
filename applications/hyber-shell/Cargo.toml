@@ -17,6 +17,7 @@ hyber-hostfs = { path = "../../backends/linux/hyber-hostfs" }
 hyber-process = { path = "../../crates/hyber-process" }
 hyber-device = { path = "../../crates/hyber-device" }
 hyber-service = { path = "../../crates/hyber-service" }
+hyber-service-host = { path = "../../backends/linux/hyber-service-host" }
 hyber-memfs = { path = "../../crates/hyber-memfs" }
 hyber-lua = { path = "../../crates/hyber-lua" }
 hyber-layout = { path = "../../crates/hyber-layout" }

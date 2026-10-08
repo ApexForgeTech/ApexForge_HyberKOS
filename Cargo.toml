@@ -21,5 +21,7 @@ members = [
     "crates/hyber-package-format",
     "crates/hyber-package",
     "applications/hyber-pkg",
+    "backends/linux/hyber-service-host",
+    "applications/hyber-serviced",
 ]
 resolver = "2"

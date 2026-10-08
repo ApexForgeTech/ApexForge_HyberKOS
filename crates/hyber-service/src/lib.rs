@@ -13,6 +13,10 @@ use hyber_vfs::Provider;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+pub mod definition;
+pub mod projection;
+pub mod supervisor;
+
 #[cfg(test)]
 mod session_tests;
 
@@ -232,6 +236,12 @@ impl ServiceProvider {
 }
 
 impl Provider for ServiceProvider {
+    fn check_open(&self, _: ObjectId, rights: hyber_core::Rights) -> Result<(), String> {
+        projection::check_projection_rights(rights)
+    }
+    fn persist_metadata(&mut self, _: &hyber_object::Object) -> Result<(), String> {
+        Err("service projection metadata is authority-owned".into())
+    }
     fn create(
         &mut self,
         _obj_mgr: &mut ObjectManager,

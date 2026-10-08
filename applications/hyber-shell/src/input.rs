@@ -204,7 +204,11 @@ impl Controller {
             || parse(line).is_ok_and(|commands| {
                 commands
                     .iter()
-                    .any(|cmd| matches!(cmd[0].as_str(), "alias" | "env" | "lua" | "history"))
+                    // `history` itself is not secret input.  Keeping it here
+                    // made `history` mysteriously absent from its own output
+                    // and from persistent history.  Commands that can embed
+                    // credentials or arbitrary source remain excluded.
+                    .any(|cmd| matches!(cmd[0].as_str(), "alias" | "env" | "lua"))
             })
     }
     pub fn remember(&mut self, line: &str) {
@@ -409,5 +413,15 @@ mod tests {
         assert_eq!(restored.history().len(), 99);
         restored.dispatch(Event::ClearHistory).unwrap();
         assert_eq!(restored.encode().unwrap(), "[]");
+    }
+
+    #[test]
+    fn history_commands_are_recorded_but_sensitive_input_is_not() {
+        let mut controller = Controller::default();
+        controller.remember("history");
+        controller.remember("history search mkdir");
+        controller.remember("lua print('safe-looking but arbitrary source')");
+        controller.remember("env API_TOKEN secret-value");
+        assert_eq!(controller.history(), ["history", "history search mkdir"]);
     }
 }

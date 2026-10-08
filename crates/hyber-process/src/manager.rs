@@ -265,14 +265,22 @@ impl ProcessManager {
         obj_mgr: &mut ObjectManager,
         process_id: ProcessId,
     ) -> Result<ThreadId, String> {
-        if !self.processes.contains_key(&process_id) {
-            return Err("Process not found".to_string());
+        let process = self.processes.get(&process_id).ok_or("Process not found")?;
+        if !matches!(process.state, ProcessState::Created | ProcessState::Running) {
+            return Err("Cannot create a thread in a terminated process".into());
         }
+        let owner = process.security_context.user_id;
+        let group = process.security_context.group_id;
 
         let tid = ThreadId(self.next_tid);
-        self.next_tid += 1;
+        self.next_tid = self.next_tid.checked_add(1).ok_or("Thread identifier space exhausted")?;
 
         let obj_id = obj_mgr.create_object(ObjectType::Thread);
+        if let Some(object) = obj_mgr.lookup_mut(obj_id) {
+            object.owner = owner;
+            object.group = group;
+            object.permissions = 0o400;
+        }
         let thread = Thread {
             id: tid,
             process_id,
@@ -363,6 +371,42 @@ impl ProcessManager {
         }
     }
 
+    /// Reap an isolated hosted child after its backend has acknowledged exit.
+    /// Shared pipes and externally retained objects require their own cleanup
+    /// owner and are deliberately refused by this narrow operation.
+    pub fn reap_isolated_process(
+        &mut self,
+        objects: &mut ObjectManager,
+        id: ProcessId,
+    ) -> Result<(), String> {
+        let process = self.processes.get(&id).ok_or("Process not found")?;
+        if process.state != ProcessState::Zombie
+            || process.stdin_pipe.is_some()
+            || process.stdout_pipe.is_some()
+        {
+            return Err("Process cannot be reaped".into());
+        }
+        let mut object_ids = vec![process.object_id];
+        for tid in &process.threads {
+            object_ids.push(self.threads.get(tid).ok_or("Thread missing")?.object_id);
+        }
+        if object_ids
+            .iter()
+            .any(|object| objects.lookup(*object).is_none_or(|o| o.references != 1))
+        {
+            return Err("Process objects are still referenced".into());
+        }
+        let process = self.processes.remove(&id).unwrap();
+        for tid in process.threads {
+            self.threads.remove(&tid);
+        }
+        for object in object_ids {
+            objects.release(object);
+            objects.destroy(object);
+        }
+        Ok(())
+    }
+
     // ── 11.5 — Process Operations: signal ────────────────────────────────────
 
     pub fn signal_process(&mut self, id: ProcessId, _signal: u32) -> Result<(), String> {
@@ -395,6 +439,30 @@ mod tests {
     use hyber_core::{ObjectType, SecurityContext};
     use hyber_handle::{HandleFlags, HandleManager};
     use hyber_object::ObjectManager;
+
+    #[test]
+    fn isolated_reaping_requires_exit_and_exclusive_ownership() {
+        let mut objects = ObjectManager::new();
+        let mut manager = ProcessManager::new();
+        let pid = manager
+            .create_process(&mut objects, None, SecurityContext::root(), None)
+            .unwrap();
+        let object = manager.get_process(pid).unwrap().object_id;
+        assert!(manager.reap_isolated_process(&mut objects, pid).is_err());
+        manager.start_process(pid).unwrap();
+        manager.stop_process(pid, 0).unwrap();
+        objects.retain(object);
+        assert!(manager.reap_isolated_process(&mut objects, pid).is_err());
+        assert!(manager.get_process(pid).is_some());
+        objects.release(object);
+        manager.reap_isolated_process(&mut objects, pid).unwrap();
+        assert!(manager.get_process(pid).is_none());
+        assert!(objects.lookup(object).is_none());
+        let next = manager
+            .create_process(&mut objects, None, SecurityContext::root(), None)
+            .unwrap();
+        assert_ne!(next, pid);
+    }
 
     #[test]
     fn pipe_connects_two_processes() {

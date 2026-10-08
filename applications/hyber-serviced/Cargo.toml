@@ -1,0 +1,22 @@
+[package]
+name = "hyber-serviced"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyber-service = { path = "../../crates/hyber-service" }
+hyber-service-host = { path = "../../backends/linux/hyber-service-host" }
+hyber-service-contract = { path = "../../crates/hyber-service-contract" }
+hyber-auth = { path = "../../crates/hyber-auth" }
+hyber-core = { path = "../../crates/hyber-core" }
+hyber-fs = { path = "../../crates/hyber-fs" }
+hyber-package = { path = "../../crates/hyber-package" }
+hyber-package-format = { path = "../../crates/hyber-package-format" }
+hyber-manifest = { path = "../../crates/hyber-manifest" }
+serde_json = "1"
+mlua = { version = "0.9", features = ["lua54", "vendored"] }
+libc = "0.2"
+
+[dev-dependencies]
+hyber-identity = { path = "../../crates/hyber-identity" }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }

@@ -3826,27 +3826,31 @@ Service Object
 
 Instead of static TOML/INI files, use Lua scripts to define and control services dynamically.
 
-Example (`/services/network.lua`):
+Example declaration (`/config/services/network.lua`; `/services` is the
+read-only runtime projection, not a writable configuration directory):
 
 ```lua
 return {
-    name = "network",
+    format_version = 1,
+    service_id = "network",
+    application_id = "network",
     startup = "automatic",
+    restart = "on-failure",
+    health_check = "ipc-readiness",
     dependencies = {"dns"},
-    start = function()
-        hyber.log.info("Starting network interface...")
-        -- setup logic
-    end,
-    stop = function()
-        hyber.log.info("Shutting down network...")
-    end
+    entrypoint = "main.lua",
+    requested_capabilities = {"service.background"},
+    ipc_endpoints = {"network"},
+    max_message_bytes = 4096,
 }
 ```
 
-The Lua file describes policy and callbacks; the Rust service manager validates
-the schema, creates the process, applies capabilities, and invokes lifecycle
-actions. A Go service is launched as an ordinary supervised application and
-cannot bypass the same manifest or capability checks.
+The Lua file returns data, not privileged lifecycle callbacks. The restricted
+loader rejects unknown fields, functions in data fields, invalid types, sparse
+arrays and duplicates. It has source, memory and instruction limits and no host
+I/O or module loader. Identity comes from the authenticated Rust account policy;
+the package grant is checked separately. A Go service must be launched as an
+ordinary supervised application under the same grant and identity checks.
 
 ---
 
@@ -3905,6 +3909,147 @@ capabilities are least-privilege and auditable
 GUI close does not implicitly terminate a service
 service communication uses Hyber IPC primitives
 ```
+
+## 19.7 — Supervisor Boundary and State Machine
+
+`hyber-service-contract` remains a pure schema/validation crate. Create the
+stateful Rust supervisor in `crates/hyber-service`; it consumes an already
+validated `ServiceCatalog`, an `ApplicationGrant`, a service `SecurityContext`,
+and an abstract payload runner. It must not parse arbitrary Lua tables during
+start, and Lua callbacks must never obtain supervisor internals.
+
+Use explicit states:
+
+```text
+Registered → WaitingDependencies → Starting → Running → Stopping → Stopped
+                                      │             │
+                                      ▼             ▼
+                                   Failed ← Backoff / restart decision
+                                      │
+                                      ▼
+                                   Disabled
+```
+
+Only legal transitions are accepted. Start is idempotent only for `Running`
+with a valid session. Stop cancels pending starts/retries when there is no
+process; repeated stop while `Stopping` does not resend a runner request.
+`Disabled` requires explicit administrative enable. A failed start creates no
+running process or ready endpoint.
+
+## 19.8 — Payload Runner and Process Ownership
+
+Define a Rust `ServiceRunner` trait rather than exposing Linux process APIs:
+
+```text
+start(definition, attenuated-context, application-grant, service-session) → ProcessId
+request_stop(service-id, process-id)
+poll(service-id, process-id) → Running | Ready | Exited(code), or typed failure
+```
+
+Test runners may model lifecycle through Hyber `ProcessManager`, but such a
+model is not proof of Lua/Go payload execution and does not complete Phase 18.
+Linux PID values never enter definitions, status, or public APIs. A production
+runner must actually execute the approved payload under its grant, enforce
+resource/cancellation policy, and report authoritative exit/reap. Process IDs
+must not be reused while events can still refer to a previous instance. A
+failed start must leave no live process. A failed poll means outcome unknown,
+not exited; a successful stop request is not an exit acknowledgement.
+
+## 19.9 — Sessions, Capabilities, and Authorization
+
+Administrative operations (`register`, `start`, `stop`, `restart`, `enable`,
+`disable`, and policy changes) require `CAP_SYS_ADMIN`. A running service uses
+its own `SessionGuard` of kind `Service`; its context is revalidated on every
+dispatch. Service sessions are revoked when the service stops or fails, but are
+independent from interactive caller logout. Requested capabilities must be a
+subset of the package `ApplicationGrant`; dependencies never transfer rights.
+
+## 19.10 — Dependencies, Readiness, and IPC Reservation
+
+Topological start order is deterministic. A dependency must be `Running` and
+ready before its dependent starts. `HealthCheck::None` is ready on successful
+runner start; `IpcReadiness` requires an explicit supervisor readiness signal.
+Until Phase 19 provides channels/RPC, endpoint names are reserved and checked
+for uniqueness but no fake IPC implementation is claimed. Stop occurs in
+reverse dependency order unless an administrative forced-stop policy is added.
+
+## 19.11 — Failure, Restart, and Backoff
+
+Use a monotonic supervisor clock and bounded restart budget. `OnFailure` may
+restart only abnormal exits; `Never` remains failed. Restart attempts use a
+deterministic bounded exponential backoff and transition to `Failed` after the
+budget is exhausted. Manual stop suppresses restart. Diagnostics record the
+last bounded error, exit code, attempt count, and next eligible restart time;
+they contain no tokens, passwords, or host paths.
+
+## 19.12 — Observability and Provider Semantics
+
+`/services/<id>` is a read-only projection of supervisor state. It reports
+service ID, application ID, state, process ID, readiness, restart count,
+dependency state, and bounded diagnostic. Enumeration and status order are
+deterministic. Provider reads must revalidate a running service session before
+revealing protected status. Mutating lifecycle operations stay on the typed
+supervisor API, not VFS writes.
+
+## 19.13 — Tests and Acceptance
+
+Test legal/illegal transitions, atomic batch registration, graph order/cycles,
+authorization, service-session revocation, dependency readiness, runner start
+failure rollback, manual stop suppression, restart backoff/budget exhaustion,
+provider projection, and independence from caller/GUI logout. Use a fake
+clock and fake runner for deterministic tests; no test depends on host process
+or socket behavior. Add real hosted payload integration tests separately;
+fake-runner tests alone cannot establish Phase 18 completion. Real channels/RPC
+remain Phase 19, but actual supervised payload execution belongs to Phase 18.
+
+### Current implementation and hosted acceptance
+
+The Rust supervisor now has independent, revalidated service sessions,
+attenuated launch contexts and explicit application grants, atomic batch
+registration, endpoint collision checks, bounded graph validation, dependency
+readiness, process-bound events, asynchronous stop acknowledgement, deterministic
+backoff/retry budgets, readiness/shutdown deadlines, and a polling control loop.
+The authenticated authority adapter issues independent service guards while
+preserving hosted credential-store freshness checks. Forced termination remains
+a runner request: an unknown process outcome is never reported as an exit.
+A restricted Lua declaration
+loader and a read-only supervisor VFS projection are implemented and tested.
+The older bootstrap `ServiceManager` remains separate; its shell placeholders
+are not supervised payloads.
+
+The hosted implementation now includes `hyber-service-host` and
+`hyber-serviced`: signed installed-package activation, actual isolated Lua/Go
+process execution, readiness/log/stop transport, cancellation, exit observation,
+reaping, authenticated operator commands, and shell attachment through
+`--service-socket`. Attached `/services/<id>` entries are live read-only daemon
+projections. `svc status/start/stop/restart/enable/disable/logs/shutdown` operates
+on the independent supervisor; shell exit does not terminate its services.
+`hyber-pkg install-service/update-service` explicitly approves only requested
+`service.background` capabilities, never the entire policy allowlist.
+
+The Phase 18 **hosted lifecycle implementation** has real Lua/Go integration
+coverage in addition to deterministic supervisor tests. The tests exercise
+readiness, normal and forced stop, memory/frame limits, session revocation,
+denial of host file/socket/child-process access, signed-package activation,
+non-administrator rejection, client independence, restart with fresh process
+identity, disable/enable, and shutdown. The opt-in cross-binary PTY test also
+attaches a real shell and verifies that exiting it leaves the service running.
+
+This completion boundary is deliberately explicit: Linux x86-64 requires
+bubblewrap, user namespaces and seccomp; absent isolation fails closed. Memory
+and descriptor ceilings are enforced, while CPU shares are relative priority
+(plus Lua instruction throttling), not hard CPU bandwidth. Go concurrency is
+cooperative. Hosted workers currently expose lifecycle/log APIs, not filesystem
+or network APIs: writable storage is denied. Full inter-service channels/RPC
+remain Phase 19 and networking remains Phase 20. The package image is pinned
+read-only for daemon lifetime; enable/disable overrides are session-local.
+Authority expiry or changed credentials stops the daemon's payloads rather
+than silently extending authority. Native boot persistence belongs to Phase 28.
+
+See `docs/design/service-manager.md` for the runnable Lua/Go examples,
+authentication and activation workflow, limits, private protocol, and exact
+verification commands. Hosted completion is not production security certification
+or a claim that the future public application ABI has been implemented.
 
 ---
 

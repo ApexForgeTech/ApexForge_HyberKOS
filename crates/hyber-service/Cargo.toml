@@ -9,6 +9,10 @@ hyber-core = { path = "../../crates/hyber-core" }
 hyber-object = { path = "../../crates/hyber-object" }
 hyber-namespace = { path = "../../crates/hyber-namespace" }
 hyber-vfs = { path = "../../crates/hyber-vfs" }
+hyber-service-contract = { path = "../hyber-service-contract" }
+hyber-identity = { path = "../hyber-identity" }
+hyber-manifest = { path = "../hyber-manifest" }
+mlua = { version = "0.9", features = ["lua54", "vendored"] }
 
 [dev-dependencies]
 hyber-identity = { path = "../hyber-identity" }

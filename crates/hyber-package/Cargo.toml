@@ -7,6 +7,7 @@ description = "Phase 17 trusted local package repository, resolver, and registry
 [dependencies]
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 hyber-core = { path = "../hyber-core" }
+hyber-fs = { path = "../hyber-fs" }
 hyber-manifest = { path = "../hyber-manifest" }
 hyber-package-format = { path = "../hyber-package-format" }
 sha2 = "0.10"

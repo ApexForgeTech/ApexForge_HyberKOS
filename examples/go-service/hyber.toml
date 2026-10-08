@@ -1,0 +1,15 @@
+format_version = 1
+app_id = "go-worker"
+version = "1.0.0"
+publisher = "example"
+display_name = "Go lifecycle and isolation example"
+entrypoint = "main"
+runtime = "go"
+execution = "service"
+requested_capabilities = ["service.background"]
+
+[resources]
+memory_bytes = 2147483648
+cpu_shares = 8
+handles = 64
+storage_bytes = 1024
