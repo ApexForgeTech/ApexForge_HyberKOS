@@ -2,6 +2,37 @@
 
 > **A modular, object-centric operating system architecture built from the ground up.**
 
+> **Current hosted storage and security status (2026-10-08):** HyberKOS is an
+> experimental development platform, not a production security guarantee. The
+> hosted HyberFS format/recovery contract is documented in
+> [the HyberFS specification](docs/filesystem/hyberfs-spec.md); identity,
+> sessions, and credential-boundary limitations are documented in
+> [the identity/session design](docs/security/identity-sessions.md). Historical
+> roadmap phase labels describe implementation scope, not a security
+> certification.
+
+<p align="center">
+  <img src="assets/logo.png" alt="HyberKOS owl logo" width="300" />
+</p>
+
+```text
+██╗  ██╗██╗   ██╗██████╗ ███████╗██████╗ ██╗  ██╗ ██████╗ ███████╗
+██║  ██║╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██║ ██╔╝██╔═══██╗██╔════╝
+███████║ ╚████╔╝ ██████╔╝█████╗  ██████╔╝█████╔╝ ██║   ██║███████╗
+██╔══██║  ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗██╔═██╗ ██║   ██║╚════██║
+██║  ██║   ██║   ██████╔╝███████╗██║  ██║██║  ██╗╚██████╔╝███████║
+╚═╝  ╚═╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝
+
+Object-Centric · Handle-Based · Provider-Oriented · Experimental OS Platform
+```
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Implementation-Rust-B7410E?style=for-the-badge" alt="Rust implementation" />
+  <img src="https://img.shields.io/badge/Architecture-Objects%20%7C%20Handles%20%7C%20VFS-0B5FFF?style=for-the-badge" alt="Object handle VFS architecture" />
+  <img src="https://img.shields.io/badge/Storage-HyberFS%20hosted%20prototype-00A8A8?style=for-the-badge" alt="HyberFS hosted prototype" />
+  <img src="https://img.shields.io/badge/Status-Experimental%20hosted%20development-5D3FD3?style=for-the-badge" alt="Experimental hosted development status" />
+</p>
+
 HyberKOS is an experimental operating system project focused on designing a clean, modular, extensible, and platform-independent system architecture.
 
 Rather than treating an operating system as only a kernel, filesystem, and collection of system utilities, HyberKOS explores a unified model where system resources are represented as **Objects**, exposed through **Nodes** and **Namespaces**, accessed through **Handles**, and implemented through interchangeable **Providers**.

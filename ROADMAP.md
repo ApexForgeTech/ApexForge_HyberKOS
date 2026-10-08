@@ -4053,74 +4053,257 @@ or a claim that the future public application ABI has been implemented.
 
 ---
 
-# 20. Phase 19 — IPC
+# 20. Phase 19 — Object-Capability IPC
 
 ## Objective
 
-Build real communication between Hyber processes.
+Build the first complete hosted Hyber IPC subsystem. IPC is an Object/Handle
+subsystem, never a disguised Linux FD, PID, Unix socket, host path, or global
+mutable queue. It connects Hyber Processes through explicit endpoint handles
+and uses the same ownership, metadata, security-context, reference-count, and
+rights model as the rest of HyberKOS.
 
----
-
-# 20.1 — Pipes
-
-Implement first.
-
-```text
-Pipe Object
-```
-
----
-
-# 20.2 — Channels
-
-Implement:
+The Phase 18 hosted-service worker's private supervisor pipes remain an adapter
+implementation detail. Phase 19 provides the public Rust/Lua-facing IPC model
+that services, applications, and the later GUI/network layers consume. The
+native kernel transport and native shared-memory mapping remain later phases.
 
 ```text
-Channel Object
+Process A                    Process B
+   │ Handle(read/write)         │ Handle(read/write)
+   ▼                            ▼
+Pipe / Channel Object ── bounded queues ── ObjectManager
 ```
 
-for structured messages.
-
----
-
-# 20.3 — Shared Memory
-
-Implement later:
+## Boundaries and language roles
 
 ```text
-SharedMemory Object
+Rust → IPC objects, queues, handles, rights, lifecycle, RPC, validation
+Lua  → capability-checked user-space use of pipe/channel/RPC endpoints
+Go   → ordinary IPC client/service payload through a future adapter; no host socket
 ```
 
----
+Rust remains the authority. Lua declarations/scripts and Go payloads cannot
+manufacture a `ProcessId`, `ObjectId`, `HandleId`, endpoint, sender identity,
+reply correlation ID, or permission. Phase 19 must not define a stable C ABI;
+that remains deferred Phase 13.
 
-# 20.4 — RPC
+## 20.1 — IPC Manager and Object Lifecycle
 
-Build a basic request/response layer.
+Create `crates/hyber-ipc`. It owns volatile queues and endpoint state while
+`ObjectManager` owns persistent-in-memory Object identity/lifetime and
+`HandleManager` owns process-local access. Its public APIs accept Hyber IDs and
+contexts only; `std::os`, host descriptors, host process IDs and host paths are
+forbidden from the public API.
 
-Example:
+The manager must create first-class `PIPE` and `CHANNEL` Objects with:
 
 ```text
-Application
- ↓
-RPC
- ↓
-Service
+owner / group / mode        → ordinary Hyber metadata
+created / modified time     → metadata updates on successful send/receive
+object reference count      → lifetime while endpoint handles exist
+queue byte/message limits   → bounded memory and back-pressure result
+endpoint open/closed state  → explicit EOF / peer-closed behavior
 ```
 
----
+Object IDs and Handle IDs are never reused. Closing an endpoint releases the
+handle's strong reference exactly once. A destroyed object rejects every later
+operation; invalid, cross-process, stale, wrong-kind, wrong-side, or
+insufficient-right handle use fails before queue mutation. An IPC manager must
+not silently retain queues after all endpoints close. Process termination must
+explicitly close/release its IPC handles before reaping; no orphan object may
+keep a process alive.
 
-# 20.5 — Phase 19 Exit Criteria
+IPC Objects are volatile in Phase 19. They are not VFS files, are not mounted
+in a global discoverable namespace, do not persist through remount/reboot, and
+may not receive arbitrary extended metadata mutation through an untrusted VFS
+path. Endpoint discovery is explicit service/application policy, introduced
+through controlled registration rather than a public writable `/runtime/sockets`
+directory.
 
-Two Hyber processes can:
+## 20.2 — Rights, Identity, and Handle Semantics
+
+Opening/duplicating an endpoint first evaluates ordinary Object owner/group/
+other metadata, then provider/IPC kind rules, then requested handle rights.
+The only Phase 19 endpoint rights are:
 
 ```text
-communicate
-send data
-receive data
-request service operations
+READ       receive bytes/messages/responses
+WRITE      send bytes/messages/requests/responses
+WAIT       wait/poll readiness when the caller has CAP_OBJECT_WAIT
+SIGNAL     close/cancel only when the caller has CAP_OBJECT_SIGNAL
 ```
 
-without direct Linux-specific communication.
+`CONNECT`, `DELETE`, `RENAME`, and `EXECUTE` do not grant IPC operations.
+Creating an endpoint requires the caller to own the new Object or be an
+authorized trusted manager. Opening a peer endpoint requires explicit Object
+metadata access; IPC never turns a service dependency into authority.
+
+Handle rights may only be attenuated. A process may not upgrade a read handle
+to write, send on a receive-only endpoint, receive on a write-only endpoint,
+or use another process's `HandleId`. Current metadata is rechecked at every
+send/receive, just like secure VFS I/O, so chmod/chown/session changes revoke
+future use even if a handle was opened earlier.
+
+Phase 19 does not yet provide unrestricted capability passing. The optional
+attachment API may duplicate an existing handle only after verifying: source
+handle ownership, requested-right attenuation, live Object state, receiver's
+current metadata authorization, bounded attachment count, and exact provider
+identity. Raw numeric handle IDs never cross a message. A later true
+delegation-capability design requires an explicit security-format revision.
+
+## 20.3 — Pipes
+
+Replace the Phase 10 unbounded stdin/stdout buffer with a Phase 19 bounded
+unidirectional Pipe Object. Creating a pipe returns distinct reader and writer
+handles (normally to different processes). Pipe operations define:
+
+```text
+write(handle, bytes) → written | WOULD_BLOCK | PEER_CLOSED | DENIED
+read(handle, limit)  → bytes | empty | EOF | DENIED
+close(handle)        → releases exactly one endpoint
+```
+
+Writes are atomic only up to a documented small frame limit. Larger writes are
+rejected rather than partly enqueued. Queue capacity, per-write maximum, and
+per-process endpoint maximum are finite checked constants. Empty reads do not
+busy-wait. Reader EOF is visible only after every writer endpoint is closed;
+writer failure after readers close is `PEER_CLOSED`. A pipe has no implicit
+broadcast, no host blocking call, and no hidden background thread.
+
+The legacy `ProcessManager::create_pipe/write_stdout/read_stdin` helpers must
+either delegate to `hyber-ipc` or be marked bootstrap-only and never be exposed
+as the Phase 19 API. Their unbounded buffer must not be presented as completed
+IPC.
+
+## 20.4 — Channels and Structured Messages
+
+A Channel Object is bidirectional: creation returns endpoint A and endpoint B.
+Each endpoint owns an inbound bounded FIFO; messages sent by A arrive only at
+B and vice versa. Channel queue ordering is FIFO per sender/receiver pair;
+there is no global ordering promise across channels.
+
+Use a versioned internal message record, not ad-hoc serialized host structures:
+
+```text
+version             u16
+kind                DATA | RPC_REQUEST | RPC_RESPONSE | CANCEL
+request_id          non-zero only for RPC/CANCEL
+payload             bounded opaque bytes
+attachments         bounded validated handle-duplication descriptors
+```
+
+The record validates length, kind, correlation rules, duplicate attachment
+identities, queue capacity, arithmetic overflow, and unknown mandatory version.
+Malformed messages are rejected without changing queue state. Sender identity
+is derived from the endpoint/process at send time and retained only as a Hyber
+`ProcessId` for diagnostics; it is never a Linux PID. Phase 19 messages are
+in-memory and opaque to the filesystem.
+
+Closing an endpoint makes its peer observe `PEER_CLOSED` only after queued
+messages drain. Endpoint closure does not destroy a channel while a live peer
+or handle reference remains. Service restart invalidates old endpoints and
+correlation state; stale response/cancel IDs must never apply to a new service
+instance.
+
+## 20.5 — RPC Layer
+
+Implement a small asynchronous request/response layer over a Channel. RPC is
+not a networking protocol, does not parse host URLs, and does not execute an
+arbitrary service command merely because a string says so.
+
+```text
+client request() → RequestId
+server receive_request() → request with sender context
+server respond(request_id, payload)
+client receive_response(request_id) → payload | pending | cancelled | closed
+client cancel(request_id)
+```
+
+Request IDs are monotonic per client endpoint, non-zero, bounded in-flight,
+and cannot be chosen by untrusted Lua/Go input. Responses must match a pending
+request on the opposite endpoint. Duplicate/unknown responses, request-ID
+overflow, wrong-side response, response after cancellation, and reply queue
+overflow fail without consuming unrelated work. Cancellation is advisory and
+idempotent; it does not kill the server process. Timeouts are caller policy,
+not a scheduler or busy loop inside IPC.
+
+Services expose RPC only through a supervisor-owned endpoint registration. The
+supervisor verifies the service is Running, ready, has a valid independent
+service session, and declares the endpoint before publishing it. On stop,
+restart, session revocation, or failed readiness it closes/unpublishes the
+endpoint before process reaping. The Phase 18 control socket remains an
+administrative adapter, not a general service RPC bypass.
+
+## 20.6 — Lua and Shell Surface
+
+Expose a narrow, state-preserving Lua table only after the Rust manager passes
+its tests:
+
+```lua
+local reader, writer = hyber.ipc.pipe()
+writer:write("hello")
+assert(reader:read() == "hello")
+
+local a, b = hyber.ipc.channel()
+local request = a:request("status")
+local incoming = b:receive()
+b:respond(incoming.request_id, "ok")
+assert(a:response(request) == "ok")
+```
+
+Lua userdata stores opaque Hyber handle identity only. It validates the active
+session and app sandbox on every method, has no host `io`, `os`, module loader,
+socket, thread or process escape, and releases its handle explicitly via
+`close()`; garbage collection is only a best-effort fallback and cannot be
+relied on for protocol correctness. Manifest applications require an explicit
+`ipc.use` capability before creating/opening IPC endpoints. Until Special_6
+policy grants that capability, the API returns a clear denial.
+
+Add shell introspection, not mutable raw IPC administration:
+
+```text
+ipc handles                 → shell process IPC handles and rights
+ipc inspect <handle>        → Object/type/peer/queue/closed state
+```
+
+It must not expose peer payloads, host paths, credentials, or another process's
+handle table. `look`, `handles`, `rights`, trace, Object metadata and Handle
+tables must report IPC Objects through existing Hyber abstractions.
+
+## 20.7 — Shared Memory and Future Transports
+
+`SHARED_MEMORY` remains a separately designed later sub-phase. Do not implement
+it as `Arc<Vec<u8>>`, a leaked host mapping, or a VFS file alias. It needs
+explicit page ownership, mapping/unmapping, size/sealing, cache coherency,
+revocation, zeroing, quotas, and native address-space rules. Sockets/network
+transport remain Phase 20; they must adapt the Channel/RPC contract rather than
+leak Linux sockets into it.
+
+## 20.8 — Testing, Faults, and Acceptance
+
+Use deterministic Rust unit/integration/property tests; no IPC correctness test
+may depend on host scheduling or host filesystem ordering. Cover:
+
+```text
+pipe FIFO, bounds, EOF, peer close, no partial write
+channel directionality, ordering, limits, malformed message rollback
+Object refs and metadata owner/group/mode changes
+wrong process/handle/side/rights and stale/closed endpoint rejection
+handle attenuation and denied receiver attachment duplication
+process exit cleanup and no orphan/reused IDs
+RPC request/response/cancel, duplicate/unknown/wrong-side IDs, queue overflow
+service endpoint publish/unpublish across ready/stop/restart/session revoke
+Lua denied-without-capability and authorized API lifecycle
+shell introspection without payload disclosure
+```
+
+Phase 19 exits only when two Hyber Processes can create bounded pipes/channels,
+exchange data through rights-checked Handles, perform correlated RPC, close and
+clean up endpoints safely, and request a ready service operation through a
+supervisor-published IPC endpoint—without a Linux-specific public API. Shared
+memory, host/network sockets, stable ABI, native kernel transport, and remote
+RPC remain explicitly out of scope.
 
 ---
 

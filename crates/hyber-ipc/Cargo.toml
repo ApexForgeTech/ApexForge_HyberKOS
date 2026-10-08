@@ -1,0 +1,10 @@
+[package]
+name = "hyber-ipc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyber-core = { path = "../hyber-core" }
+hyber-handle = { path = "../hyber-handle" }
+hyber-object = { path = "../hyber-object" }
+

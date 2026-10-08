@@ -76,8 +76,14 @@ quota. Go concurrency is cooperative, not an adversarial thread-count limit.
 This initial hosted worker exposes lifecycle and bounded logs only. Storage
 grants do not yet expose filesystem methods inside this worker; writable storage
 is denied entirely. Network requests are rejected until Phase 20. It is not the
-full `hyber run` Lua application API. General inter-service channels, RPC and
-shared memory remain Phase 19; endpoint reservation is not endpoint delivery.
+full `hyber run` Lua application API. Phase 19 now supplies the bounded
+object/handle Pipe and Channel/RPC primitive. The hosted worker protocol above
+remains private lifecycle plumbing, not a general RPC bypass. Before a future
+hosted service-IPC adapter publishes a declared endpoint it must call
+`ServiceSupervisor::ipc_endpoint_context`; that gate requires a Running, ready
+service, a valid independent service session, and an exact declared endpoint
+name. Shared memory remains separately designed and is not supplied by the
+service manager.
 These limits must not be represented as a general-purpose production sandbox.
 
 Private newline-delimited JSON messages over backend pipes are:

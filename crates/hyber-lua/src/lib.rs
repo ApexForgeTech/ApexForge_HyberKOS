@@ -79,6 +79,7 @@
 
 use hyber_core::{MetadataValue, Path, ProcessId, Rights, SecurityContext, SecurityManager};
 use hyber_handle::HandleManager;
+use hyber_ipc::{IpcManager, IpcMessage, MessageKind, ReceiveResult};
 use hyber_layout::AppLayout;
 use hyber_manifest::{ApplicationSandbox, StorageClass};
 use hyber_namespace::NamespaceManager;
@@ -103,6 +104,7 @@ struct KernelState {
     app_layout: Option<AppLayout>,
     sandbox: Option<ApplicationSandbox>,
     input_queue: VecDeque<InputEvent>,
+    ipc: IpcManager,
 }
 
 #[derive(Debug, Clone)]
@@ -175,7 +177,7 @@ pub fn run_lua_script_with_session_and_layout(
     ObjectManager,
     Result<(), mlua::Error>,
 ) {
-    run_lua_script_with_session_and_layout_impl(
+    let (vfs, ns_mgr, handles, objects, _, result) = run_lua_script_with_session_and_layout_impl(
         script,
         vfs,
         ns_mgr,
@@ -187,7 +189,9 @@ pub fn run_lua_script_with_session_and_layout(
         session,
         app_layout,
         None,
-    )
+        IpcManager::new(),
+    );
+    (vfs, ns_mgr, handles, objects, result)
 }
 
 /// Run a manifest-approved application. The sandbox is checked before every
@@ -212,7 +216,7 @@ pub fn run_lua_script_with_application_sandbox(
     ObjectManager,
     Result<(), mlua::Error>,
 ) {
-    run_lua_script_with_session_and_layout_impl(
+    let (vfs, ns_mgr, handles, objects, _, result) = run_lua_script_with_session_and_layout_impl(
         script,
         vfs,
         ns_mgr,
@@ -224,6 +228,45 @@ pub fn run_lua_script_with_application_sandbox(
         session,
         Some(app_layout),
         Some(sandbox),
+        IpcManager::new(),
+    );
+    (vfs, ns_mgr, handles, objects, result)
+}
+
+/// Shell/runtime integration that preserves IPC objects across Lua evaluations.
+#[allow(clippy::too_many_arguments, clippy::arc_with_non_send_sync)]
+pub fn run_lua_script_with_session_and_ipc(
+    script: &str,
+    vfs: VFS,
+    ns_mgr: NamespaceManager,
+    handle_mgr: HandleManager,
+    obj_mgr: ObjectManager,
+    ipc: IpcManager,
+    proc_mgr: Arc<Mutex<ProcessManager>>,
+    process_id: ProcessId,
+    security_context: SecurityContext,
+    session: Option<hyber_auth::SessionGuard>,
+) -> (
+    VFS,
+    NamespaceManager,
+    HandleManager,
+    ObjectManager,
+    IpcManager,
+    Result<(), mlua::Error>,
+) {
+    run_lua_script_with_session_and_layout_impl(
+        script,
+        vfs,
+        ns_mgr,
+        handle_mgr,
+        obj_mgr,
+        proc_mgr,
+        process_id,
+        security_context,
+        session,
+        None,
+        None,
+        ipc,
     )
 }
 
@@ -274,11 +317,13 @@ fn run_lua_script_with_session_and_layout_impl(
     session: Option<hyber_auth::SessionGuard>,
     app_layout: Option<AppLayout>,
     sandbox: Option<ApplicationSandbox>,
+    ipc: IpcManager,
 ) -> (
     VFS,
     NamespaceManager,
     HandleManager,
     ObjectManager,
+    IpcManager,
     Result<(), mlua::Error>,
 ) {
     let state = Arc::new(Mutex::new(KernelState {
@@ -293,6 +338,7 @@ fn run_lua_script_with_session_and_layout_impl(
         app_layout,
         sandbox,
         input_queue: VecDeque::new(),
+        ipc,
     }));
 
     let exec_res = (|| -> Result<(), mlua::Error> {
@@ -338,7 +384,14 @@ fn run_lua_script_with_session_and_layout_impl(
         .into_inner()
         .expect("Mutex poisoned");
 
-    (ks.vfs, ks.ns_mgr, ks.handle_mgr, ks.obj_mgr, exec_res)
+    (
+        ks.vfs,
+        ks.ns_mgr,
+        ks.handle_mgr,
+        ks.obj_mgr,
+        ks.ipc,
+        exec_res,
+    )
 }
 
 // ── Lua table builder ─────────────────────────────────────────────────────────
@@ -353,6 +406,7 @@ fn build_hyber_table(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<()>
     hyber.set("proc", build_proc(lua, Arc::clone(&state))?)?;
     hyber.set("sec", build_sec(lua, Arc::clone(&state))?)?;
     hyber.set("input", build_input(lua, Arc::clone(&state))?)?;
+    hyber.set("ipc", build_ipc(lua, Arc::clone(&state))?)?;
     hyber.set("app", build_app(lua, Arc::clone(&state))?)?;
     hyber.set("log", build_log(lua)?)?;
     hyber.set(
@@ -367,6 +421,393 @@ fn build_hyber_table(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<()>
 
     globals.set("hyber", hyber)?;
     Ok(())
+}
+
+// ── hyber.ipc (Phase 19) ────────────────────────────────────────────────────
+
+fn authorize_ipc(state: &KernelState) -> LuaResult<()> {
+    if let Some(session) = &state.session {
+        session.context().map_err(|e| lua_err(e.to_string()))?;
+    }
+    if let Some(sandbox) = &state.sandbox
+        && !sandbox.capability("ipc.use")
+    {
+        return Err(lua_err("application lacks ipc.use capability".into()));
+    }
+    Ok(())
+}
+
+fn ipc_message_to_lua(lua: &Lua, message: IpcMessage) -> LuaResult<LuaValue<'_>> {
+    let table = lua.create_table()?;
+    table.set("version", message.version)?;
+    table.set(
+        "kind",
+        match message.kind {
+            MessageKind::Data => "data",
+            MessageKind::RpcRequest => "request",
+            MessageKind::RpcResponse => "response",
+            MessageKind::Cancel => "cancel",
+        },
+    )?;
+    table.set("request_id", message.request_id)?;
+    table.set("sender", message.sender.0)?;
+    table.set("payload", lua.create_string(&message.payload)?)?;
+    // Attachments stay opaque until a dedicated Lua capability-transfer API is
+    // designed; Lua cannot forge the hidden receiver ProcessId bookkeeping.
+    table.set("attachment_count", message.attachments.len())?;
+    Ok(LuaValue::Table(table))
+}
+
+fn build_ipc_endpoint(
+    lua: &Lua,
+    state: Arc<Mutex<KernelState>>,
+    handle: hyber_core::HandleId,
+) -> LuaResult<LuaTable<'_>> {
+    let endpoint = lua.create_table()?;
+    endpoint.set("id", handle.0)?;
+    {
+        let state = Arc::clone(&state);
+        endpoint.set(
+            "close",
+            lua.create_function(move |_lua, _: LuaTable| {
+                let mut ks = lock(&state)?;
+                authorize_ipc(&ks)?;
+                let pid = ks.process_id;
+                let context = ks.security_context.clone();
+                let KernelState {
+                    ipc,
+                    obj_mgr,
+                    handle_mgr,
+                    ..
+                } = &mut *ks;
+                ipc.close_authorized(obj_mgr, handle_mgr, pid, &context, handle)
+                    .map_err(|e| lua_err(e.to_string()))
+            })?,
+        )?;
+    }
+    {
+        let state = Arc::clone(&state);
+        endpoint.set(
+            "inspect",
+            lua.create_function(move |lua, _: LuaTable| {
+                let ks = lock(&state)?;
+                authorize_ipc(&ks)?;
+                let details = ks
+                    .ipc
+                    .inspect(ks.process_id, handle)
+                    .map_err(|e| lua_err(e.to_string()))?;
+                let result = lua.create_table()?;
+                result.set("object_id", details.object_id.0)?;
+                result.set("queued_bytes", details.queued_bytes)?;
+                result.set("queued_messages", details.queued_messages)?;
+                result.set("peer_closed", details.peer_closed)?;
+                Ok(result)
+            })?,
+        )?;
+    }
+    {
+        let state = Arc::clone(&state);
+        endpoint.set(
+            "read",
+            lua.create_function(move |lua, (_endpoint, limit): (LuaTable, Option<usize>)| {
+                let mut ks = lock(&state)?;
+                authorize_ipc(&ks)?;
+                let pid = ks.process_id;
+                let context = ks.security_context.clone();
+                let kind = ks
+                    .handle_mgr
+                    .get_handle(pid, handle)
+                    .ok_or_else(|| lua_err("invalid IPC handle".into()))?
+                    .object_id;
+                let object_type = ks
+                    .obj_mgr
+                    .lookup(kind)
+                    .ok_or_else(|| lua_err("IPC object unavailable".into()))?
+                    .object_type;
+                let KernelState {
+                    ipc,
+                    obj_mgr,
+                    handle_mgr,
+                    ..
+                } = &mut *ks;
+                let result = match object_type {
+                    hyber_core::ObjectType::Pipe => ipc.pipe_read(
+                        obj_mgr,
+                        handle_mgr,
+                        pid,
+                        &context,
+                        handle,
+                        limit.unwrap_or(hyber_ipc::MAX_PIPE_WRITE_BYTES),
+                    ),
+                    hyber_core::ObjectType::Channel => {
+                        ipc.channel_receive(obj_mgr, handle_mgr, pid, &context, handle)
+                    }
+                    _ => return Err(lua_err("invalid IPC object".into())),
+                }
+                .map_err(|e| lua_err(e.to_string()))?;
+                match result {
+                    ReceiveResult::Message(message)
+                        if object_type == hyber_core::ObjectType::Pipe =>
+                    {
+                        Ok(LuaValue::String(lua.create_string(&message.payload)?))
+                    }
+                    ReceiveResult::Message(message) => ipc_message_to_lua(lua, message),
+                    ReceiveResult::Empty => Ok(LuaValue::Nil),
+                    ReceiveResult::Eof => Ok(LuaValue::Boolean(false)),
+                }
+            })?,
+        )?;
+    }
+    // Structured channels use `receive`; it is intentionally the same
+    // operation as `read`, not a separate queue implementation.
+    endpoint.set("receive", endpoint.get::<_, mlua::Function>("read")?)?;
+    {
+        let state = Arc::clone(&state);
+        endpoint.set(
+            "write",
+            lua.create_function(
+                move |_lua, (_endpoint, payload): (LuaTable, mlua::String)| {
+                    let mut ks = lock(&state)?;
+                    authorize_ipc(&ks)?;
+                    let pid = ks.process_id;
+                    let context = ks.security_context.clone();
+                    let KernelState {
+                        ipc,
+                        obj_mgr,
+                        handle_mgr,
+                        ..
+                    } = &mut *ks;
+                    ipc.pipe_write(
+                        obj_mgr,
+                        handle_mgr,
+                        pid,
+                        &context,
+                        handle,
+                        payload.as_bytes().as_ref(),
+                    )
+                    .map_err(|e| lua_err(e.to_string()))
+                },
+            )?,
+        )?;
+    }
+    {
+        let state = Arc::clone(&state);
+        endpoint.set(
+            "send",
+            lua.create_function(
+                move |_lua, (_endpoint, payload): (LuaTable, mlua::String)| {
+                    let mut ks = lock(&state)?;
+                    authorize_ipc(&ks)?;
+                    let pid = ks.process_id;
+                    let context = ks.security_context.clone();
+                    let KernelState {
+                        ipc,
+                        obj_mgr,
+                        handle_mgr,
+                        ..
+                    } = &mut *ks;
+                    ipc.channel_send(
+                        obj_mgr,
+                        handle_mgr,
+                        pid,
+                        &context,
+                        handle,
+                        MessageKind::Data,
+                        0,
+                        payload.as_bytes().to_vec(),
+                        &[],
+                        (pid, &context),
+                    )
+                    .map_err(|e| lua_err(e.to_string()))
+                },
+            )?,
+        )?;
+    }
+    {
+        let state = Arc::clone(&state);
+        endpoint.set(
+            "request",
+            lua.create_function(
+                move |_lua, (_endpoint, payload): (LuaTable, mlua::String)| {
+                    let mut ks = lock(&state)?;
+                    authorize_ipc(&ks)?;
+                    let pid = ks.process_id;
+                    let context = ks.security_context.clone();
+                    let KernelState {
+                        ipc,
+                        obj_mgr,
+                        handle_mgr,
+                        ..
+                    } = &mut *ks;
+                    ipc.rpc_request(
+                        obj_mgr,
+                        handle_mgr,
+                        pid,
+                        &context,
+                        handle,
+                        payload.as_bytes().to_vec(),
+                        (pid, &context),
+                    )
+                    .map_err(|e| lua_err(e.to_string()))
+                },
+            )?,
+        )?;
+    }
+    {
+        let state = Arc::clone(&state);
+        endpoint.set(
+            "respond",
+            lua.create_function(
+                move |_lua, (_endpoint, request, payload): (LuaTable, u64, mlua::String)| {
+                    let mut ks = lock(&state)?;
+                    authorize_ipc(&ks)?;
+                    let pid = ks.process_id;
+                    let context = ks.security_context.clone();
+                    let KernelState {
+                        ipc,
+                        obj_mgr,
+                        handle_mgr,
+                        ..
+                    } = &mut *ks;
+                    ipc.rpc_respond(
+                        obj_mgr,
+                        handle_mgr,
+                        pid,
+                        &context,
+                        handle,
+                        request,
+                        payload.as_bytes().to_vec(),
+                        (pid, &context),
+                    )
+                    .map_err(|e| lua_err(e.to_string()))
+                },
+            )?,
+        )?;
+    }
+    {
+        let state = Arc::clone(&state);
+        endpoint.set(
+            "cancel",
+            lua.create_function(move |_lua, (_endpoint, request): (LuaTable, u64)| {
+                let mut ks = lock(&state)?;
+                authorize_ipc(&ks)?;
+                let pid = ks.process_id;
+                let context = ks.security_context.clone();
+                let KernelState {
+                    ipc,
+                    obj_mgr,
+                    handle_mgr,
+                    ..
+                } = &mut *ks;
+                ipc.rpc_cancel(
+                    obj_mgr,
+                    handle_mgr,
+                    pid,
+                    &context,
+                    handle,
+                    request,
+                    (pid, &context),
+                )
+                .map_err(|e| lua_err(e.to_string()))
+            })?,
+        )?;
+    }
+    {
+        let state = Arc::clone(&state);
+        endpoint.set(
+            "response",
+            lua.create_function(move |lua, (_endpoint, request): (LuaTable, u64)| {
+                let mut ks = lock(&state)?;
+                authorize_ipc(&ks)?;
+                let pid = ks.process_id;
+                let context = ks.security_context.clone();
+                let KernelState {
+                    ipc,
+                    obj_mgr,
+                    handle_mgr,
+                    ..
+                } = &mut *ks;
+                match ipc
+                    .rpc_receive_response(obj_mgr, handle_mgr, pid, &context, handle, request)
+                    .map_err(|e| lua_err(e.to_string()))?
+                {
+                    ReceiveResult::Message(message) => {
+                        Ok(LuaValue::String(lua.create_string(&message.payload)?))
+                    }
+                    ReceiveResult::Empty => Ok(LuaValue::Nil),
+                    ReceiveResult::Eof => Ok(LuaValue::Boolean(false)),
+                }
+            })?,
+        )?;
+    }
+    Ok(endpoint)
+}
+
+fn build_ipc(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>> {
+    let table = lua.create_table()?;
+    {
+        let state = Arc::clone(&state);
+        table.set(
+            "pipe",
+            lua.create_function(move |lua, ()| {
+                let mut ks = lock(&state)?;
+                authorize_ipc(&ks)?;
+                let pid = ks.process_id;
+                let context = ks.security_context.clone();
+                let KernelState {
+                    ipc,
+                    obj_mgr,
+                    handle_mgr,
+                    ..
+                } = &mut *ks;
+                let endpoints = ipc
+                    .create_pipe(
+                        obj_mgr,
+                        handle_mgr,
+                        &context,
+                        (pid, &context),
+                        (pid, &context),
+                    )
+                    .map_err(|e| lua_err(e.to_string()))?;
+                Ok((
+                    build_ipc_endpoint(lua, Arc::clone(&state), endpoints.reader)?,
+                    build_ipc_endpoint(lua, Arc::clone(&state), endpoints.writer)?,
+                ))
+            })?,
+        )?;
+    }
+    {
+        let state = Arc::clone(&state);
+        table.set(
+            "channel",
+            lua.create_function(move |lua, ()| {
+                let mut ks = lock(&state)?;
+                authorize_ipc(&ks)?;
+                let pid = ks.process_id;
+                let context = ks.security_context.clone();
+                let KernelState {
+                    ipc,
+                    obj_mgr,
+                    handle_mgr,
+                    ..
+                } = &mut *ks;
+                let endpoints = ipc
+                    .create_channel(
+                        obj_mgr,
+                        handle_mgr,
+                        &context,
+                        (pid, &context),
+                        (pid, &context),
+                    )
+                    .map_err(|e| lua_err(e.to_string()))?;
+                Ok((
+                    build_ipc_endpoint(lua, Arc::clone(&state), endpoints.a)?,
+                    build_ipc_endpoint(lua, Arc::clone(&state), endpoints.b)?,
+                ))
+            })?,
+        )?;
+    }
+    Ok(table)
 }
 
 // ── hyber.fs ─────────────────────────────────────────────────────────────────
@@ -1191,6 +1632,27 @@ mod tests {
         ResourceQuotas, Runtime, ScopeAccess, StorageRoots, StorageScopes,
     };
     use std::collections::BTreeSet;
+
+    #[test]
+    fn lua_ipc_pipe_channel_and_rpc_preserve_state_and_protocol() {
+        let mut objects = ObjectManager::new();
+        let namespace = NamespaceManager::new(&mut objects);
+        let mut processes = ProcessManager::new();
+        let pid = processes
+            .create_process(&mut objects, None, SecurityContext::root(), None)
+            .unwrap();
+        let (_, _, _, _, result) = run_lua_script(
+            "local r,w=hyber.ipc.pipe(); assert(w:write('hello') == 5); assert(r:read() == 'hello'); local a,b=hyber.ipc.channel(); local id=a:request('ping'); local req=b:receive(); assert(req.kind == 'request' and req.payload == 'ping'); b:respond(req.request_id, 'pong'); assert(a:response(id) == 'pong'); r:close(); w:close(); a:close(); b:close()",
+            VFS::new(),
+            namespace,
+            HandleManager::new(),
+            objects,
+            Arc::new(Mutex::new(processes)),
+            pid,
+            SecurityContext::root(),
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
 
     #[test]
     fn manifest_sandbox_blocks_sibling_paths_before_vfs_access() {

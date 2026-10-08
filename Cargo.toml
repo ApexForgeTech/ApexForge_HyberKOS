@@ -7,6 +7,7 @@ members = [
     "crates/hyber-vfs",
     "crates/hyber-api",
     "crates/hyber-process",
+    "crates/hyber-ipc",
     "crates/hyber-device",
     "crates/hyber-service",
     "crates/hyber-memfs",

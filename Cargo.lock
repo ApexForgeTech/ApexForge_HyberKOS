@@ -362,6 +362,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyber-ipc"
+version = "0.1.0"
+dependencies = [
+ "hyber-core",
+ "hyber-handle",
+ "hyber-object",
+]
+
+[[package]]
 name = "hyber-layout"
 version = "0.1.0"
 dependencies = [
@@ -379,6 +388,7 @@ dependencies = [
  "hyber-auth",
  "hyber-core",
  "hyber-handle",
+ "hyber-ipc",
  "hyber-layout",
  "hyber-manifest",
  "hyber-namespace",
@@ -540,6 +550,7 @@ dependencies = [
  "hyber-device",
  "hyber-handle",
  "hyber-hostfs",
+ "hyber-ipc",
  "hyber-layout",
  "hyber-lua",
  "hyber-memfs",

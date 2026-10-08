@@ -582,6 +582,34 @@ impl ServiceSupervisor {
         Ok(context)
     }
 
+    /// Trusted Phase 19 publication gate. An IPC adapter must call this before
+    /// it hands a client an endpoint for a service. Reserving a name in a Lua
+    /// declaration is deliberately insufficient: the service must have a
+    /// running, ready process and a still-valid independent service session.
+    ///
+    /// This returns only Hyber identity, never a host socket, PID, or path.
+    pub fn ipc_endpoint_context(
+        &self,
+        id: &ServiceId,
+        endpoint: &str,
+    ) -> Result<(ProcessId, SecurityContext), SupervisorError> {
+        let definition = self
+            .catalog
+            .get(id)
+            .ok_or(SupervisorError::UnknownService)?;
+        if !definition.ipc.endpoints.contains(endpoint) {
+            return Err(SupervisorError::Contract(
+                "service does not declare this IPC endpoint".into(),
+            ));
+        }
+        let status = self.status.get(id).ok_or(SupervisorError::UnknownService)?;
+        if status.state != SupervisorState::Running || !status.ready {
+            return Err(SupervisorError::InvalidState);
+        }
+        let process = status.process_id.ok_or(SupervisorError::InvalidState)?;
+        Ok((process, self.dispatch_context(id)?))
+    }
+
     fn session_context(&self, id: &ServiceId) -> Result<SecurityContext, SupervisorError> {
         let status = self.status.get(id).ok_or(SupervisorError::UnknownService)?;
         if status.state != SupervisorState::Running {

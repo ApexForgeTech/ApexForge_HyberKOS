@@ -11,6 +11,7 @@ use hyber_core::{
 use hyber_device::{DeviceClass, DeviceManager, DeviceProvider};
 use hyber_handle::HandleManager;
 use hyber_hostfs::HostFSProvider;
+use hyber_ipc::IpcManager;
 use hyber_layout::{LayoutManager, UserLayout};
 use hyber_memfs::MemFSProvider;
 use hyber_namespace::NamespaceManager;
@@ -30,6 +31,7 @@ struct HyberShell {
     obj_mgr: ObjectManager,
     ns_mgr: NamespaceManager,
     handle_mgr: HandleManager,
+    ipc: IpcManager,
     vfs: VFS,
     current_dir: Path,
     process_id: ProcessId,
@@ -259,6 +261,7 @@ impl HyberShell {
             obj_mgr,
             ns_mgr,
             handle_mgr,
+            ipc: IpcManager::new(),
             vfs,
             current_dir,
             process_id: shell_pid,
@@ -838,6 +841,7 @@ impl HyberShell {
             "acquire" => self.cmd_acquire(args),
             "release" => self.cmd_release(args),
             "handles" => self.cmd_handles(args),
+            "ipc" => self.cmd_ipc(args),
             "mnts" => self.cmd_mnts(args),
             "rights" => self.cmd_rights(args),
             "meta" => self.cmd_meta(args),
@@ -1574,12 +1578,32 @@ impl HyberShell {
             .map_err(|_| "Invalid handle ID".to_string())?;
         let handle_id = HandleId(handle_id_num);
 
-        self.vfs.close(
-            &mut self.handle_mgr,
-            &mut self.obj_mgr,
-            self.process_id,
-            handle_id,
-        )?;
+        if self.ipc.inspect(self.process_id, handle_id).is_ok() {
+            let context = self
+                .proc_mgr
+                .lock()
+                .map_err(|_| "process manager unavailable".to_string())?
+                .get_process(self.process_id)
+                .ok_or("shell process missing")?
+                .security_context
+                .clone();
+            self.ipc
+                .close_authorized(
+                    &mut self.obj_mgr,
+                    &mut self.handle_mgr,
+                    self.process_id,
+                    &context,
+                    handle_id,
+                )
+                .map_err(|error| error.to_string())?;
+        } else {
+            self.vfs.close(
+                &mut self.handle_mgr,
+                &mut self.obj_mgr,
+                self.process_id,
+                handle_id,
+            )?;
+        }
         println!("Released Handle #{}", handle_id.0);
         Ok(())
     }
@@ -1604,6 +1628,54 @@ impl HyberShell {
             );
         }
         Ok(())
+    }
+
+    /// Inspect endpoint metadata only. IPC payloads deliberately never appear
+    /// in the shell inspector.
+    fn cmd_ipc(&self, args: &[&str]) -> Result<(), String> {
+        match args {
+            ["handles"] => {
+                println!(
+                    "{:<10} | {:<12} | {:<10} | {:<8} | {:<8} | Peer",
+                    "HandleId", "ObjectId", "Side", "Bytes", "Messages"
+                );
+                println!("{}", "-".repeat(78));
+                for handle in self.handle_mgr.list_handle_ids(self.process_id) {
+                    if let Ok(info) = self.ipc.inspect(self.process_id, handle) {
+                        println!(
+                            "{:<10} | {:<12} | {:<10?} | {:<8} | {:<8} | {}",
+                            handle.0,
+                            info.object_id.0,
+                            info.side,
+                            info.queued_bytes,
+                            info.queued_messages,
+                            if info.peer_closed { "closed" } else { "open" },
+                        );
+                    }
+                }
+                Ok(())
+            }
+            ["inspect", raw] => {
+                let handle = HandleId(
+                    raw.parse()
+                        .map_err(|_| "invalid IPC handle ID".to_string())?,
+                );
+                let info = self
+                    .ipc
+                    .inspect(self.process_id, handle)
+                    .map_err(|error| error.to_string())?;
+                println!("Object ID:       {}", info.object_id.0);
+                println!("Endpoint side:   {:?}", info.side);
+                println!("Queued bytes:    {}", info.queued_bytes);
+                println!("Queued messages: {}", info.queued_messages);
+                println!(
+                    "Peer:            {}",
+                    if info.peer_closed { "closed" } else { "open" }
+                );
+                Ok(())
+            }
+            _ => Err("Usage: ipc handles | ipc inspect <handle-id>".into()),
+        }
     }
 
     fn cmd_mnts(&self, _args: &[&str]) -> Result<(), String> {
@@ -2258,6 +2330,7 @@ impl HyberShell {
         println!("  acquire <path> [mode]   Get Handle (r/w/rw)");
         println!("  release <handle_id>     Release Handle");
         println!("  handles                 Show Handle Table");
+        println!("  ipc handles|inspect     Inspect bounded IPC endpoint state");
         println!("  mnts                    Show mount points");
         println!("  rights <path>           Show access rights");
         println!("  meta <ls|get|set|rm>    Manage extended metadata");
@@ -2282,6 +2355,7 @@ impl HyberShell {
         println!("    hyber.obj.meta_get/set(...)    Extended metadata");
         println!("    hyber.proc.pid() / .uid()      Process info");
         println!("    hyber.proc.spawn(path) / .wait(pid) Process control");
+        println!("    hyber.ipc.pipe() / .channel()      Create bounded IPC endpoints");
         println!("    hyber.sec.check_access(...)     Security check");
         println!("    hyber.log.info/warn/error(s)   Logging");
         println!("    hyber.cls()                    Clear terminal screen");
@@ -2399,6 +2473,7 @@ impl HyberShell {
         let ns_mgr = std::mem::replace(&mut self.ns_mgr, NamespaceManager::new_placeholder());
         let handle_mgr = std::mem::replace(&mut self.handle_mgr, HandleManager::new());
         let obj_mgr = std::mem::replace(&mut self.obj_mgr, ObjectManager::new());
+        let ipc = std::mem::replace(&mut self.ipc, IpcManager::new());
 
         let sec_ctx = self
             .proc_mgr
@@ -2409,23 +2484,26 @@ impl HyberShell {
             .security_context
             .clone();
 
-        let (vfs, ns_mgr, handle_mgr, obj_mgr, exec_res) = hyber_lua::run_lua_script_with_session(
-            script,
-            vfs,
-            ns_mgr,
-            handle_mgr,
-            obj_mgr,
-            self.proc_mgr.clone(),
-            self.process_id,
-            sec_ctx,
-            self.session.clone(),
-        );
+        let (vfs, ns_mgr, handle_mgr, obj_mgr, ipc, exec_res) =
+            hyber_lua::run_lua_script_with_session_and_ipc(
+                script,
+                vfs,
+                ns_mgr,
+                handle_mgr,
+                obj_mgr,
+                ipc,
+                self.proc_mgr.clone(),
+                self.process_id,
+                sec_ctx,
+                self.session.clone(),
+            );
 
         // Always restore the state
         self.vfs = vfs;
         self.ns_mgr = ns_mgr;
         self.handle_mgr = handle_mgr;
         self.obj_mgr = obj_mgr;
+        self.ipc = ipc;
 
         match exec_res {
             Ok(()) => Ok(()),
@@ -2443,12 +2521,21 @@ impl HyberShell {
         }
         let handle_ids = self.handle_mgr.list_handle_ids(self.process_id);
         for hid in handle_ids {
-            let _ = self.vfs.close(
-                &mut self.handle_mgr,
-                &mut self.obj_mgr,
-                self.process_id,
-                hid,
-            );
+            if self.ipc.inspect(self.process_id, hid).is_ok() {
+                let _ = self.ipc.close(
+                    &mut self.obj_mgr,
+                    &mut self.handle_mgr,
+                    self.process_id,
+                    hid,
+                );
+            } else {
+                let _ = self.vfs.close(
+                    &mut self.handle_mgr,
+                    &mut self.obj_mgr,
+                    self.process_id,
+                    hid,
+                );
+            }
         }
     }
 }
@@ -2475,6 +2562,7 @@ fn shell_command_help(command: &str) -> Option<&'static str> {
         "acquire" => "Usage: acquire <path> [r|w|rw]\nCreate a shell handle with the requested rights.",
         "release" => "Usage: release <handle-id>\nClose one shell handle and release its object reference.",
         "handles" => "Usage: handles\nShow this shell process's open handle table.",
+        "ipc" => "Usage: ipc handles | ipc inspect <handle-id>\nInspect endpoint identity, queue bounds, and peer state. IPC payloads are never printed.",
         "mnts" => "Usage: mnts\nShow active VFS mount points and providers.",
         "rights" => "Usage: rights <path>\nEvaluate effective rights for the current security context.",
         "meta" => "Usage: meta ls <path> | meta get <path> <key> | meta set <path> <key> <string|int|bool> <value> | meta rm <path> <key>\nManage validated extended object metadata.",

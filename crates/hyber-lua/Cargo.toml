@@ -11,6 +11,7 @@ hyber-handle = { path = "../hyber-handle" }
 hyber-namespace = { path = "../hyber-namespace" }
 hyber-vfs = { path = "../hyber-vfs" }
 hyber-process = { path = "../hyber-process" }
+hyber-ipc = { path = "../hyber-ipc" }
 hyber-layout = { path = "../hyber-layout" }
 hyber-manifest = { path = "../hyber-manifest" }
 

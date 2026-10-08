@@ -5,9 +5,9 @@
 //! the simpler `create_process()` is intentionally used when no handle table
 //! is in scope.
 //!
-//! FIX (Gap 5): Minimal Pipe support added here so processes can communicate
-//!              via stdin/stdout before Phase 19 IPC arrives.
-//!              Pipe objects are backed by in-memory byte buffers.
+//! Bootstrap-only legacy stdin/stdout buffer support. It predates Phase 19,
+//! has no HandleManager/rights/back-pressure semantics, and is intentionally
+//! not the public Hyber IPC API. New IPC users must use `hyber-ipc`.
 
 use hyber_core::{ObjectId, ObjectType, ProcessId, SecurityContext, ThreadId};
 use hyber_handle::HandleManager;
@@ -33,11 +33,12 @@ pub enum ThreadState {
     Terminated,
 }
 
-// ── FIX Gap 5: Minimal in-process Pipe ───────────────────────────────────────
+// ── Bootstrap-only legacy in-process Pipe ────────────────────────────────────
 
-/// A simple in-memory byte pipe connecting a writer end to a reader end.
-/// This satisfies the Phase 10 requirement for stdin/stdout between processes
-/// without pulling in full Phase 19 IPC channels.
+/// Legacy in-memory byte pipe for Phase 10 bootstrap stdio only.
+///
+/// It is deliberately not bounded or capability-checked; do not use it for
+/// Phase 19 application/service IPC.
 #[derive(Debug)]
 pub struct Pipe {
     pub id: ObjectId,
@@ -102,7 +103,7 @@ pub struct Process {
     pub threads: Vec<ThreadId>,
     pub exit_code: Option<i32>,
 
-    // FIX Gap 5: Optional stdio pipe pair (read-end, write-end) as ObjectIds
+    // Bootstrap stdio pair, not a Phase 19 endpoint.
     pub stdin_pipe: Option<ObjectId>,
     pub stdout_pipe: Option<ObjectId>,
 }
@@ -111,7 +112,7 @@ pub struct Process {
 pub struct ProcessManager {
     processes: HashMap<ProcessId, Process>,
     threads: HashMap<ThreadId, Thread>,
-    /// FIX Gap 5: Registered pipes keyed by their ObjectId
+    /// Bootstrap pipes keyed by ObjectId; see `hyber-ipc` for public IPC.
     pipes: HashMap<ObjectId, Pipe>,
     next_pid: u64,
     next_tid: u64,
@@ -209,10 +210,10 @@ impl ProcessManager {
         Ok(id)
     }
 
-    // ── FIX Gap 5: Pipe creation ──────────────────────────────────────────────
+    // ── Bootstrap-only Pipe creation ──────────────────────────────────────────
 
-    /// Create a pipe and wire it as the stdout of `writer_pid` and the stdin
-    /// of `reader_pid`.  Returns the ObjectId of the pipe.
+    /// Bootstrap-only stdout/stdin wiring. Returns an ObjectId but deliberately
+    /// not endpoint handles; new callers must use `IpcManager::create_pipe`.
     pub fn create_pipe(
         &mut self,
         obj_mgr: &mut ObjectManager,

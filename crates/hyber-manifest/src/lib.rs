@@ -527,6 +527,7 @@ fn validate_capability(value: &str) -> Result<(), ManifestError> {
     if matches!(
         value,
         "process.spawn"
+            | "ipc.use"
             | "service.background"
             | "gui.window"
             | "network.outbound"
