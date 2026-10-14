@@ -113,6 +113,75 @@ fn context(session: &SessionGuard) -> SecurityContext {
     context.supplementary_groups.clear();
     context
 }
+
+fn approve_network(
+    definition: &mut ServiceDefinition,
+    grant: ApplicationGrant,
+) -> ApplicationGrant {
+    let mut manifest = grant.manifest;
+    manifest
+        .requested_capabilities
+        .insert(CapabilityName("network.outbound".into()));
+    manifest.network.outbound = true;
+    manifest.network.domains.insert("localhost".into());
+    definition
+        .requested_capabilities
+        .insert(CapabilityName("network.outbound".into()));
+    definition.socket_policy.outbound = true;
+    definition.socket_policy.domains.insert("localhost".into());
+    GrantPolicy {
+        capabilities: manifest.requested_capabilities.clone(),
+        allow_gui: false,
+        allow_background: false,
+        allow_service: true,
+        max_resources: manifest.resources,
+    }
+    .approve(manifest)
+    .unwrap()
+}
+
+#[test]
+fn blocked_network_read_does_not_block_service_stop() {
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = peer.local_addr().unwrap().port();
+    let source = format!(
+        "local s=hyber.network.connect('localhost',{port},'udp'); hyber.service.ready(); s:read(1)"
+    );
+    let (mut runner, mut definition, grant, session) = fixture(Runtime::Lua, source.into_bytes());
+    let grant = approve_network(&mut definition, grant);
+    let pid = runner
+        .start(&definition, &context(&session), &grant, &session)
+        .unwrap();
+    await_observation(&mut runner, &definition, pid, |o| {
+        o == ProcessObservation::Ready
+    });
+    let start = Instant::now();
+    runner.request_stop(&definition.service_id, pid).unwrap();
+    await_observation(&mut runner, &definition, pid, |o| {
+        matches!(o, ProcessObservation::Exited(0))
+    });
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "supervisor was blocked by socket read"
+    );
+}
+
+#[test]
+fn service_network_policy_denies_undeclared_destination() {
+    let source = b"hyber.network.connect('denied.test',80,'tcp'); hyber.service.ready()".to_vec();
+    let (mut runner, mut definition, grant, session) = fixture(Runtime::Lua, source);
+    let grant = approve_network(&mut definition, grant);
+    let pid = runner
+        .start(&definition, &context(&session), &grant, &session)
+        .unwrap();
+    await_observation(
+        &mut runner,
+        &definition,
+        pid,
+        |o| matches!(o, ProcessObservation::Exited(code) if code != 0),
+    );
+    assert_eq!(runner.live_count(), 0);
+}
 fn await_observation(
     runner: &mut HostedRunner,
     definition: &ServiceDefinition,
@@ -157,6 +226,69 @@ fn real_lua_ready_graceful_stop_and_reap() {
     );
     assert_eq!(runner.live_count(), 0);
 }
+
+#[test]
+fn real_lua_network_is_brokered_without_host_socket_access() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(e) => panic!("loopback accept failed: {e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = [0; 4];
+        stream.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"ping");
+        stream.write_all(b"pong").unwrap();
+    });
+    let source = format!("assert(io == nil and os == nil); local s=hyber.network.connect('localhost', {port}, 'tcp'); assert(type(s)=='userdata'); assert(s:write('ping')==4); local reply=''; while #reply<4 do reply=reply .. s:read(4-#reply) end; assert(reply=='pong'); s:close(); s:close(); hyber.service.ready(); while hyber.service.wait(10) do end");
+    let (mut runner, mut definition, grant, session) = fixture(Runtime::Lua, source.into_bytes());
+    let mut manifest = grant.manifest.clone();
+    manifest
+        .requested_capabilities
+        .insert(CapabilityName("network.outbound".into()));
+    manifest.network.outbound = true;
+    manifest.network.domains.insert("localhost".into());
+    let grant = GrantPolicy {
+        capabilities: manifest.requested_capabilities.clone(),
+        allow_gui: false,
+        allow_background: false,
+        allow_service: true,
+        max_resources: manifest.resources,
+    }
+    .approve(manifest)
+    .unwrap();
+    definition
+        .requested_capabilities
+        .insert(CapabilityName("network.outbound".into()));
+    definition.socket_policy.outbound = true;
+    definition.socket_policy.domains.insert("localhost".into());
+    let pid = runner
+        .start(&definition, &context(&session), &grant, &session)
+        .unwrap();
+    await_observation(&mut runner, &definition, pid, |o| {
+        o == ProcessObservation::Ready
+    });
+    runner.request_stop(&definition.service_id, pid).unwrap();
+    await_observation(&mut runner, &definition, pid, |o| {
+        matches!(o, ProcessObservation::Exited(0))
+    });
+    peer.join().unwrap();
+    assert_eq!(runner.live_count(), 0);
+}
 #[test]
 fn real_lua_infinite_loop_can_be_terminated() {
     let (mut runner, definition, grant, session) = fixture(
@@ -179,8 +311,18 @@ fn real_lua_infinite_loop_can_be_terminated() {
 #[test]
 fn real_lua_memory_limit_and_declared_frame_limit_are_enforced() {
     let source = b"local t = {}; while true do t[#t+1] = string.rep('x', 1024*1024) end".to_vec();
-    let (mut runner, definition, mut grant, session) = fixture(Runtime::Lua, source);
-    grant.manifest.resources.memory_bytes = 64 * 1024 * 1024;
+    let (mut runner, definition, grant, session) = fixture(Runtime::Lua, source);
+    let mut manifest = grant.manifest;
+    manifest.resources.memory_bytes = 64 * 1024 * 1024;
+    let grant = GrantPolicy {
+        capabilities: manifest.requested_capabilities.clone(),
+        allow_gui: false,
+        allow_background: false,
+        allow_service: true,
+        max_resources: manifest.resources,
+    }
+    .approve(manifest)
+    .unwrap();
     let pid = runner
         .start(&definition, &context(&session), &grant, &session)
         .unwrap();

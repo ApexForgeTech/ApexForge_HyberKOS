@@ -32,6 +32,7 @@ struct HyberShell {
     ns_mgr: NamespaceManager,
     handle_mgr: HandleManager,
     ipc: IpcManager,
+    network: hyber_network::NetworkManager<hyber_network_host::HostedNetworkProvider>,
     vfs: VFS,
     current_dir: Path,
     process_id: ProcessId,
@@ -262,6 +263,9 @@ impl HyberShell {
             ns_mgr,
             handle_mgr,
             ipc: IpcManager::new(),
+            network: hyber_network::NetworkManager::new(
+                hyber_network_host::HostedNetworkProvider::default(),
+            ),
             vfs,
             current_dir,
             process_id: shell_pid,
@@ -842,6 +846,7 @@ impl HyberShell {
             "release" => self.cmd_release(args),
             "handles" => self.cmd_handles(args),
             "ipc" => self.cmd_ipc(args),
+            "net" => self.cmd_net(args),
             "mnts" => self.cmd_mnts(args),
             "rights" => self.cmd_rights(args),
             "meta" => self.cmd_meta(args),
@@ -2293,6 +2298,42 @@ impl HyberShell {
         Ok(())
     }
 
+    fn cmd_net(&mut self, args: &[&str]) -> Result<(), String> {
+        if args != ["interfaces"] {
+            return Err("Usage: net interfaces".into());
+        }
+        let context = if let Some(session) = &self.session {
+            session.context().map_err(|e| e.to_string())?
+        } else {
+            self.proc_mgr
+                .lock()
+                .map_err(|_| "process manager unavailable")?
+                .get_process(self.process_id)
+                .ok_or("process unavailable")?
+                .security_context
+                .clone()
+        };
+        let entries = self
+            .network
+            .interface_objects(&mut self.obj_mgr, &context)
+            .map_err(|e| e.to_string())?;
+        println!("ObjectId | Interface | State | Provider");
+        for (id, interface) in entries {
+            println!(
+                "{} | {} | {} | {}",
+                id.0,
+                interface.name,
+                if interface.active {
+                    "active"
+                } else {
+                    "inactive"
+                },
+                interface.provider
+            );
+        }
+        Ok(())
+    }
+
     fn cmd_help(&self, args: &[&str]) -> Result<(), String> {
         match args {
             [] => (),
@@ -2331,6 +2372,7 @@ impl HyberShell {
         println!("  release <handle_id>     Release Handle");
         println!("  handles                 Show Handle Table");
         println!("  ipc handles|inspect     Inspect bounded IPC endpoint state");
+        println!("  net interfaces          Inspect logical network Device Objects (admin)");
         println!("  mnts                    Show mount points");
         println!("  rights <path>           Show access rights");
         println!("  meta <ls|get|set|rm>    Manage extended metadata");
@@ -2516,6 +2558,12 @@ impl HyberShell {
 
     /// Cleanup: release all open handles
     fn cleanup(&mut self) {
+        if let Err(error) = self
+            .network
+            .shutdown(&mut self.obj_mgr, &mut self.handle_mgr)
+        {
+            eprintln!("network cleanup: {error}");
+        }
         if let Some(session) = self.session.take() {
             let _ = session.logout();
         }
@@ -2544,6 +2592,7 @@ impl HyberShell {
 /// it documents Hyber commands without exposing host command execution.
 fn shell_command_help(command: &str) -> Option<&'static str> {
     Some(match command {
+        "net" => "Usage: net interfaces\nList logical network Device Objects, state and provider. Requires administrative capability. Application networking requires an approved grant; shell profiles cannot grant it.",
         "help" => "Usage: help [command]\nShow the command index, or detailed usage for one shell command.\nExample: help lua",
         "pwd" => "Usage: pwd\nPrint the current Hyber namespace directory.",
         "whoami" => "Usage: whoami\nPrint the current Hyber account name.",

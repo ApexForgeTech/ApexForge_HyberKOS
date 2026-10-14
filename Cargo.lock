@@ -392,6 +392,7 @@ dependencies = [
  "hyber-layout",
  "hyber-manifest",
  "hyber-namespace",
+ "hyber-network",
  "hyber-object",
  "hyber-process",
  "hyber-vfs",
@@ -423,6 +424,24 @@ version = "0.1.0"
 dependencies = [
  "hyber-core",
  "hyber-object",
+]
+
+[[package]]
+name = "hyber-network"
+version = "0.1.0"
+dependencies = [
+ "hyber-core",
+ "hyber-handle",
+ "hyber-manifest",
+ "hyber-object",
+ "hyber-service-contract",
+]
+
+[[package]]
+name = "hyber-network-host"
+version = "0.1.0"
+dependencies = [
+ "hyber-network",
 ]
 
 [[package]]
@@ -476,6 +495,7 @@ dependencies = [
  "hyber-handle",
  "hyber-ipc",
  "hyber-namespace",
+ "hyber-network",
  "hyber-object",
  "hyber-vfs",
 ]
@@ -511,8 +531,11 @@ version = "0.1.0"
 dependencies = [
  "hyber-auth",
  "hyber-core",
+ "hyber-handle",
  "hyber-manifest",
  "hyber-namespace",
+ "hyber-network",
+ "hyber-network-host",
  "hyber-object",
  "hyber-process",
  "hyber-service",
@@ -556,6 +579,8 @@ dependencies = [
  "hyber-lua",
  "hyber-memfs",
  "hyber-namespace",
+ "hyber-network",
+ "hyber-network-host",
  "hyber-object",
  "hyber-process",
  "hyber-service",

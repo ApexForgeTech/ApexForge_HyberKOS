@@ -291,6 +291,7 @@ impl GrantPolicy {
         }
         let granted_capabilities = manifest.requested_capabilities.clone();
         Ok(ApplicationGrant {
+            approved_manifest: manifest.clone(),
             manifest,
             granted_capabilities,
         })
@@ -299,6 +300,7 @@ impl GrantPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplicationGrant {
     pub manifest: Manifest,
+    approved_manifest: Manifest,
     granted_capabilities: BTreeSet<CapabilityName>,
 }
 impl ApplicationGrant {
@@ -317,6 +319,7 @@ impl ApplicationGrant {
             ));
         }
         Ok(Self {
+            approved_manifest: manifest.clone(),
             manifest,
             granted_capabilities,
         })
@@ -324,7 +327,8 @@ impl ApplicationGrant {
 
     pub fn capability_granted(&self, capability: &str) -> bool {
         let cap = CapabilityName(capability.into());
-        self.manifest.requested_capabilities.contains(&cap)
+        self.manifest == self.approved_manifest
+            && self.manifest.requested_capabilities.contains(&cap)
             && self.granted_capabilities.contains(&cap)
     }
 
@@ -335,7 +339,10 @@ impl ApplicationGrant {
         self.manifest
             .requested_capabilities
             .iter()
-            .filter(|capability| self.granted_capabilities.contains(*capability))
+            .filter(|capability| {
+                self.manifest == self.approved_manifest
+                    && self.granted_capabilities.contains(*capability)
+            })
     }
 
     pub fn granted_capability_set(&self) -> BTreeSet<CapabilityName> {

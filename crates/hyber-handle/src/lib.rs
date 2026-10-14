@@ -204,6 +204,16 @@ impl HandleManager {
             .get_handle_mut(handle_id)
     }
 
+    /// Snapshot process-local identifiers for a lifecycle owner.  Managers
+    /// such as IPC/network use this during process reaping to close provider
+    /// state before the common handle table releases object references.
+    pub fn handles_for_process(&self, process_id: ProcessId) -> Vec<HandleId> {
+        self.process_tables
+            .get(&process_id)
+            .map(|table| table.handles.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// 5.4 — Check if a handle has specific rights
     pub fn check_rights(
         &self,

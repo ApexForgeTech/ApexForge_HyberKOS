@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-fn emit(value: serde_json::Value) -> mlua::Result<()> {
+pub(crate) fn emit(value: serde_json::Value) -> mlua::Result<()> {
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{value}")
         .and_then(|_| stdout.flush())
@@ -21,6 +21,7 @@ pub fn run(path: &str, memory: usize, shares: usize) -> Result<(), String> {
     }
     let stop = Arc::new(AtomicBool::new(false));
     let input_stop = stop.clone();
+    let (network_reply, network_responses) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut input = std::io::stdin().lock();
         loop {
@@ -29,12 +30,16 @@ pub fn run(path: &str, memory: usize, shares: usize) -> Result<(), String> {
             match input.by_ref().take(8193).read_until(b'\n', &mut frame) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    if frame.len() > 8192
-                        || serde_json::from_slice::<serde_json::Value>(&frame)
-                            .map(|v| v["op"] == "stop")
-                            .unwrap_or(true)
-                    {
+                    if frame.len() > 8192 {
                         break;
+                    }
+                    match serde_json::from_slice::<serde_json::Value>(&frame) {
+                        Ok(value) if value["op"] == "network-result" => {
+                            if network_reply.try_send(value).is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
                     }
                 }
             }
@@ -124,6 +129,13 @@ pub fn run(path: &str, memory: usize, shares: usize) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     hyber.set("service", service).map_err(|e| e.to_string())?;
+    hyber
+        .set(
+            "network",
+            crate::worker_network::table(&lua, stop.clone(), network_responses)
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
     hyber.set("log", log).map_err(|e| e.to_string())?;
     lua.globals()
         .set("hyber", hyber)

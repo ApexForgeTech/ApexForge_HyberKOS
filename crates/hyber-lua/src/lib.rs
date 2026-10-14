@@ -83,6 +83,9 @@ use hyber_ipc::{IpcManager, IpcMessage, MessageKind, ReceiveResult};
 use hyber_layout::AppLayout;
 use hyber_manifest::{ApplicationSandbox, StorageClass};
 use hyber_namespace::NamespaceManager;
+use hyber_network::{
+    NetworkAccess, NetworkManager, NetworkProvider, Protocol, UnavailableNetworkProvider,
+};
 use hyber_object::ObjectManager;
 use hyber_process::ProcessManager;
 use hyber_vfs::VFS;
@@ -105,6 +108,7 @@ struct KernelState {
     sandbox: Option<ApplicationSandbox>,
     input_queue: VecDeque<InputEvent>,
     ipc: IpcManager,
+    network: NetworkManager<Box<dyn NetworkProvider>>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +194,7 @@ pub fn run_lua_script_with_session_and_layout(
         app_layout,
         None,
         IpcManager::new(),
+        Box::new(UnavailableNetworkProvider),
     );
     (vfs, ns_mgr, handles, objects, result)
 }
@@ -229,6 +234,48 @@ pub fn run_lua_script_with_application_sandbox(
         Some(app_layout),
         Some(sandbox),
         IpcManager::new(),
+        Box::new(UnavailableNetworkProvider),
+    );
+    (vfs, ns_mgr, handles, objects, result)
+}
+
+/// Composition-root entry point. The caller supplies transport explicitly;
+/// sockets are owned by this complete script execution and released on return.
+#[allow(clippy::too_many_arguments, clippy::arc_with_non_send_sync)]
+pub fn run_lua_script_with_application_network(
+    script: &str,
+    vfs: VFS,
+    ns_mgr: NamespaceManager,
+    handle_mgr: HandleManager,
+    obj_mgr: ObjectManager,
+    proc_mgr: Arc<Mutex<ProcessManager>>,
+    process_id: ProcessId,
+    security_context: SecurityContext,
+    session: Option<hyber_auth::SessionGuard>,
+    app_layout: AppLayout,
+    sandbox: ApplicationSandbox,
+    provider: Box<dyn NetworkProvider>,
+) -> (
+    VFS,
+    NamespaceManager,
+    HandleManager,
+    ObjectManager,
+    Result<(), mlua::Error>,
+) {
+    let (vfs, ns_mgr, handles, objects, _, result) = run_lua_script_with_session_and_layout_impl(
+        script,
+        vfs,
+        ns_mgr,
+        handle_mgr,
+        obj_mgr,
+        proc_mgr,
+        process_id,
+        security_context,
+        session,
+        Some(app_layout),
+        Some(sandbox),
+        IpcManager::new(),
+        provider,
     );
     (vfs, ns_mgr, handles, objects, result)
 }
@@ -267,6 +314,7 @@ pub fn run_lua_script_with_session_and_ipc(
         None,
         None,
         ipc,
+        Box::new(UnavailableNetworkProvider),
     )
 }
 
@@ -318,6 +366,7 @@ fn run_lua_script_with_session_and_layout_impl(
     app_layout: Option<AppLayout>,
     sandbox: Option<ApplicationSandbox>,
     ipc: IpcManager,
+    provider: Box<dyn NetworkProvider>,
 ) -> (
     VFS,
     NamespaceManager,
@@ -339,6 +388,7 @@ fn run_lua_script_with_session_and_layout_impl(
         sandbox,
         input_queue: VecDeque::new(),
         ipc,
+        network: NetworkManager::new(provider),
     }));
 
     let exec_res = (|| -> Result<(), mlua::Error> {
@@ -384,6 +434,16 @@ fn run_lua_script_with_session_and_layout_impl(
         .into_inner()
         .expect("Mutex poisoned");
 
+    // The legacy Lua entry points return only the common managers. Network
+    // sockets are evaluation-scoped until the shell/runtime owns a persistent
+    // NetworkManager, so no returned handle may outlive its provider state.
+    let mut ks = ks;
+    let cleanup = ks
+        .network
+        .close_process(&mut ks.obj_mgr, &mut ks.handle_mgr, ks.process_id)
+        .map_err(|e| lua_err(e.to_string()));
+    let exec_res = exec_res.and(cleanup);
+
     (
         ks.vfs,
         ks.ns_mgr,
@@ -407,6 +467,7 @@ fn build_hyber_table(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<()>
     hyber.set("sec", build_sec(lua, Arc::clone(&state))?)?;
     hyber.set("input", build_input(lua, Arc::clone(&state))?)?;
     hyber.set("ipc", build_ipc(lua, Arc::clone(&state))?)?;
+    hyber.set("network", build_network(lua, Arc::clone(&state))?)?;
     hyber.set("app", build_app(lua, Arc::clone(&state))?)?;
     hyber.set("log", build_log(lua)?)?;
     hyber.set(
@@ -424,6 +485,231 @@ fn build_hyber_table(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<()>
 }
 
 // ── hyber.ipc (Phase 19) ────────────────────────────────────────────────────
+
+// ── hyber.network (Phase 20) ────────────────────────────────────────────────
+
+fn authorize_network(state: &KernelState) -> LuaResult<&hyber_manifest::ApplicationGrant> {
+    if let Some(session) = &state.session {
+        session.context().map_err(|e| lua_err(e.to_string()))?;
+    }
+    state
+        .sandbox
+        .as_ref()
+        .map(ApplicationSandbox::grant)
+        .ok_or_else(|| {
+            lua_err("network is available only to a manifest-approved application".into())
+        })
+}
+
+fn build_network(lua: &Lua, state: Arc<Mutex<KernelState>>) -> LuaResult<LuaTable<'_>> {
+    let network = lua.create_table()?;
+    let resolving = Arc::clone(&state);
+    network.set(
+        "resolve",
+        lua.create_function(move |lua, host: String| {
+            let mut ks = lock(&resolving)?;
+            let grant = authorize_network(&ks)?.clone();
+            let context = ks.security_context.clone();
+            let info = ks
+                .network
+                .resolve(&context, &grant, &host)
+                .map_err(|e| lua_err(e.to_string()))?;
+            authorize_network(&ks)?;
+            let result = lua.create_table()?;
+            result.set("host", info.host.as_str())?;
+            result.set("answers", info.answers)?;
+            result.set("cached", info.cached)?;
+            result.set("cache_seconds", info.cache_seconds)?;
+            Ok(result)
+        })?,
+    )?;
+    let state_for_connect = Arc::clone(&state);
+    network.set(
+        "connect",
+        lua.create_function(
+            move |lua, (host, port, kind): (String, u16, Option<String>)| {
+                let mut ks = lock(&state_for_connect)?;
+                let grant = authorize_network(&ks)?.clone();
+                let protocol = match kind.as_deref().unwrap_or("tcp") {
+                    "tcp" => Protocol::Tcp,
+                    "udp" => Protocol::Udp,
+                    _ => return Err(lua_err("network protocol must be tcp or udp".into())),
+                };
+                let pid = ks.process_id;
+                let context = ks.security_context.clone();
+                let KernelState {
+                    network,
+                    obj_mgr,
+                    handle_mgr,
+                    ..
+                } = &mut *ks;
+                let handle = network
+                    .connect(
+                        obj_mgr, handle_mgr, pid, &context, &grant, protocol, &host, port,
+                    )
+                    .map_err(|e| lua_err(e.to_string()))?;
+                if let Err(error) = authorize_network(&ks) {
+                    let KernelState {
+                        network,
+                        obj_mgr,
+                        handle_mgr,
+                        ..
+                    } = &mut *ks;
+                    let _ = network.close(obj_mgr, handle_mgr, pid, handle);
+                    return Err(error);
+                }
+                build_network_socket(lua, Arc::clone(&state_for_connect), handle)
+            },
+        )?,
+    )?;
+    Ok(network)
+}
+
+struct LuaNetworkSocket {
+    state: std::sync::Weak<Mutex<KernelState>>,
+    handle: hyber_core::HandleId,
+    closed: bool,
+}
+impl mlua::UserData for LuaNetworkSocket {
+    fn add_methods<'lua, M: mlua::UserDataMethods<'lua, Self>>(methods: &mut M) {
+        methods.add_method("write", |_, this, payload: mlua::String| {
+            if this.closed {
+                return Err(lua_err("network socket is closed".into()));
+            }
+            let shared = this
+                .state
+                .upgrade()
+                .ok_or_else(|| lua_err("network runtime ended".into()))?;
+            let mut ks = lock(&shared)?;
+            let grant = authorize_network(&ks)?.clone();
+            let context = ks.security_context.clone();
+            let process = ks.process_id;
+            let KernelState {
+                network,
+                obj_mgr,
+                handle_mgr,
+                ..
+            } = &mut *ks;
+            let access = NetworkAccess {
+                objects: obj_mgr,
+                handles: handle_mgr,
+                process,
+                context: &context,
+                grant: &grant,
+            };
+            let result = network
+                .send(&access, this.handle, payload.as_bytes())
+                .map_err(|e| lua_err(e.to_string()));
+            authorize_network(&ks)?;
+            result
+        });
+        methods.add_method("read", |lua, this, limit: Option<usize>| {
+            if this.closed {
+                return Err(lua_err("network socket is closed".into()));
+            }
+            let shared = this
+                .state
+                .upgrade()
+                .ok_or_else(|| lua_err("network runtime ended".into()))?;
+            let mut ks = lock(&shared)?;
+            let grant = authorize_network(&ks)?.clone();
+            let context = ks.security_context.clone();
+            let process = ks.process_id;
+            let KernelState {
+                network,
+                obj_mgr,
+                handle_mgr,
+                ..
+            } = &mut *ks;
+            let access = NetworkAccess {
+                objects: obj_mgr,
+                handles: handle_mgr,
+                process,
+                context: &context,
+                grant: &grant,
+            };
+            let info = network
+                .inspect(&access, this.handle)
+                .map_err(|e| lua_err(e.to_string()))?
+                .clone();
+            let data = network
+                .receive(&access, this.handle, limit.unwrap_or(4096))
+                .map_err(|e| lua_err(e.to_string()))?;
+            authorize_network(&ks)?;
+            if data.is_empty() && info.protocol == Protocol::Tcp {
+                Ok(LuaValue::Nil)
+            } else {
+                Ok(LuaValue::String(lua.create_string(&data)?))
+            }
+        });
+        methods.add_method("inspect", |lua, this, ()| {
+            if this.closed {
+                return Err(lua_err("network socket is closed".into()));
+            }
+            let shared = this
+                .state
+                .upgrade()
+                .ok_or_else(|| lua_err("network runtime ended".into()))?;
+            let ks = lock(&shared)?;
+            let grant = authorize_network(&ks)?;
+            let access = NetworkAccess {
+                objects: &ks.obj_mgr,
+                handles: &ks.handle_mgr,
+                process: ks.process_id,
+                context: &ks.security_context,
+                grant,
+            };
+            let info = ks
+                .network
+                .inspect(&access, this.handle)
+                .map_err(|e| lua_err(e.to_string()))?;
+            let result = lua.create_table()?;
+            result.set("object_id", info.object_id.0)?;
+            result.set("host", info.peer.host.as_str())?;
+            result.set("port", info.peer.port)?;
+            result.set("bytes_sent", info.bytes_sent)?;
+            result.set("bytes_received", info.bytes_received)?;
+            Ok(result)
+        });
+        methods.add_method_mut("close", |_, this, ()| {
+            if this.closed {
+                return Ok(());
+            }
+            let shared = this
+                .state
+                .upgrade()
+                .ok_or_else(|| lua_err("network runtime ended".into()))?;
+            // Resource release must work even when the session was revoked.
+            let mut ks = shared
+                .lock()
+                .map_err(|_| lua_err("network runtime unavailable".into()))?;
+            let process = ks.process_id;
+            let KernelState {
+                network,
+                obj_mgr,
+                handle_mgr,
+                ..
+            } = &mut *ks;
+            network
+                .close(obj_mgr, handle_mgr, process, this.handle)
+                .map_err(|e| lua_err(e.to_string()))?;
+            this.closed = true;
+            Ok(())
+        });
+    }
+}
+
+fn build_network_socket(
+    lua: &Lua,
+    state: Arc<Mutex<KernelState>>,
+    handle: hyber_core::HandleId,
+) -> LuaResult<mlua::AnyUserData<'_>> {
+    lua.create_userdata(LuaNetworkSocket {
+        state: Arc::downgrade(&state),
+        handle,
+        closed: false,
+    })
+}
 
 fn authorize_ipc(state: &KernelState) -> LuaResult<()> {
     if let Some(session) = &state.session {
@@ -1634,6 +1920,104 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
+    fn injected_network_uses_userdata_and_reclaims_on_script_error() {
+        use hyber_network::{Endpoint, InterfaceInfo, ProviderError, ProviderSocketId};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Fake(Arc<AtomicUsize>);
+        impl NetworkProvider for Fake {
+            fn interfaces(&mut self) -> Result<Vec<InterfaceInfo>, ProviderError> {
+                Ok(vec![])
+            }
+            fn connect(
+                &mut self,
+                _: Protocol,
+                _: &Endpoint,
+            ) -> Result<ProviderSocketId, ProviderError> {
+                Ok(ProviderSocketId(1))
+            }
+            fn send(&mut self, _: ProviderSocketId, bytes: &[u8]) -> Result<usize, ProviderError> {
+                Ok(bytes.len())
+            }
+            fn receive(&mut self, _: ProviderSocketId, _: usize) -> Result<Vec<u8>, ProviderError> {
+                Ok(vec![0, 255])
+            }
+            fn close(&mut self, _: ProviderSocketId) -> Result<(), ProviderError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        for script in [
+            "local s=hyber.network.connect('example.test',80); assert(type(s)=='userdata'); assert(not pcall(function() s.id=999 end)); assert(s:write(string.char(0,255))==2); assert(s:read(2)==string.char(0,255)); assert(s:inspect().port==80); s:close(); s:close(); assert(not pcall(function() s:read(2) end))",
+            "local s=hyber.network.connect('example.test',80); error('intentional test error')",
+        ] {
+            let mut objects = ObjectManager::new();
+            let namespace = NamespaceManager::new(&mut objects);
+            let mut processes = ProcessManager::new();
+            let pid = processes
+                .create_process(&mut objects, None, SecurityContext::root(), None)
+                .unwrap();
+            let layout = AppLayout::new(UserLayout::root(), "net").unwrap();
+            let manifest = Manifest {
+                format_version: 1,
+                app_id: ApplicationId("net".into()),
+                version: "1.0.0".into(),
+                publisher: "test".into(),
+                display_name: "Net".into(),
+                entrypoint: "main.lua".into(),
+                runtime: Runtime::Lua,
+                execution: ExecutionMode::Background,
+                requested_capabilities: BTreeSet::from([hyber_manifest::CapabilityName(
+                    "network.outbound".into(),
+                )]),
+                storage: StorageScopes::default(),
+                network: NetworkPolicy {
+                    outbound: true,
+                    inbound: false,
+                    domains: BTreeSet::from(["example.test".into()]),
+                },
+                resources: ResourceQuotas {
+                    memory_bytes: 1024,
+                    cpu_shares: 1,
+                    handles: 2,
+                    storage_bytes: 1024,
+                },
+            };
+            let mut policy = GrantPolicy::deny_all();
+            policy.capabilities = manifest.requested_capabilities.clone();
+            let sandbox = ApplicationSandbox::new(
+                policy.approve(manifest).unwrap(),
+                StorageRoots {
+                    config: layout.config.clone(),
+                    data: layout.data.clone(),
+                    state: layout.state.clone(),
+                    cache: layout.cache.clone(),
+                    temporary: layout.temporary.clone(),
+                    runtime: layout.runtime.clone(),
+                },
+            )
+            .unwrap();
+            let closed = Arc::new(AtomicUsize::new(0));
+            let (_, _, handles, _, result) = run_lua_script_with_application_network(
+                script,
+                VFS::new(),
+                namespace,
+                HandleManager::new(),
+                objects,
+                Arc::new(Mutex::new(processes)),
+                pid,
+                SecurityContext::root(),
+                None,
+                layout,
+                sandbox,
+                Box::new(Fake(closed.clone())),
+            );
+            assert_eq!(result.is_err(), script.contains("intentional"));
+            assert_eq!(closed.load(Ordering::SeqCst), 1);
+            assert!(handles.list_handles(pid).is_empty());
+        }
+    }
+
+    #[test]
     fn lua_ipc_pipe_channel_and_rpc_preserve_state_and_protocol() {
         let mut objects = ObjectManager::new();
         let namespace = NamespaceManager::new(&mut objects);
@@ -1755,6 +2139,62 @@ mod tests {
         .unwrap();
         let (_, _, _, _, result) = run_lua_script_with_application_sandbox(
             "assert(not hyber.sec.check_capability('CAP_SYS_ADMIN')); assert(not pcall(hyber.input.emit, 'keyboard', 'KEY_A', 1)); assert(not pcall(hyber.proc.spawn, '/apps/other/main.lua'))",
+            VFS::new(),
+            namespace,
+            HandleManager::new(),
+            objects,
+            Arc::new(Mutex::new(processes)),
+            pid,
+            SecurityContext::root(),
+            None,
+            layout,
+            sandbox,
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn lua_network_requires_an_approved_network_grant() {
+        let mut objects = ObjectManager::new();
+        let namespace = NamespaceManager::new(&mut objects);
+        let mut processes = ProcessManager::new();
+        let pid = processes
+            .create_process(&mut objects, None, SecurityContext::root(), None)
+            .unwrap();
+        let layout = AppLayout::new(UserLayout::root(), "editor").unwrap();
+        let manifest = Manifest {
+            format_version: 1,
+            app_id: ApplicationId("editor".into()),
+            version: "1.0.0".into(),
+            publisher: "local".into(),
+            display_name: "Editor".into(),
+            entrypoint: "main.lua".into(),
+            runtime: Runtime::Lua,
+            requested_capabilities: BTreeSet::new(),
+            storage: StorageScopes::default(),
+            execution: ExecutionMode::Background,
+            network: NetworkPolicy::default(),
+            resources: ResourceQuotas {
+                memory_bytes: 1024,
+                cpu_shares: 1,
+                handles: 1,
+                storage_bytes: 1024,
+            },
+        };
+        let sandbox = ApplicationSandbox::new(
+            GrantPolicy::deny_all().approve(manifest).unwrap(),
+            StorageRoots {
+                config: layout.config.clone(),
+                data: layout.data.clone(),
+                state: layout.state.clone(),
+                cache: layout.cache.clone(),
+                temporary: layout.temporary.clone(),
+                runtime: layout.runtime.clone(),
+            },
+        )
+        .unwrap();
+        let (_, _, _, _, result) = run_lua_script_with_application_sandbox(
+            "assert(not pcall(hyber.network.connect, 'localhost', 80, 'tcp'))",
             VFS::new(),
             namespace,
             HandleManager::new(),

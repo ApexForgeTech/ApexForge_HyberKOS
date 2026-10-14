@@ -1,0 +1,8 @@
+[package]
+name = "hyber-network-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyber-network = { path = "../../../crates/hyber-network" }
+

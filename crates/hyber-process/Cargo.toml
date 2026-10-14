@@ -8,5 +8,6 @@ hyber-core = { path = "../hyber-core" }
 hyber-object = { path = "../hyber-object" }
 hyber-handle = { path = "../hyber-handle" }
 hyber-ipc = { path = "../hyber-ipc" }
+hyber-network = { path = "../hyber-network" }
 hyber-namespace = { path = "../hyber-namespace" }
 hyber-vfs = { path = "../hyber-vfs" }

@@ -15,3 +15,6 @@ hyber-service = { path = "../../../crates/hyber-service" }
 hyber-service-contract = { path = "../../../crates/hyber-service-contract" }
 hyber-namespace = { path = "../../../crates/hyber-namespace" }
 hyber-vfs = { path = "../../../crates/hyber-vfs" }
+hyber-network = { path = "../../../crates/hyber-network" }
+hyber-network-host = { path = "../hyber-network-host" }
+hyber-handle = { path = "../../../crates/hyber-handle" }

@@ -12,6 +12,7 @@
 use hyber_core::{ObjectId, ObjectType, ProcessId, SecurityContext, ThreadId};
 use hyber_handle::HandleManager;
 use hyber_ipc::IpcManager;
+use hyber_network::{NetworkManager, NetworkProvider};
 use hyber_object::ObjectManager;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -428,6 +429,27 @@ impl ProcessManager {
             return Err("Process cannot be reaped".into());
         }
         ipc.close_process(objects, handles, id);
+        self.reap_isolated_process(objects, id)
+    }
+
+    /// Full hosted reaping boundary for volatile IPC and network resources.
+    /// Providers are closed before common object reference accounting runs.
+    pub fn reap_isolated_process_with_ipc_and_network<P: NetworkProvider>(
+        &mut self,
+        objects: &mut ObjectManager,
+        handles: &mut HandleManager,
+        ipc: &mut IpcManager,
+        network: &mut NetworkManager<P>,
+        id: ProcessId,
+    ) -> Result<(), String> {
+        let process = self.processes.get(&id).ok_or("Process not found")?;
+        if process.state != ProcessState::Zombie {
+            return Err("Process cannot be reaped".into());
+        }
+        ipc.close_process(objects, handles, id);
+        network
+            .close_process(objects, handles, id)
+            .map_err(|e| e.to_string())?;
         self.reap_isolated_process(objects, id)
     }
 

@@ -4309,108 +4309,278 @@ RPC remain explicitly out of scope.
 
 # 21. Phase 20 — Networking
 
+### Hosted implementation status
+
+The implementation and tested limits are documented in
+[`docs/design/networking.md`](docs/design/networking.md). Outbound TCP/UDP,
+grant-bound handles, opaque Lua sockets, bounded resolution, synthetic
+interface Objects and sandboxed service network brokering are implemented.
+The detailed design below also includes acceptance targets: it must not be
+read as proof that every target is already available. In particular, network
+wait/signal readiness, cross-broker diagnostics and a public cross-language
+API are not implemented. Resolver cache expiry is a local 30-second maximum,
+not authoritative DNS TTL. Lua close is idempotent; raw reclaimed handles are
+rejected. Ordinary shell Lua does not acquire an implicit networking grant.
+
 ## Objective
 
-Create Hyber-native user-space networking abstractions and a host-backed
-networking implementation. This phase does not yet replace the kernel network
-stack; that work belongs to Phase 27.
+Create a capability-controlled, Hyber-native user-space networking boundary
+with a hosted provider. Applications, Lua, services, and optional Go payloads
+must operate on Hyber Socket Objects and Hyber Handles; host sockets, file
+descriptors, host interface names, resolver handles, and host process details
+must remain private to the provider.
+
+This phase is deliberately **not** a replacement for the host kernel network
+stack. Native device discovery, packet I/O, routing implementation, TCP/UDP
+state machines, and the native stack remain Phase 27. Phase 20 proves the
+object, capability, lifecycle, policy, provider, and service contracts that
+the Phase 27 implementation must preserve.
+
+## Scope, authority, and non-goals
+
+```text
+Application / service / Lua consumer
+        ↓ approved ApplicationGrant + current SecurityContext
+Hyber NetworkManager
+        ↓ Socket Object + process-local HandleId
+NetworkProvider trait
+        ↓
+isolated hosted provider (temporary)
+        ↓
+host TCP/UDP + resolver
+```
+
+The `NetworkManager` is Rust-owned. It owns logical socket state, validates
+destination names and ports, authorizes each operation, closes/reclaims socket
+objects, and maps typed provider failures to Hyber errors. Providers implement
+transport behavior only; they may never decide application permissions.
+
+Phase 20 v1 supports bounded outbound TCP and UDP client sockets plus
+name-resolution through the selected provider. Inbound/listening sockets,
+accept queues, raw sockets, multicast, packet capture, proxy chaining, TLS
+trust policy, and a system-wide packet firewall are explicitly deferred unless
+their own design and tests are added. A manifest's `network.inbound` request is
+therefore validated as policy intent but must return `Unsupported` until an
+inbound implementation exists.
+
+Direct host paths, numeric host file descriptors, `std::net` objects, raw
+resolver results, Linux errno values, and implicit unrestricted network access
+must never appear in the public Hyber API, Lua userdata, shell output, service
+contracts, or persistent metadata.
 
 ## Language Responsibilities
 
 ```text
-Rust → Hyber NetworkInterface/Socket object model, security boundary, API
-Go   → user-space networking data plane, clients, proxies, DNS/HTTP services,
-       connection pools, concurrent background daemons
-Lua  → configuration, service startup, policy, health checks, automation
+Rust → NetworkManager, Socket/Interface Objects, authorization, provider API,
+       hosted adapter, resolver contract, lifecycle, observability, tests
+Lua  → capability-checked client use, configuration, service policy, health
+       checks and automation through the Rust-owned API
+Go   → optional ordinary supervised payloads/daemons using the same Hyber IPC
+       and network contract; never an alternate security authority
 ```
 
-Go networking is written from a clean Hyber-facing implementation boundary. It
-may use a narrowly isolated host adapter in this phase, but host sockets must
-never leak through the public Hyber object model. Lua does not implement TCP,
-UDP, DNS, packet scheduling, or socket lifetime.
+Lua does not implement TCP, UDP, DNS, packet scheduling, provider lifetime, or
+security policy. Go is optional in this phase: no Go component receives a host
+socket or bypasses the manifest, service, IPC, handle, or session boundaries.
 
 ---
 
-# 21.1 — Network Interfaces
+# 21.1 — Public Hyber Network Model
 
-Define:
+Create `crates/hyber-network` as the language-neutral Rust implementation
+boundary. Define strong logical types for interface IDs, socket IDs, protocol,
+socket state, endpoint name, port, timeout, address family, resolver result,
+provider status, and typed errors. These types must not wrap Linux descriptors
+or host socket types.
+
+Socket lifecycle is explicit:
 
 ```text
-NetworkInterface Object
+Created → Connecting → Connected → Closing → Closed | Failed
 ```
+
+Only `Created` sockets can connect; only `Connected` sockets can send/receive;
+close is idempotent; provider failure moves the socket to `Failed`; and a
+closed, failed, or reclaimed handle can never be resurrected. Bounds are
+defined for sockets, requests, read/write buffers, resolver answers, hostname
+length, timeout, and error detail.
+
+Each logical socket has an `ObjectType::Socket` Object owned by the caller,
+with restrictive Hyber metadata and a provider name. The caller receives a
+normal process-local `HandleId`, never a transport-native identifier. Read,
+write, wait, signal, close, object inspection, process exit cleanup, and
+metadata behavior must use the existing ObjectManager, HandleManager,
+SecurityManager, and lifecycle rules.
 
 ---
 
-# 21.2 — Socket Object
+# 21.2 — Authorization and Manifest/Service Integration
 
-Implement:
+Every connect, resolve, send, receive, inspect, and close operation must be
+authorized with both:
 
 ```text
-Socket Object
+current SecurityContext
+        +
+approved ApplicationGrant / ServiceDefinition policy
 ```
+
+Outbound use requires the approved `network.outbound` capability and an
+outbound policy. A hostname must use canonical lower-case DNS form and match
+the application's exact/suffix domain allowlist. Empty allowlists deny all
+named destinations. Raw numeric destinations are denied in v1 so a declared
+domain policy cannot be bypassed; a future IP/CIDR policy requires a versioned
+manifest extension. Ports are validated and policy decisions are made before
+provider resolution or connection.
+
+Service socket intent must exactly match the already validated
+`hyber-service-contract::SocketPolicy`; service workers and Go payloads use
+the same grant-derived authorization and cannot open host sockets directly.
+The security check never trusts a caller-supplied `SecurityContext` as an
+authentication proof: authenticated paths revalidate their session guard at
+the dispatch boundary.
 
 ---
 
-# 21.3 — TCP/UDP
+# 21.3 — Network Interfaces
 
-Initially map to Linux networking.
+Define logical `NetworkInterface` Objects and a deterministic read-only
+interface inventory. An interface record has a Hyber ID, stable display name,
+administrative state, supported protocol families, provider name, and no host
+adapter identity. Interface enumeration requires an explicit inspection right
+or administrative authority; applications do not acquire unrestricted device
+access by listing an interface.
 
-Later implement native networking.
+The hosted v1 provider may expose one synthetic active interface such as
+`host0`. It must not leak Linux interface names or configuration. Native
+interface discovery/control belongs to Phase 27.
 
-The Phase 20 implementation is split into two explicit layers:
+---
+
+# 21.4 — Provider Boundary and Hosted TCP/UDP
+
+Define a `NetworkProvider` trait using only Hyber request/response types. The
+format/model layer performs no I/O. The temporary hosted implementation lives
+behind a Linux/host backend crate and privately uses host networking.
+
+Provider operations:
 
 ```text
-Hyber Rust socket/object boundary
-        ↓
-Go user-space TCP/UDP clients and services
-        ↓
-isolated host-network adapter (temporary)
+list_interfaces
+resolve
+connect_tcp
+connect_udp
+send
+receive
+close
 ```
 
-The Go layer must define timeouts, cancellation, bounded buffers, connection
-limits, error mapping, and shutdown behavior. It must not define kernel
-syscalls or freeze the final native networking ABI.
+The provider enforces bounded I/O and maps host failures to a small typed
+Hyber error set (`Timeout`, `Refused`, `Unreachable`, `WouldBlock`, `Closed`,
+`Io`, `Unsupported`) without exposing platform errno text. A failed connect
+does not leave a usable handle or object. Close/reap releases provider state
+exactly once even if process cleanup races normal close.
 
 ---
 
-# 21.4 — DNS
+# 21.5 — DNS and Destination Integrity
 
-Create:
+Create a resolver interface rather than treating DNS as an untrusted utility:
 
 ```text
-DNS Service
+canonical name validation
+policy check before resolve
+bounded resolver answers and TTL
+provider-owned cache with explicit expiry
+typed resolver failures
 ```
 
+The hostname authorized by policy is retained as the socket's logical peer;
+resolved addresses remain provider-private in v1. This prevents shell, Lua,
+or application code from treating a resolver result as a permission to connect
+to an arbitrary numeric address. DNS service processes added later communicate
+through Phase 19 IPC and consume this same resolver contract.
+
 ---
 
-# 21.5 — Firewall
+# 21.6 — Policy Firewall and Observability
 
-Design a Hyber security layer.
-
----
-
-# 21.6 — Phase 20 Exit Criteria
-
-A Hyber application can create a network connection without knowing Linux networking internals.
-
-# 21.7 — Go Integration for Networking
-
-Implement the user-space networking daemons in Go from the Hyber-facing
-boundary:
+The first firewall is an object-level default-deny policy evaluator:
 
 ```text
-Go network daemon
- ↓
-Hyber Network API / IPC
- ↓
-Rust socket and security boundary
+identity + approved grant + service policy + protocol + canonical hostname + port
 ```
 
-Start with DNS/client utilities, TCP/UDP clients, a bounded proxy, and a
-health-check daemon. Each daemon must have explicit lifecycle, cancellation,
-back-pressure, retry, timeout, logging, and capability requirements. Go is not
-used for the native kernel network stack; Phase 27 defines that Rust-first
-native implementation.
+It records an auditable allow/deny decision without secret tokens, payloads,
+or host addresses. It is not a claim of host packet filtering. A packet
+firewall, CIDR rules, NAT, routing tables, and TLS certificate policy require
+separate future designs.
+
+Expose bounded socket/interface inspection to authorized shell and diagnostic
+tools. Diagnostics show logical socket ID/object ID, protocol, state, logical
+destination, owner, provider, byte counts, and redacted typed failure. They
+must not print credentials, host descriptors, raw packet contents, or provider
+internals.
+
+---
+
+# 21.7 — Lua, Shell, and Service Consumers
+
+Expose a minimal `hyber.network` Lua module through the existing restricted
+runtime:
+
+```lua
+local socket = hyber.network.connect("api.example.test", 443, "tcp")
+socket:write(request)
+local reply = socket:read(4096)
+socket:close()
+```
+
+Lua receives opaque socket userdata only. Calls revalidate the current session
+and grant, honor bounded timeouts/buffers, and cannot import host I/O, mutate
+policy, forge handles, or retain a socket after closure. A profile cannot use
+the module to elevate privileges. The shell adds only capability-checked
+inspection and test-oriented commands; it does not expose a host networking
+escape hatch.
+
+Services acquire networking only through their approved service definition and
+the supervisor's grant-derived execution context. A Go daemon, if added,
+receives the same IPC/network API and cooperative cancellation contract; it
+does not receive a host command line or raw socket.
+
+---
+
+# 21.8 — Testing, Fault Handling, and Acceptance
+
+Use deterministic fake-provider tests for policy, state transitions, handle
+rights, lifecycle cleanup, error mapping, resolver bounds, and failed-connect
+rollback. Use loopback-only hosted integration tests for TCP and UDP; tests
+must never require public Internet access or depend on host interface order.
+
+Required negative tests include unauthorized capability, ungranted manifest
+capability, denied/invalid domain, numeric-address bypass, invalid port,
+unsupported inbound listen, wrong-handle operation, use-after-close, provider
+failure, process reaping, bounded queue/read/write behavior, and service
+policy mismatch. Test that a provider can never be called before authorization.
+
+Phase 20 is complete only when:
+
+```text
+Socket and Interface Objects are represented through Hyber Object/Handle rules
+outbound TCP and UDP work through an isolated hosted provider
+manifest and service socket policies are enforced before provider I/O
+Lua uses opaque, session-checked socket userdata
+host descriptors/paths/errno never enter public APIs or diagnostics
+DNS name policy cannot be bypassed with a raw numeric address
+close, failure, and process cleanup release provider/object/handle state once
+typed errors and inspection are deterministic and bounded
+unit, corruption/negative, loopback integration, workspace test, clippy, and
+format checks pass
+```
+
+Phase 27 replaces only the provider beneath this stable Hyber boundary; it
+must not require applications, Lua, services, manifests, or package metadata
+to learn native networking details.
 
 ---
 

@@ -14,5 +14,6 @@ hyber-process = { path = "../hyber-process" }
 hyber-ipc = { path = "../hyber-ipc" }
 hyber-layout = { path = "../hyber-layout" }
 hyber-manifest = { path = "../hyber-manifest" }
+hyber-network = { path = "../hyber-network" }
 
 mlua = { version = "0.9", features = ["lua54", "vendored"] }

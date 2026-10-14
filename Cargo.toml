@@ -8,6 +8,7 @@ members = [
     "crates/hyber-api",
     "crates/hyber-process",
     "crates/hyber-ipc",
+    "crates/hyber-network",
     "crates/hyber-device",
     "crates/hyber-service",
     "crates/hyber-memfs",
@@ -23,6 +24,7 @@ members = [
     "crates/hyber-package",
     "applications/hyber-pkg",
     "backends/linux/hyber-service-host",
+    "backends/linux/hyber-network-host",
     "applications/hyber-serviced",
 ]
 resolver = "2"

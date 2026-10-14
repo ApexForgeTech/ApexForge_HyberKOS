@@ -24,6 +24,7 @@ use std::{
 const FRAME_LIMIT: usize = 8192;
 const MAX_LOGS: usize = 128;
 pub mod client;
+mod network;
 struct Instance {
     service: ServiceId,
     child: Child,
@@ -34,6 +35,8 @@ struct Instance {
     session: SessionGuard,
     stopping: bool,
     frame_limit: usize,
+    network: Option<network::Broker>,
+    network_reply: Option<Vec<u8>>,
 }
 pub struct HostedRunner {
     worker: PathBuf,
@@ -106,8 +109,11 @@ impl ServiceRunner for HostedRunner {
             return Err("service identity mismatch".into());
         }
         // Phase 20 is not bypassed by inheriting host network access.
-        if definition.socket_policy.inbound || definition.socket_policy.outbound {
-            return Err("network service adapter is not available before Phase 20".into());
+        if definition.socket_policy.inbound {
+            return Err("inbound networking is unsupported by this provider".into());
+        }
+        if definition.socket_policy.outbound && definition.ipc.max_message_bytes < 4096 {
+            return Err("network broker requires a 4096-byte IPC frame allowance".into());
         }
         let limits = grant.manifest.resources;
         if limits.memory_bytes < 64 * 1024 * 1024 || limits.handles < 16 {
@@ -227,10 +233,33 @@ impl ServiceRunner for HostedRunner {
                 return Err(error);
             }
         };
+        let network = if definition.socket_policy.outbound {
+            match network::Broker::new(
+                definition.clone(),
+                grant.clone(),
+                session.clone(),
+                context.clone(),
+                pid,
+            ) {
+                Ok(broker) => Some(broker),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    self.processes.stop_process(pid, 1)?;
+                    self.processes
+                        .reap_isolated_process(&mut self.objects, pid)?;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         self.live.insert(
             pid,
             Instance {
                 service: definition.service_id.clone(),
+                network,
+                network_reply: None,
                 child,
                 input,
                 output,
@@ -253,6 +282,9 @@ impl ServiceRunner for HostedRunner {
                 _ => return Err("control pipe unavailable".into()),
             }
             instance.stopping = true;
+            if let Some(network) = &instance.network {
+                network.cancel();
+            }
         }
         Ok(())
     }
@@ -264,6 +296,38 @@ impl ServiceRunner for HostedRunner {
     }
     fn poll(&mut self, id: &ServiceId, process: ProcessId) -> Result<ProcessObservation, String> {
         let instance = self.instance(id, process)?;
+        if instance.session.context().is_err() {
+            if let Some(network) = &instance.network {
+                network.cancel();
+            }
+            let _ = instance.child.kill();
+        } else if !instance.stopping {
+            if instance.network_reply.is_none() {
+                if let Some(result) = instance.network.as_mut().and_then(|n| n.poll()) {
+                    let mut bytes =
+                        serde_json::to_vec(&result).map_err(|_| "network reply encoding failed")?;
+                    bytes.push(b'\n');
+                    if bytes.len() > 4096 {
+                        return Err("network reply exceeds frame bound".into());
+                    }
+                    instance.network_reply = Some(bytes);
+                }
+            }
+            if let Some(bytes) = &instance.network_reply {
+                match instance.input.write(bytes) {
+                    Ok(n) if n == bytes.len() => {
+                        instance.network_reply = None;
+                        if let Some(network) = &mut instance.network {
+                            network.pending = false;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                    _ => {
+                        let _ = instance.child.kill();
+                    }
+                }
+            }
+        }
         let mut logs = Vec::new();
         let mut invalid = false;
         for _ in 0..16 {
@@ -287,6 +351,15 @@ impl ServiceRunner for HostedRunner {
                         }
                         match serde_json::from_slice::<Value>(&frame) {
                             Ok(value) if value["op"] == "ready" => instance.ready = true,
+                            Ok(value) if value["op"] == "network" => {
+                                if instance
+                                    .network
+                                    .as_mut()
+                                    .is_none_or(|network| network.submit(value).is_err())
+                                {
+                                    invalid = true;
+                                }
+                            }
                             Ok(value) if value["op"] == "log" => {
                                 if let Some(text) =
                                     value["message"].as_str().filter(|s| s.len() <= 1024)

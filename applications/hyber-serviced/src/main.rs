@@ -1,5 +1,6 @@
 mod daemon;
 mod worker;
+mod worker_network;
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let result = if args.first().is_some_and(|a| a == "--worker") && args.len() == 4 {

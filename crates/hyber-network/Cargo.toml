@@ -1,0 +1,11 @@
+[package]
+name = "hyber-network"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyber-core = { path = "../hyber-core" }
+hyber-handle = { path = "../hyber-handle" }
+hyber-manifest = { path = "../hyber-manifest" }
+hyber-object = { path = "../hyber-object" }
+hyber-service-contract = { path = "../hyber-service-contract" }
