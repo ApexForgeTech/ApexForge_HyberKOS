@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "kernel/foundation",
     "crates/hyber-core",
     "crates/hyber-object",
     "crates/hyber-namespace",

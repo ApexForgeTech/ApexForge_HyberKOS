@@ -371,6 +371,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyber-kernel-foundation"
+version = "0.1.0"
+
+[[package]]
 name = "hyber-layout"
 version = "0.1.0"
 dependencies = [

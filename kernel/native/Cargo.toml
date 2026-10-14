@@ -1,0 +1,22 @@
+[package]
+name = "hyber-kernel"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[workspace]
+
+[dependencies]
+hyber-kernel-foundation = { path = "../foundation" }
+
+[features]
+fault-test = []
+protection-test = []
+unmap-test = []
+nx-test = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

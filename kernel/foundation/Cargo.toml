@@ -1,0 +1,4 @@
+[package]
+name = "hyber-kernel-foundation"
+version = "0.1.0"
+edition = "2021"

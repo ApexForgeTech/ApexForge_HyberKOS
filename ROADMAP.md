@@ -4597,6 +4597,92 @@ to learn native networking details.
 
 # 22. Phase 21 — Native Kernel Preparation
 
+**Implemented: bounded x86_64 single-CPU native prototype.** See
+[`docs/kernel/phase21.md`](docs/kernel/phase21.md) for the reproducible build,
+host tests, eighteen QEMU boot/fault cases and explicit limitations. Hosted
+providers remain intact; native userland is not claimed by this milestone.
+
+## Implementation contract — x86_64 hosted-to-native boundary
+
+This phase delivers a bootable, single-CPU native kernel prototype, not a native
+port of the hosted shell, services, network stack, ObjectManager or HyberFS.
+The existing hosted workspace must keep building unchanged. Kernel mechanisms
+must not import Linux FDs/PIDs, `std`, Lua, Java, or hosted providers. Rust owns
+memory and scheduling policy; assembly owns the initial CPU transition,
+interrupt entry and register switching. C/C++ are optional, not requirements.
+
+### Preserve the Hyber provider architecture
+
+`std` is an implementation dependency, not the system architecture. Native
+migration preserves Path → Node → Object and Process → Handle → Object.
+x86_64 is the CPU mechanism layer, not a replacement filesystem/network
+provider. Phase 21 establishes the mechanisms that native providers will use.
+Later phases replace hosted clocks, allocation, locks and process/device
+adapters behind the existing contracts; they must not introduce a competing
+object or application model. Hosted libraries stay usable during this work.
+Lua/Go and later JVM/JS runtimes remain user-space consumers; C/C++ components
+may use explicit FFI where needed. Multiple languages do not imply multiple
+security authorities or require embedding their runtimes in the kernel.
+
+### Boot and CPU contract
+
+Use a GRUB Multiboot2 BIOS image for the initial QEMU x86_64 target. Validate
+the loader magic and bounded tagged memory map before allocating memory.
+Enter long mode with a known GDT, aligned stack and identity mapping; explicitly
+initialize SSE control bits required by the Rust target. Report failures on
+COM1. Bootloader/kernel/page tables/stacks/boot-information memory are reserved.
+No disk device on the developer's machine is formatted by the build tools.
+
+### Memory contract
+
+Use 4 KiB frame accounting with explicit available/reserved/allocated states,
+checked bounds and rejection of double frees. Only loader-declared usable RAM
+may enter the allocator; reserved entries take precedence. The first prototype
+deliberately manages RAM below 128 MiB and identity maps the first GiB. This is
+a bounded bring-up limit, not a claim that every physical address is RAM.
+
+Exercise a separate virtual test mapping with map/protect/unmap and TLB
+invalidation. Enable CR0.WP and EFER.NXE. Bootstrap huge-page mappings are a
+temporary supervisor-only identity window, not final W^X hardening or user
+isolation. Kernel heap allocations are bounded, aligned and reclaimable.
+Reject exhaustion, invalid alignment and duplicate frees in model tests.
+
+### Interrupt and scheduler contract
+
+Install a 256-entry IDT with normalized exception error-code frames, register
+preservation and fail-stop serial diagnostics. Remap/mask the legacy PIC and
+enable only PIT IRQ0 at approximately 100 Hz. Acknowledge IRQs; the timer handler
+must not allocate, acquire a blocking lock, perform filesystem I/O or run Lua.
+
+Start with two kernel execution contexts on separate stacks and a deterministic
+round-robin queue. Timer ticks drive cooperative scheduling at explicit safe
+points; save/restore ABI callee-saved registers and per-context x87/SSE state.
+Test distinct MXCSR modes across switches. This is not arbitrary-instruction
+preemption, SMP, user processes, syscalls or a production scheduler. Those require
+later process/address-space and interrupt-stack designs. Idle uses `hlt`, not
+busy spinning. Phase 22 consumes these mechanisms rather than hosted processes.
+
+### Build, tests and exit evidence
+
+Keep architecture-independent allocator/scheduler logic in a no_std workspace
+library with host unit tests. Keep the boot binary in an isolated bare-metal
+workspace with an explicit linker script and target. Ninja is the build/test
+entry point (`ninja kernel-check`); shell helpers create a
+new ISO only beneath ignored build outputs; QEMU uses TCG, serial output, no
+network and no attached user disks. The smoke runner must have a wall-clock
+timeout and require both a success marker and the expected debug-exit code.
+Test at 32, 64 and 128 MiB RAM with normal and optimized release images, plus
+invalid-opcode, read-only-write, unmapped-read and NX-execution fault images.
+These eighteen cases prove the failure handler as well as normal execution,
+not just a successful compiler invocation.
+
+Completion evidence must demonstrate boot, validated memory, frame reuse,
+heap reuse, page mapping/protection/removal, timer delivery and both scheduled
+contexts. Host tests, clean bare-metal build and QEMU tests are distinct gates.
+Document commands, platform limits and the migration boundary in
+`docs/kernel/phase21.md`. Never describe a serial boot banner as a working
+native shell/network/filesystem.
+
 ## Objective
 
 Only now begin serious kernel development.
@@ -4660,7 +4746,8 @@ stack
 early console
 ```
 
-These operations require the lowest-level hardware manipulation where Rust's memory safety model might be too restrictive.
+These operations require small audited unsafe/assembly boundaries; Rust remains
+the primary language for kernel mechanisms and policy.
 
 ---
 

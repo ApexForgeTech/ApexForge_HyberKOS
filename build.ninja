@@ -1,0 +1,46 @@
+# Run from the repository root: ninja kernel-check
+builddir = target/ninja
+pool kernel_build
+  depth = 1
+
+rule kernel_image
+  command = sh kernel/build.sh $mode
+  description = KERNEL ISO $mode
+  pool = kernel_build
+
+build kernel-sources: phony kernel/build.sh kernel/grub.cfg kernel/native/Cargo.toml kernel/native/Cargo.lock kernel/native/build.rs kernel/native/entry.asm kernel/native/link.ld kernel/native/src/main.rs kernel/native/src/paging.rs kernel/foundation/Cargo.toml kernel/foundation/src/lib.rs
+
+build target/kernel-normal/hyber.iso: kernel_image kernel-sources
+  mode = normal
+build target/kernel-fault/hyber.iso: kernel_image kernel-sources
+  mode = fault
+build target/kernel-protection/hyber.iso: kernel_image kernel-sources
+  mode = protection
+build target/kernel-unmap/hyber.iso: kernel_image kernel-sources
+  mode = unmap
+build target/kernel-nx/hyber.iso: kernel_image kernel-sources
+  mode = nx
+build target/kernel-release/hyber.iso: kernel_image kernel-sources
+  mode = release
+
+build kernel-images: phony target/kernel-normal/hyber.iso target/kernel-fault/hyber.iso target/kernel-protection/hyber.iso target/kernel-unmap/hyber.iso target/kernel-nx/hyber.iso target/kernel-release/hyber.iso
+
+rule qemu_tests
+  command = sh kernel/smoke.sh --no-build
+  description = QEMU kernel acceptance matrix
+  pool = console
+rule host_tests
+  command = cargo test
+  description = Rust workspace tests
+  pool = console
+rule lint
+  command = cargo fmt --all --check && cargo fmt --manifest-path kernel/native/Cargo.toml -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo clippy --manifest-path kernel/native/Cargo.toml --target x86_64-unknown-none -- -D warnings
+  description = Rust formatting and Clippy
+  pool = console
+
+build always: phony
+build kernel-qemu: qemu_tests always | kernel-images
+build kernel-host-tests: host_tests always
+build kernel-lint: lint always
+build kernel-check: phony kernel-qemu kernel-host-tests kernel-lint
+default target/kernel-normal/hyber.iso
