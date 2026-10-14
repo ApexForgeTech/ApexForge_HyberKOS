@@ -182,6 +182,70 @@ fn service_network_policy_denies_undeclared_destination() {
     );
     assert_eq!(runner.live_count(), 0);
 }
+#[test]
+fn service_resolver_denies_undeclared_destination() {
+    let source = b"hyber.network.resolve('denied.test'); hyber.service.ready()".to_vec();
+    let (mut runner, mut definition, grant, session) = fixture(Runtime::Lua, source);
+    let grant = approve_network(&mut definition, grant);
+    let pid = runner
+        .start(&definition, &context(&session), &grant, &session)
+        .unwrap();
+    await_observation(
+        &mut runner,
+        &definition,
+        pid,
+        |o| matches!(o, ProcessObservation::Exited(code) if code != 0),
+    );
+    assert_eq!(runner.live_count(), 0);
+}
+
+#[test]
+fn service_socket_inspection_exposes_only_logical_metadata() {
+    let source = b"local s=hyber.network.connect('localhost', 9, 'udp'); local i=s:inspect(); assert(i.object_id>0 and i.owner>0); assert(i.protocol=='udp' and i.state=='Connected'); assert(i.host=='localhost' and i.port==9); assert(i.bytes_sent==0 and i.bytes_received==0); assert(i.fd==nil and i.address==nil); s:close(); hyber.service.ready(); while hyber.service.wait(10) do end".to_vec();
+    let (mut runner, mut definition, grant, session) = fixture(Runtime::Lua, source);
+    let grant = approve_network(&mut definition, grant);
+    let pid = runner
+        .start(&definition, &context(&session), &grant, &session)
+        .unwrap();
+    await_observation(&mut runner, &definition, pid, |o| {
+        o == ProcessObservation::Ready
+    });
+    runner.request_stop(&definition.service_id, pid).unwrap();
+    await_observation(&mut runner, &definition, pid, |o| {
+        o == ProcessObservation::Exited(0)
+    });
+    assert_eq!(runner.live_count(), 0);
+}
+
+#[test]
+fn service_cancel_and_supervisor_diagnostics_share_logical_state() {
+    let source = b"local s=hyber.network.connect('localhost',9,'udp'); assert(s:wait('writable',0)); s:cancel(); s:cancel(); assert(s:inspect().state=='Closed'); hyber.service.ready(); while hyber.service.wait(10) do end; s:close()".to_vec();
+    let (mut runner, mut definition, grant, session) = fixture(Runtime::Lua, source);
+    let grant = approve_network(&mut definition, grant);
+    let pid = runner
+        .start(&definition, &context(&session), &grant, &session)
+        .unwrap();
+    await_observation(&mut runner, &definition, pid, |o| {
+        o == ProcessObservation::Ready
+    });
+    assert!(runner.network_diagnostics(&session).is_err());
+    let password = b"diagnostic authority test password";
+    let mut auth = AuthService::provision(password, Arc::new(SystemClock)).unwrap();
+    let token = auth
+        .login("root", password, SessionKind::Interactive, 600)
+        .unwrap();
+    let admin = SessionGuard::new(Arc::new(Mutex::new(auth)), token).unwrap();
+    let records = runner.network_diagnostics(&admin).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0, definition.service_id);
+    assert_eq!(records[0].1, pid);
+    assert_eq!(records[0].3.state, hyber_network::SocketState::Closed);
+    runner.request_stop(&definition.service_id, pid).unwrap();
+    await_observation(&mut runner, &definition, pid, |o| {
+        matches!(o, ProcessObservation::Exited(_))
+    });
+    assert!(runner.network_diagnostics(&admin).unwrap().is_empty());
+}
 fn await_observation(
     runner: &mut HostedRunner,
     definition: &ServiceDefinition,
@@ -254,7 +318,7 @@ fn real_lua_network_is_brokered_without_host_socket_access() {
         assert_eq!(&bytes, b"ping");
         stream.write_all(b"pong").unwrap();
     });
-    let source = format!("assert(io == nil and os == nil); local s=hyber.network.connect('localhost', {port}, 'tcp'); assert(type(s)=='userdata'); assert(s:write('ping')==4); local reply=''; while #reply<4 do reply=reply .. s:read(4-#reply) end; assert(reply=='pong'); s:close(); s:close(); hyber.service.ready(); while hyber.service.wait(10) do end");
+    let source = format!("assert(io == nil and os == nil); local dns=hyber.network.resolve('localhost'); assert(dns.host=='localhost' and dns.answers>0 and dns.answers<=16 and dns.cache_seconds<=30); assert(hyber.network.resolve('localhost').cached); local s=hyber.network.connect('localhost', {port}, 'tcp'); assert(type(s)=='userdata'); assert(s:write('ping')==4); local reply=''; while #reply<4 do reply=reply .. s:read(4-#reply) end; assert(reply=='pong'); s:close(); s:close(); hyber.service.ready(); while hyber.service.wait(10) do end");
     let (mut runner, mut definition, grant, session) = fixture(Runtime::Lua, source.into_bytes());
     let mut manifest = grant.manifest.clone();
     manifest

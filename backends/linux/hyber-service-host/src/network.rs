@@ -11,7 +11,7 @@ use hyber_service_contract::ServiceDefinition;
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    mpsc, Arc,
+    mpsc, Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -27,6 +27,7 @@ pub(crate) struct Broker {
     response: mpsc::Receiver<Value>,
     cancelled: Arc<AtomicBool>,
     pub pending: bool,
+    snapshot: Arc<Mutex<Vec<(ProcessId, HandleId, hyber_network::SocketInfo)>>>,
 }
 impl Broker {
     pub fn new(
@@ -46,6 +47,8 @@ impl Broker {
         let (reply, response) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let stopping = cancelled.clone();
+        let snapshot = Arc::new(Mutex::new(Vec::new()));
+        let published = snapshot.clone();
         std::thread::Builder::new().name("hyber-service-network".into()).spawn(move || {
             let _permit = permit;
             let mut network = NetworkManager::new(HostedNetworkProvider::with_timeout(Duration::from_secs(2)));
@@ -63,6 +66,12 @@ impl Broker {
                     definition.validate_against(&grant).map_err(|_| "network policy mismatch")?;
                     let handle = HandleId(value["handle"].as_u64().unwrap_or(0));
                     match value["action"].as_str() {
+                        Some("resolve") => {
+                            let host = value["host"].as_str().ok_or("invalid host")?;
+                            authorize_service_outbound(&context, &grant, &definition, host).map_err(|e| e.to_string())?;
+                            let result = network.resolve(&context, &grant, host).map_err(|e| e.to_string())?;
+                            Ok(json!({"host":result.host.as_str(), "answers":result.answers, "cached":result.cached, "cache_seconds":result.cache_seconds}))
+                        },
                         Some("connect") => {
                             let host = value["host"].as_str().ok_or("invalid host")?;
                             let port = value["port"].as_u64().and_then(|p| u16::try_from(p).ok()).ok_or("invalid port")?;
@@ -70,6 +79,23 @@ impl Broker {
                             let protocol = match value["protocol"].as_str() { Some("tcp") => Protocol::Tcp, Some("udp") => Protocol::Udp, _ => return Err("invalid protocol".into()) };
                             let handle = network.connect(&mut objects, &mut handles, process, &context, &grant, protocol, host, port).map_err(|e| e.to_string())?;
                             Ok(json!({"handle":handle.0}))
+                        },
+                        Some("cancel") => {
+                            let access = NetworkAccess { objects: &objects, handles: &handles, process, context: &context, grant: &grant };
+                            network.cancel(&access, handle).map_err(|e| e.to_string())?;
+                            Ok(json!({}))
+                        },
+                        Some("wait") => {
+                            let timeout = value["timeout_ms"].as_u64().filter(|n| *n <= 2000).ok_or("wait exceeds 2000 milliseconds")?;
+                            let interest = match value["interest"].as_str() { Some("readable") => hyber_network::WaitInterest::Readable, Some("writable") => hyber_network::WaitInterest::Writable, _ => return Err("invalid wait interest".into()) };
+                            let access = NetworkAccess { objects: &objects, handles: &handles, process, context: &context, grant: &grant };
+                            let ready = network.wait(&access, handle, interest, timeout as u32).map_err(|e| e.to_string())?;
+                            Ok(json!({"ready":ready}))
+                        },
+                        Some("inspect") => {
+                            let access = NetworkAccess { objects: &objects, handles: &handles, process, context: &context, grant: &grant };
+                            let info = network.inspect(&access, handle).map_err(|e| e.to_string())?;
+                            Ok(json!({"object_id":info.object_id.0, "owner":info.owner.0, "protocol":match info.protocol { Protocol::Tcp => "tcp", Protocol::Udp => "udp" }, "state":format!("{:?}",info.state), "host":info.peer.host.as_str(), "port":info.peer.port, "provider":info.provider, "bytes_sent":info.bytes_sent, "bytes_received":info.bytes_received}))
                         },
                         Some("write") => {
                             let bytes = value["data"].as_array().filter(|a| a.len() <= 512).ok_or("payload exceeds 512 bytes")?;
@@ -92,18 +118,31 @@ impl Broker {
                         _ => Err("unsupported network operation".into()),
                     }
                 })();
+                if let Ok(mut snapshot) = published.lock() {
+                    *snapshot = network.diagnostics(&SecurityContext::root()).unwrap_or_default();
+                }
                 if stopping.load(Ordering::Acquire) || session.context().is_err() { break; }
                 let value = match result { Ok(data) => json!({"op":"network-result","id":id,"ok":true,"result":data}), Err(error) => json!({"op":"network-result","id":id,"ok":false,"error":error}) };
                 if reply.try_send(value).is_err() { break; }
             }
             let _ = network.shutdown(&mut objects, &mut handles);
+            if let Ok(mut snapshot) = published.lock() { snapshot.clear(); }
         }).map_err(|_| "cannot start network broker")?;
         Ok(Self {
             request: tx,
             response,
             cancelled,
             pending: false,
+            snapshot,
         })
+    }
+    pub fn diagnostics(
+        &self,
+    ) -> Result<Vec<(ProcessId, HandleId, hyber_network::SocketInfo)>, String> {
+        self.snapshot
+            .lock()
+            .map(|s| s.clone())
+            .map_err(|_| "network diagnostics unavailable".into())
     }
     pub fn submit(&mut self, value: Value) -> Result<(), ()> {
         if self.pending || value["id"].as_u64().is_none_or(|id| id == 0) {

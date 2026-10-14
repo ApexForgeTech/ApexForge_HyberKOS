@@ -642,6 +642,73 @@ impl mlua::UserData for LuaNetworkSocket {
                 Ok(LuaValue::String(lua.create_string(&data)?))
             }
         });
+        methods.add_method("cancel", |_, this, ()| {
+            if this.closed {
+                return Err(lua_err("network socket is closed".into()));
+            }
+            let shared = this
+                .state
+                .upgrade()
+                .ok_or_else(|| lua_err("network runtime ended".into()))?;
+            let mut ks = lock(&shared)?;
+            let grant = authorize_network(&ks)?.clone();
+            let context = ks.security_context.clone();
+            let process = ks.process_id;
+            let KernelState {
+                network,
+                obj_mgr,
+                handle_mgr,
+                ..
+            } = &mut *ks;
+            let access = NetworkAccess {
+                objects: obj_mgr,
+                handles: handle_mgr,
+                process,
+                context: &context,
+                grant: &grant,
+            };
+            network
+                .cancel(&access, this.handle)
+                .map_err(|e| lua_err(e.to_string()))?;
+            authorize_network(&ks)?;
+            Ok(())
+        });
+        methods.add_method("wait", |_, this, (interest, timeout_ms): (String, u32)| {
+            if this.closed {
+                return Err(lua_err("network socket is closed".into()));
+            }
+            let interest = match interest.as_str() {
+                "readable" => hyber_network::WaitInterest::Readable,
+                "writable" => hyber_network::WaitInterest::Writable,
+                _ => return Err(lua_err("invalid wait interest".into())),
+            };
+            let shared = this
+                .state
+                .upgrade()
+                .ok_or_else(|| lua_err("network runtime ended".into()))?;
+            let mut ks = lock(&shared)?;
+            let grant = authorize_network(&ks)?.clone();
+            let context = ks.security_context.clone();
+            let process = ks.process_id;
+            let KernelState {
+                network,
+                obj_mgr,
+                handle_mgr,
+                ..
+            } = &mut *ks;
+            let access = NetworkAccess {
+                objects: obj_mgr,
+                handles: handle_mgr,
+                process,
+                context: &context,
+                grant: &grant,
+            };
+            let ready = network
+                .wait(&access, this.handle, interest, timeout_ms)
+                .map_err(|e| lua_err(e.to_string()))?;
+            authorize_network(&ks)?;
+            Ok(ready)
+        });
         methods.add_method("inspect", |lua, this, ()| {
             if this.closed {
                 return Err(lua_err("network socket is closed".into()));

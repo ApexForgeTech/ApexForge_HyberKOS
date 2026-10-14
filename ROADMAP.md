@@ -4311,16 +4311,23 @@ RPC remain explicitly out of scope.
 
 ### Hosted implementation status
 
+**Hosted outbound v1 implementation complete.** This label applies to the
+bounded TCP/UDP client scope below, not native networking, production security
+qualification, inbound servers or the deferred public ABI.
+
 The implementation and tested limits are documented in
 [`docs/design/networking.md`](docs/design/networking.md). Outbound TCP/UDP,
 grant-bound handles, opaque Lua sockets, bounded resolution, synthetic
 interface Objects and sandboxed service network brokering are implemented.
-The detailed design below also includes acceptance targets: it must not be
-read as proof that every target is already available. In particular, network
-wait/signal readiness, cross-broker diagnostics and a public cross-language
-API are not implemented. Resolver cache expiry is a local 30-second maximum,
+The v1 signal is endpoint cancellation (SIGNAL + WRITE), not process signalling
+or TCP half-close. Authenticated administrator diagnostics aggregate logical
+snapshots across live service brokers, qualified by service/process identity.
+A public cross-language ABI remains deferred, rather than a Phase 20 deliverable.
+Resolver cache expiry is a local 30-second maximum,
 not authoritative DNS TTL. Lua close is idempotent; raw reclaimed handles are
 rejected. Ordinary shell Lua does not acquire an implicit networking grant.
+Bounded readable/writable readiness now uses WAIT plus the appropriate I/O
+right, through the provider and both Lua consumers.
 
 ## Objective
 

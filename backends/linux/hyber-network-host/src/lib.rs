@@ -116,6 +116,41 @@ impl HostedNetworkProvider {
     }
 }
 impl NetworkProvider for HostedNetworkProvider {
+    fn wait(
+        &mut self,
+        id: ProviderSocketId,
+        interest: hyber_network::WaitInterest,
+        timeout_ms: u32,
+    ) -> Result<bool, ProviderError> {
+        use std::os::fd::AsRawFd;
+        if timeout_ms > 30_000 {
+            return Err(ProviderError::Io);
+        }
+        let socket = self.sockets.get(&id).ok_or(ProviderError::Closed)?;
+        let fd = match socket {
+            HostSocket::Tcp(s) => s.as_raw_fd(),
+            HostSocket::Udp(s) => s.as_raw_fd(),
+        };
+        let events = match interest {
+            hyber_network::WaitInterest::Readable => libc::POLLIN,
+            hyber_network::WaitInterest::Writable => libc::POLLOUT,
+        };
+        let mut descriptor = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // The socket remains borrowed and alive for the entire synchronous poll.
+        // The pointer addresses exactly one initialized pollfd.
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms as i32) };
+        if result < 0 {
+            return Err(Self::map(&std::io::Error::last_os_error()));
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(ProviderError::Closed);
+        }
+        Ok(result > 0 && descriptor.revents & (events | libc::POLLERR | libc::POLLHUP) != 0)
+    }
     fn resolve(&mut self, host: &HostName) -> Result<ResolutionInfo, ProviderError> {
         let (answers, cached) = self.addresses(host)?;
         let cache_seconds = self
@@ -262,6 +297,26 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn readiness_is_bounded_and_rejects_closed_tokens() {
+        use hyber_network::WaitInterest;
+        let mut provider = HostedNetworkProvider::default();
+        let token = provider
+            .connect(Protocol::Udp, &Endpoint::new("localhost", 9).unwrap())
+            .unwrap();
+        assert!(provider.wait(token, WaitInterest::Writable, 0).unwrap());
+        assert!(!provider.wait(token, WaitInterest::Readable, 1).unwrap());
+        assert_eq!(
+            provider.wait(token, WaitInterest::Readable, 30_001),
+            Err(ProviderError::Io)
+        );
+        provider.close(token).unwrap();
+        assert_eq!(
+            provider.wait(token, WaitInterest::Readable, 0),
+            Err(ProviderError::Closed)
+        );
+    }
 
     #[test]
     fn loopback_tcp_is_private_behind_provider_token() {

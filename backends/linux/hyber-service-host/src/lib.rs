@@ -74,6 +74,38 @@ impl HostedRunner {
     pub fn live_count(&self) -> usize {
         self.live.len()
     }
+    /// Nonblocking-I/O snapshot of all live service brokers. Object IDs are
+    /// broker-local; always retain service and process qualifiers.
+    pub fn network_diagnostics(
+        &self,
+        authority: &SessionGuard,
+    ) -> Result<
+        Vec<(
+            ServiceId,
+            ProcessId,
+            hyber_core::HandleId,
+            hyber_network::SocketInfo,
+        )>,
+        String,
+    > {
+        let context = authority
+            .context()
+            .map_err(|_| "invalid diagnostic session")?;
+        hyber_core::SecurityManager::check_capability(&context, "CAP_SYS_ADMIN")
+            .map_err(|_| "network diagnostics denied")?;
+        let mut result = Vec::new();
+        for instance in self.live.values() {
+            if let Some(broker) = &instance.network {
+                for (process, handle, info) in broker.diagnostics()? {
+                    result.push((instance.service.clone(), process, handle, info));
+                }
+            }
+        }
+        authority
+            .context()
+            .map_err(|_| "diagnostic session revoked")?;
+        Ok(result)
+    }
     fn instance(&mut self, id: &ServiceId, process: ProcessId) -> Result<&mut Instance, String> {
         self.live
             .get_mut(&process)

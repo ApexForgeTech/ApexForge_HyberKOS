@@ -57,7 +57,7 @@ Generic Lua execution defaults to an unavailable transport. A trusted
 composition root explicitly injects a provider with an approved application
 grant using `run_lua_script_with_application_network`. Merely requesting a
 capability in a manifest or running inline shell Lua does not grant networking.
-Sockets are opaque userdata; this runtime offers connect, read, write, inspect,
+Sockets are opaque userdata; this runtime offers connect, read, write, wait, inspect,
 close and resolution diagnostics. Invocation completion or error closes its
 sockets; separate shell Lua invocations do not share a VM or socket state.
 
@@ -67,10 +67,11 @@ grant and service session. Its ObjectManager and HandleManager are scoped to
 that broker and are not the shell's object registry. Each service has one
 request in flight, bounded channels and at most 512 payload bytes per request.
 The existing service IPC frame limit must be at least 4096 bytes. The worker
-Lua binding supplies connect/read/write/close, with binary data support.
+Lua binding supplies connect/read/write/wait/inspect/close and policy-checked resolution
+diagnostics, with binary data support.
 
 The private JSON transport uses `op=network`, a nonzero correlation `id`, and
-an `action` of connect/write/read/close. Responses use `op=network-result`, the
+an `action` of connect/write/read/wait/inspect/close/resolve. Responses use `op=network-result`, the
 same id, `ok`, and either `result` or a redacted `error`. This is a provisional
 hosted service protocol, not a public ABI. Optional Go payloads must use the
 same broker protocol and sandbox; they receive no native socket authority.
@@ -82,6 +83,19 @@ bounded current operation returns. Service exit closes all its sockets, even
 when Lua throws or omits close. Caller shell lifetime does not own the service.
 
 ## Verification and remaining boundaries
+
+Hosted outbound v1 acceptance maps to the following executable coverage:
+
+| Requirement | Coverage |
+| --- | --- |
+| Grant, identity, rights, quotas, lifecycle | `hyber-network` unit tests |
+| TCP/UDP, resolver cache, readiness and datagram bounds | `hyber-network-host` loopback tests |
+| Opaque application sockets and error cleanup | `hyber-lua` injected-provider tests |
+| Service policy, cancellation, metadata, administrator diagnostics | `hyber-serviced/tests/hosted.rs` |
+| Service independence and authenticated activation | `hyber-serviced/tests/daemon.rs` |
+
+Completion is for this hosted v1 scope. It is not a guarantee of absence of
+defects, a frozen ABI, DNS security or native-device qualification.
 
 Tests cover grant tampering, permission changes, wrong/copied handles, capacity,
 retryable failures, cleanup after raw handle close, interface identity, resolver
@@ -95,6 +109,24 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+`socket:wait("readable" | "writable", timeout_ms)` provides advisory readiness.
+It requires WAIT and the corresponding READ/WRITE right and rechecks authority.
+Zero timeout is a poll; the core limit is 30000 ms and service limit is 2000 ms.
+Readiness includes EOF/error notification, not a promise that I/O succeeds.
+Host descriptors remain private to the polling provider.
+
+`socket:cancel()` is the v1 network signal: it requires SIGNAL and WRITE,
+closes the endpoint transport and leaves the handle inspectable until close.
+Repeated cancellation is harmless; close after cancellation does not close the
+transport twice. This is not TCP half-close or arbitrary process signalling.
+
+`HostedRunner::network_diagnostics` takes a current administrator SessionGuard
+and aggregates all live broker snapshots without waiting on transport I/O.
+Each record retains service, process, handle and ObjectId qualifiers because
+ObjectIds are broker-local. Snapshots reflect the last completed request, not
+live intermediate I/O state; they disappear when the service is reaped.
+The snapshot contains logical metadata only and is not an authority token.
+
 Inbound sockets remain unsupported. Native drivers/protocol stacks are Phase
-27. Wait/signal readiness APIs, cross-broker socket inspection and public
-cross-language networking bindings are not implemented by this hosted layer.
+27. Public cross-language ABI/bindings belong to the deferred API phase; Go is
+optional and the hosted JSON broker protocol is not a frozen Go SDK.

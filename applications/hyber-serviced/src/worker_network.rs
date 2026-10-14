@@ -65,6 +65,49 @@ struct Socket {
 }
 impl UserData for Socket {
     fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
+        methods.add_method("cancel", |_, this, ()| {
+            if this.closed {
+                return Err(mlua::Error::external("closed socket"));
+            }
+            this.client
+                .borrow_mut()
+                .call(json!({"action":"cancel","handle":this.handle}))?;
+            Ok(())
+        });
+        methods.add_method("wait", |_, this, (interest, timeout_ms): (String, u32)| {
+            if this.closed || timeout_ms > 2000 || !matches!(interest.as_str(), "readable" | "writable") {
+                return Err(mlua::Error::external("closed socket or invalid wait request"));
+            }
+            let result = this.client.borrow_mut().call(json!({"action":"wait","handle":this.handle,"interest":interest,"timeout_ms":timeout_ms}))?;
+            result["ready"].as_bool().ok_or_else(|| mlua::Error::external("invalid wait response"))
+        });
+        methods.add_method("inspect", |lua, this, ()| {
+            if this.closed {
+                return Err(mlua::Error::external("closed socket"));
+            }
+            let result = this
+                .client
+                .borrow_mut()
+                .call(json!({"action":"inspect","handle":this.handle}))?;
+            let info = lua.create_table()?;
+            for key in ["protocol", "state", "host", "provider"] {
+                info.set(
+                    key,
+                    result[key]
+                        .as_str()
+                        .ok_or_else(|| mlua::Error::external("invalid inspection response"))?,
+                )?;
+            }
+            for key in ["object_id", "owner", "port", "bytes_sent", "bytes_received"] {
+                info.set(
+                    key,
+                    result[key]
+                        .as_u64()
+                        .ok_or_else(|| mlua::Error::external("invalid inspection response"))?,
+                )?;
+            }
+            Ok(info)
+        });
         methods.add_method("write", |_, this, data: mlua::String| {
             if this.closed || data.as_bytes().len() > 512 {
                 return Err(mlua::Error::external(
@@ -126,6 +169,44 @@ pub fn table(
         next: 1,
     }));
     let table = lua.create_table()?;
+    let resolver = client.clone();
+    table.set(
+        "resolve",
+        lua.create_function(move |lua, host: String| {
+            if host.len() > 253 {
+                return Err(mlua::Error::external("hostname too long"));
+            }
+            let result = resolver
+                .borrow_mut()
+                .call(json!({"action":"resolve","host":host}))?;
+            let info = lua.create_table()?;
+            info.set(
+                "host",
+                result["host"]
+                    .as_str()
+                    .ok_or_else(|| mlua::Error::external("invalid resolver response"))?,
+            )?;
+            info.set(
+                "answers",
+                result["answers"]
+                    .as_u64()
+                    .ok_or_else(|| mlua::Error::external("invalid resolver response"))?,
+            )?;
+            info.set(
+                "cached",
+                result["cached"]
+                    .as_bool()
+                    .ok_or_else(|| mlua::Error::external("invalid resolver response"))?,
+            )?;
+            info.set(
+                "cache_seconds",
+                result["cache_seconds"]
+                    .as_u64()
+                    .ok_or_else(|| mlua::Error::external("invalid resolver response"))?,
+            )?;
+            Ok(info)
+        })?,
+    )?;
     table.set(
         "connect",
         lua.create_function(

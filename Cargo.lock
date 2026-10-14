@@ -442,6 +442,7 @@ name = "hyber-network-host"
 version = "0.1.0"
 dependencies = [
  "hyber-network",
+ "libc",
 ]
 
 [[package]]
@@ -555,6 +556,7 @@ dependencies = [
  "hyber-fs",
  "hyber-identity",
  "hyber-manifest",
+ "hyber-network",
  "hyber-package",
  "hyber-package-format",
  "hyber-service",

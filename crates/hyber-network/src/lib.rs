@@ -28,6 +28,12 @@ pub enum Protocol {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitInterest {
+    Readable,
+    Writable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketState {
     Created,
     Connecting,
@@ -144,6 +150,14 @@ pub enum ProviderError {
 
 /// Provider token is opaque and logical; it is never a host descriptor.
 pub trait NetworkProvider {
+    fn wait(
+        &mut self,
+        _socket: ProviderSocketId,
+        _interest: WaitInterest,
+        _timeout_ms: u32,
+    ) -> Result<bool, ProviderError> {
+        Err(ProviderError::Unsupported)
+    }
     fn resolve(&mut self, _host: &HostName) -> Result<ResolutionInfo, ProviderError> {
         Err(ProviderError::Unsupported)
     }
@@ -160,6 +174,14 @@ pub trait NetworkProvider {
 }
 
 impl<T: NetworkProvider + ?Sized> NetworkProvider for Box<T> {
+    fn wait(
+        &mut self,
+        socket: ProviderSocketId,
+        interest: WaitInterest,
+        timeout_ms: u32,
+    ) -> Result<bool, ProviderError> {
+        (**self).wait(socket, interest, timeout_ms)
+    }
     fn resolve(&mut self, host: &HostName) -> Result<ResolutionInfo, ProviderError> {
         (**self).resolve(host)
     }
@@ -494,6 +516,8 @@ impl<P: NetworkProvider> NetworkManager<P> {
             read: true,
             write: true,
             connect: true,
+            wait: true,
+            signal: true,
             ..Rights::empty()
         };
         let handle = match handles.open_with_flags(
@@ -579,6 +603,89 @@ impl<P: NetworkProvider> NetworkManager<P> {
         )
         .map_err(|_| NetworkError::AccessDenied)?;
         Ok(object)
+    }
+
+    /// Advisory readiness, not a reservation: subsequent I/O may still time out.
+    /// A zero timeout polls once; waits are capped at 30 seconds.
+    pub fn wait(
+        &mut self,
+        access: &NetworkAccess<'_>,
+        handle: HandleId,
+        interest: WaitInterest,
+        timeout_ms: u32,
+    ) -> Result<bool, NetworkError> {
+        let object = self.authorized_object(access, handle, interest == WaitInterest::Writable)?;
+        if !access
+            .handles
+            .get_handle(access.process, handle)
+            .ok_or(NetworkError::InvalidHandle)?
+            .rights
+            .wait
+        {
+            return Err(NetworkError::AccessDenied);
+        }
+        if timeout_ms > 30_000 {
+            return Err(NetworkError::TooLarge);
+        }
+        let record = self
+            .sockets
+            .get(&object)
+            .ok_or(NetworkError::InvalidHandle)?;
+        if record.info.state != SocketState::Connected {
+            return Err(NetworkError::InvalidState);
+        }
+        self.provider
+            .wait(record.provider_socket, interest, timeout_ms)
+            .map_err(Into::into)
+    }
+
+    /// Cancel this endpoint's transport. The handle remains inspectable until
+    /// close; cancellation is not process signalling or TCP half-close.
+    pub fn cancel(
+        &mut self,
+        access: &NetworkAccess<'_>,
+        handle: HandleId,
+    ) -> Result<(), NetworkError> {
+        let object = self.authorized_object(access, handle, true)?;
+        if !access
+            .handles
+            .get_handle(access.process, handle)
+            .ok_or(NetworkError::InvalidHandle)?
+            .rights
+            .signal
+        {
+            return Err(NetworkError::AccessDenied);
+        }
+        let record = self
+            .sockets
+            .get_mut(&object)
+            .ok_or(NetworkError::InvalidHandle)?;
+        if record.info.state == SocketState::Closed {
+            return Ok(());
+        }
+        record.info.state = SocketState::Closing;
+        match self.provider.close(record.provider_socket) {
+            Ok(()) | Err(ProviderError::Closed) => {
+                record.info.state = SocketState::Closed;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Trusted supervisor diagnostics. Records are logical, bounded by the
+    /// manager socket cap, and must be qualified by process/broker identity.
+    pub fn diagnostics(
+        &self,
+        context: &SecurityContext,
+    ) -> Result<Vec<(ProcessId, HandleId, SocketInfo)>, NetworkError> {
+        SecurityManager::check_capability(context, "CAP_SYS_ADMIN")
+            .map_err(|_| NetworkError::AccessDenied)?;
+        Ok(self
+            .sockets
+            .values()
+            .map(|r| (r.process, r.handle, r.info.clone()))
+            .collect())
     }
 
     pub fn send(
@@ -677,10 +784,12 @@ impl<P: NetworkProvider> NetworkManager<P> {
             .sockets
             .get_mut(&object)
             .ok_or(NetworkError::InvalidHandle)?;
-        record.info.state = SocketState::Closing;
-        match self.provider.close(record.provider_socket) {
-            Ok(()) | Err(ProviderError::Closed) => (),
-            Err(e) => return Err(e.into()), // retain state for retry; never lose a live provider resource
+        if record.info.state != SocketState::Closed {
+            record.info.state = SocketState::Closing;
+            match self.provider.close(record.provider_socket) {
+                Ok(()) | Err(ProviderError::Closed) => (),
+                Err(e) => return Err(e.into()), // retain state for retry; never lose a live provider resource
+            }
         }
         self.sockets.remove(&object);
         if let Some(entry) = handles.get_handle(process, handle) {
@@ -833,6 +942,7 @@ mod tests {
         closed: usize,
         send_error: Option<ProviderError>,
         close_error: Option<ProviderError>,
+        connect_error: Option<ProviderError>,
     }
     impl NetworkProvider for Fake {
         fn interfaces(&mut self) -> Result<Vec<InterfaceInfo>, ProviderError> {
@@ -848,6 +958,9 @@ mod tests {
             _: &Endpoint,
         ) -> Result<ProviderSocketId, ProviderError> {
             self.calls += 1;
+            if let Some(error) = self.connect_error.take() {
+                return Err(error);
+            }
             self.next += 1;
             Ok(ProviderSocketId(self.next))
         }
@@ -928,6 +1041,185 @@ mod tests {
             NetworkError::DeniedByPolicy
         );
         assert_eq!(n.provider_mut().calls, 0);
+    }
+    #[test]
+    fn refused_connect_and_invalid_port_leave_no_handle_or_socket() {
+        let mut network = NetworkManager::new(Fake {
+            connect_error: Some(ProviderError::Refused),
+            ..Fake::default()
+        });
+        let mut objects = ObjectManager::new();
+        let mut handles = HandleManager::new();
+        let context = SecurityContext::root();
+        let grant = grant();
+        assert_eq!(
+            network.connect(
+                &mut objects,
+                &mut handles,
+                ProcessId(1),
+                &context,
+                &grant,
+                Protocol::Tcp,
+                "example.test",
+                0
+            ),
+            Err(NetworkError::InvalidDestination)
+        );
+        assert_eq!(network.provider_mut().calls, 0);
+        assert_eq!(
+            network.connect(
+                &mut objects,
+                &mut handles,
+                ProcessId(1),
+                &context,
+                &grant,
+                Protocol::Tcp,
+                "example.test",
+                80
+            ),
+            Err(NetworkError::Refused)
+        );
+        assert!(handles.list_handles(ProcessId(1)).is_empty());
+        assert!(network.diagnostics(&context).unwrap().is_empty());
+        assert!(objects.lookup(ObjectId(1)).is_none());
+    }
+    #[test]
+    fn wait_checks_bounds_and_closed_handles_before_provider() {
+        let mut network = NetworkManager::new(Fake::default());
+        let mut objects = ObjectManager::new();
+        let mut handles = HandleManager::new();
+        let context = SecurityContext::root();
+        let grant = grant();
+        let process = ProcessId(1);
+        let handle = network
+            .connect(
+                &mut objects,
+                &mut handles,
+                process,
+                &context,
+                &grant,
+                Protocol::Tcp,
+                "example.test",
+                80,
+            )
+            .unwrap();
+        let access = NetworkAccess {
+            objects: &objects,
+            handles: &handles,
+            process,
+            context: &context,
+            grant: &grant,
+        };
+        assert_eq!(
+            network.wait(&access, handle, WaitInterest::Readable, 30_001),
+            Err(NetworkError::TooLarge)
+        );
+        assert_eq!(
+            network.wait(&access, handle, WaitInterest::Readable, 0),
+            Err(NetworkError::Unsupported)
+        );
+        network
+            .close(&mut objects, &mut handles, process, handle)
+            .unwrap();
+        let access = NetworkAccess {
+            objects: &objects,
+            handles: &handles,
+            process,
+            context: &context,
+            grant: &grant,
+        };
+        assert_eq!(
+            network.wait(&access, handle, WaitInterest::Readable, 0),
+            Err(NetworkError::InvalidHandle)
+        );
+    }
+    #[test]
+    fn cancellation_is_idempotent_and_cleanup_closes_transport_once() {
+        let mut network = NetworkManager::new(Fake::default());
+        let mut objects = ObjectManager::new();
+        let mut handles = HandleManager::new();
+        let context = SecurityContext::root();
+        let grant = grant();
+        let process = ProcessId(1);
+        let handle = network
+            .connect(
+                &mut objects,
+                &mut handles,
+                process,
+                &context,
+                &grant,
+                Protocol::Tcp,
+                "example.test",
+                80,
+            )
+            .unwrap();
+        let access = NetworkAccess {
+            objects: &objects,
+            handles: &handles,
+            process,
+            context: &context,
+            grant: &grant,
+        };
+        assert_eq!(
+            network.wait(&access, handle, WaitInterest::Writable, 0),
+            Err(NetworkError::Unsupported)
+        );
+        handles
+            .get_handle_mut(process, handle)
+            .unwrap()
+            .rights
+            .signal = false;
+        handles.get_handle_mut(process, handle).unwrap().rights.wait = false;
+        let access = NetworkAccess {
+            objects: &objects,
+            handles: &handles,
+            process,
+            context: &context,
+            grant: &grant,
+        };
+        assert_eq!(
+            network.cancel(&access, handle),
+            Err(NetworkError::AccessDenied)
+        );
+        assert_eq!(
+            network.wait(&access, handle, WaitInterest::Writable, 0),
+            Err(NetworkError::AccessDenied)
+        );
+        handles
+            .get_handle_mut(process, handle)
+            .unwrap()
+            .rights
+            .signal = true;
+        let access = NetworkAccess {
+            objects: &objects,
+            handles: &handles,
+            process,
+            context: &context,
+            grant: &grant,
+        };
+        network.cancel(&access, handle).unwrap();
+        network.cancel(&access, handle).unwrap();
+        assert_eq!(
+            network.inspect(&access, handle).unwrap().state,
+            SocketState::Closed
+        );
+        assert_eq!(
+            network.send(&access, handle, b"x"),
+            Err(NetworkError::InvalidState)
+        );
+        let mut unprivileged = context.clone();
+        unprivileged.user_id = UserId(7);
+        unprivileged.capabilities.clear();
+        assert_eq!(
+            network.diagnostics(&unprivileged),
+            Err(NetworkError::AccessDenied)
+        );
+        assert_eq!(network.diagnostics(&context).unwrap().len(), 1);
+        network
+            .close(&mut objects, &mut handles, process, handle)
+            .unwrap();
+        assert_eq!(network.provider_mut().closed, 1);
+        assert!(network.diagnostics(&context).unwrap().is_empty());
     }
     #[test]
     fn socket_is_handle_backed_and_closes_once() {
