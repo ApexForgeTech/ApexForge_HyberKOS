@@ -4328,6 +4328,10 @@ not authoritative DNS TTL. Lua close is idempotent; raw reclaimed handles are
 rejected. Ordinary shell Lua does not acquire an implicit networking grant.
 Bounded readable/writable readiness now uses WAIT plus the appropriate I/O
 right, through the provider and both Lua consumers.
+Administrative shell diagnostics include `net interfaces`, `net resolve <host>`,
+`net probe <host> <port>` and `ping <host> [port]`. The latter is explicitly a
+TCP connect probe (default 443), not ICMP. With the hosted provider it tests the
+shell's current host/guest environment, not a future native VM network driver.
 
 ## Objective
 

@@ -23,6 +23,7 @@ use hyber_shell::{
     profiles::{self, Profiles},
 };
 use hyber_vfs::{Provider, VFS};
+mod network_commands;
 mod terminal;
 
 /// HyberKOS Shell state
@@ -847,6 +848,11 @@ impl HyberShell {
             "handles" => self.cmd_handles(args),
             "ipc" => self.cmd_ipc(args),
             "net" => self.cmd_net(args),
+            "ping" => match args {
+                [host] => self.cmd_net(&["probe", host, "443"]),
+                [host, port] => self.cmd_net(&["probe", host, port]),
+                _ => Err("Usage: ping <hostname> [tcp-port]; TCP connect probe, NOT ICMP".into()),
+            },
             "mnts" => self.cmd_mnts(args),
             "rights" => self.cmd_rights(args),
             "meta" => self.cmd_meta(args),
@@ -2299,8 +2305,11 @@ impl HyberShell {
     }
 
     fn cmd_net(&mut self, args: &[&str]) -> Result<(), String> {
-        if args != ["interfaces"] {
-            return Err("Usage: net interfaces".into());
+        if !matches!(args, ["interfaces"] | ["resolve", _] | ["probe", _, _]) {
+            return Err(
+                "Usage: net interfaces | net resolve <hostname> | net probe <hostname> <tcp-port>"
+                    .into(),
+            );
         }
         let context = if let Some(session) = &self.session {
             session.context().map_err(|e| e.to_string())?
@@ -2313,6 +2322,46 @@ impl HyberShell {
                 .security_context
                 .clone()
         };
+        if let ["resolve", host] | ["probe", host, _] = args {
+            let grant = network_commands::diagnostic_grant(&context, host)?;
+            if args[0] == "resolve" {
+                let result = self
+                    .network
+                    .resolve(&context, &grant, host)
+                    .map_err(|e| e.to_string())?;
+                if let Some(session) = &self.session {
+                    session.context().map_err(|e| e.to_string())?;
+                }
+                println!(
+                    "{}: {} answer(s), cached={}, local cache remaining={}s (addresses private)",
+                    result.host.as_str(),
+                    result.answers,
+                    result.cached,
+                    result.cache_seconds
+                );
+            } else {
+                let port: u16 = args[2].parse().map_err(|_| "TCP port must be 1..65535")?;
+                if port == 0 {
+                    return Err("TCP port must be 1..65535".into());
+                }
+                let start = std::time::Instant::now();
+                let handle = self.network.connect(&mut self.obj_mgr, &mut self.handle_mgr, self.process_id, &context, &grant, hyber_network::Protocol::Tcp, host, port).map_err(|e| format!("TCP probe {host}:{port} failed: {e}; this does not prove the host is offline"))?;
+                let elapsed = start.elapsed();
+                self.network
+                    .close(
+                        &mut self.obj_mgr,
+                        &mut self.handle_mgr,
+                        self.process_id,
+                        handle,
+                    )
+                    .map_err(|e| e.to_string())?;
+                if let Some(session) = &self.session {
+                    session.context().map_err(|e| e.to_string())?;
+                }
+                println!("TCP probe {host}:{port}: connected in {:.2} ms (includes DNS; NOT ICMP ping). No application payload sent.", elapsed.as_secs_f64() * 1000.0);
+            }
+            return Ok(());
+        }
         let entries = self
             .network
             .interface_objects(&mut self.obj_mgr, &context)
@@ -2373,6 +2422,9 @@ impl HyberShell {
         println!("  handles                 Show Handle Table");
         println!("  ipc handles|inspect     Inspect bounded IPC endpoint state");
         println!("  net interfaces          Inspect logical network Device Objects (admin)");
+        println!("  net resolve <host>      Check name resolution (admin)");
+        println!("  net probe <host> <port> Test TCP connection (admin)");
+        println!("  ping <host> [port]      TCP probe, default port 443; NOT ICMP (admin)");
         println!("  mnts                    Show mount points");
         println!("  rights <path>           Show access rights");
         println!("  meta <ls|get|set|rm>    Manage extended metadata");
@@ -2592,7 +2644,8 @@ impl HyberShell {
 /// it documents Hyber commands without exposing host command execution.
 fn shell_command_help(command: &str) -> Option<&'static str> {
     Some(match command {
-        "net" => "Usage: net interfaces\nList logical network Device Objects, state and provider. Requires administrative capability. Application networking requires an approved grant; shell profiles cannot grant it.",
+        "net" => "Usage: net interfaces | net resolve <hostname> | net probe <hostname> <tcp-port>\nAdministrative diagnostics through Hyber networking. Names only; numeric IPs are rejected. TCP probe includes DNS time, sends no application payload, and closes its handle. A failed port does not prove the host is offline. Hosted provider uses the host network, not a future VM NIC.",
+        "ping" => "Usage: ping <hostname> [tcp-port]\nOne TCP connect probe, default port 443. NOT ICMP echo. Requires administrator authority. Uses the same Hyber provider as net probe; names only. Timeout/refusal does not prove Internet or host failure.",
         "help" => "Usage: help [command]\nShow the command index, or detailed usage for one shell command.\nExample: help lua",
         "pwd" => "Usage: pwd\nPrint the current Hyber namespace directory.",
         "whoami" => "Usage: whoami\nPrint the current Hyber account name.",
@@ -2724,6 +2777,34 @@ fn main() {
 mod session_tests {
     use super::*;
     use hyber_auth::{AuthService, SessionGuard, SessionKind, SystemClock};
+
+    #[test]
+    fn network_diagnostics_probe_loopback_and_release_handles() {
+        let dir =
+            std::env::temp_dir().join(format!("hyber-net-diagnostics-{}", std::process::id()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        {
+            let mut shell = HyberShell::new(dir.clone()).unwrap();
+            let before = shell.handle_mgr.list_handles(shell.process_id).len();
+            shell.cmd_net(&["resolve", "localhost"]).unwrap();
+            shell.cmd_net(&["probe", "localhost", &port]).unwrap();
+            assert_eq!(
+                shell.handle_mgr.list_handles(shell.process_id).len(),
+                before
+            );
+            assert!(shell
+                .network
+                .diagnostics(&SecurityContext::root())
+                .unwrap()
+                .is_empty());
+            assert!(shell.cmd_net(&["probe", "localhost", "0"]).is_err());
+            assert!(shell.cmd_net(&["resolve", "127.0.0.1"]).is_err());
+            assert!(shell_command_help("ping").unwrap().contains("NOT ICMP"));
+            shell.cleanup();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn write_text(shell: &mut HyberShell, path: &str, text: &str) {
         let path = Path::parse(path);

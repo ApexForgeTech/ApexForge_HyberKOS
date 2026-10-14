@@ -140,12 +140,26 @@ impl NetworkProvider for HostedNetworkProvider {
             events,
             revents: 0,
         };
-        // The socket remains borrowed and alive for the entire synchronous poll.
-        // The pointer addresses exactly one initialized pollfd.
-        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms as i32) };
-        if result < 0 {
-            return Err(Self::map(&std::io::Error::last_os_error()));
-        }
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        let result = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let millis = remaining
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(timeout_ms as u128) as i32;
+            // The socket remains alive; the pointer addresses one initialized pollfd.
+            let result = unsafe { libc::poll(&mut descriptor, 1, millis) };
+            if result >= 0 {
+                break result;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(Self::map(&error));
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+        };
         if descriptor.revents & libc::POLLNVAL != 0 {
             return Err(ProviderError::Closed);
         }
@@ -222,7 +236,13 @@ impl NetworkProvider for HostedNetworkProvider {
                     } else {
                         "[::]:0"
                     };
-                    let socket = UdpSocket::bind(bind).map_err(|e| Self::map(&e))?;
+                    let socket = match UdpSocket::bind(bind) {
+                        Ok(socket) => socket,
+                        Err(error) => {
+                            last = Self::map(&error);
+                            continue;
+                        }
+                    };
                     match socket.connect(addr) {
                         Ok(()) => {
                             connected = Some(socket);

@@ -53,6 +53,31 @@ grant untrusted domain control where those additional protections are needed.
 
 ## Lua and service integration
 
+### Shell connectivity diagnostics
+
+```text
+net interfaces
+net resolve example.com
+net probe example.com 443
+ping example.com 443
+help ping
+```
+
+These commands require administrator authority. Each resolve/probe receives a
+temporary diagnostic grant for the named destination; it does not grant network
+access to applications. Names must satisfy the same policy validation, so raw
+IP addresses are rejected. `ping` is explicitly a **TCP connect probe, not ICMP
+echo**; its default port is 443. A successful probe sends no application payload
+and immediately closes its Hyber handle. Timing includes resolver work. A
+refused port or timeout does not alone establish that a host or the Internet is
+unreachable. Use a destination/port known to accept TCP connections.
+
+With the hosted provider, these commands test the environment running the
+shell. Running the hosted shell inside a Linux VM tests that guest's networking;
+running it on the host does not test a separate Hyber native VM NIC. Native
+kernel connectivity requires the Phase 27 provider/driver stack. These commands
+do not replace that work or add raw ICMP socket authority.
+
 Generic Lua execution defaults to an unavailable transport. A trusted
 composition root explicitly injects a provider with an approved application
 grant using `run_lua_script_with_application_network`. Merely requesting a
